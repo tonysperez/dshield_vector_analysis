@@ -30,9 +30,16 @@ def reasons_to_escalate(
     parsed: Optional[CommandEnrichment],
     local_failed: bool,
     cfg: CloudConfig,
+    embedding: Optional[list[float]] = None,
+    centroids: Optional[list[list[float]]] = None,
     rng: Optional[random.Random] = None,
 ) -> list[str]:
-    """Return list of reason codes that fire for this command. Empty = stay local."""
+    """Return list of reason codes that fire for this command. Empty = stay local.
+
+    embedding + centroids are optional Phase 3 inputs. When both are provided
+    and the command's novelty_score >= cfg.triage.novel_embedding_threshold,
+    the "novel_embedding" reason code fires.
+    """
     rng = rng or random
     reasons: list[str] = []
 
@@ -58,6 +65,13 @@ def reasons_to_escalate(
         if m.group(1).lower() in sus_tlds:
             reasons.append("rare_tld")
             break
+
+    # Phase 3 novel_embedding rule — requires cluster centroids loaded from ES.
+    if embedding is not None and centroids:
+        from .cluster import novelty_score_from_lists
+        score = novelty_score_from_lists(embedding, centroids)
+        if score >= cfg.triage.novel_embedding_threshold:
+            reasons.append("novel_embedding")
 
     # Random sampling for quality monitoring.
     if cfg.triage.sample_rate > 0 and rng.random() < cfg.triage.sample_rate:

@@ -12,9 +12,9 @@ dependencies = [
 
 [project.optional-dependencies]
 # Phase 3: clustering / novelty scoring
+# Uses sklearn.cluster.HDBSCAN (added in scikit-learn 1.3) — no Cython build needed.
 cluster = [
     "numpy>=1.26",
-    "hdbscan>=0.8.33",
     "scikit-learn>=1.4",
 ]
 

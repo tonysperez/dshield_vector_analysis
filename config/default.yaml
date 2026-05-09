@@ -5,7 +5,7 @@ elasticsearch:
   hosts: ["https://localhost:9200"]
   verify_certs: false
   ca_certs: null
-  events_index: "logs-dshield.cowrie.session-*"
+  events_index: "logs-dshield_cowrie_sessions-default"
   enrichment_index: "enriched-dshield_cowrie_sessions-default"
   request_timeout: 60
 
@@ -39,9 +39,10 @@ cloud:
   daily_budget_usd: 5.0
   rpm_limit: 10
   triage:
-    confidence_max: 5       # escalate when local confidence is <= this (1-10)
-    sample_rate: 0.01       # 1% random sampling for quality monitoring
-    base64_min_run: 200     # length threshold for "suspicious base64 blob"
+    confidence_max: 5           # enrich: escalate when local confidence is <= this (1-10)
+    escalate_confidence_max: 7  # escalate cmd: only re-triage novel docs with confidence <= this
+    sample_rate: 0.01           # 1% random sampling for quality monitoring
+    base64_min_run: 200         # length threshold for "suspicious base64 blob"
     suspicious_tlds:
       - xyz
       - top
@@ -61,6 +62,9 @@ cloud:
       - site
       - stream
       - cam
+      - zip
+      - exe
+    novel_embedding_threshold: 0.5  # escalate when novelty_score >= this
   pricing:
     # USD per 1M tokens. Update to match the model you point at.
     input_per_mtok: 3.0
@@ -69,3 +73,12 @@ cloud:
 prompts:
   command_enrichment: "config/prompts/command_enrichment.txt"
   command_deep_dive:  "config/prompts/command_deep_dive.txt"
+
+# Phase 3 — HDBSCAN clustering + novelty scoring. Run independently of enrich.
+cluster:
+  min_cluster_size: 5
+  min_samples: 2
+  page_size: 1000
+  batch_size: 200
+  # null = derive from enrichment_index (replace trailing -default with -clusters-default)
+  clusters_index: null

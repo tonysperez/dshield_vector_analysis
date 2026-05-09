@@ -39,8 +39,12 @@ cloud:
   # model: "claude-sonnet-4-6"
   # daily_budget_usd: 5.0
   # triage:
-  #   confidence_max: 5
+  #   confidence_max: 5         # enrich: escalate any command with confidence <= this
+  #   escalate_confidence_max: 7  # escalate cmd: re-triage novel docs with confidence <= this
+  #                                 # (novelty is already a strong signal, so this can be
+  #                                 #  higher than confidence_max to cast a wider net)
   #   sample_rate: 0.01
+  #   novel_embedding_threshold: 0.5
   # pricing:                 # update to match the model picked
   #   input_per_mtok: 3.0
   #   output_per_mtok: 15.0

@@ -7,12 +7,13 @@ import logging
 import re
 from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Iterator, Optional
 
 from pydantic import ValidationError
 
 from .cache import StateDB
 from .config import AppConfig, Secrets, load_prompt
+from elasticsearch import Elasticsearch
 from .es_client import bulk_write, iter_command_events, make_client
 from .llm import make_llm_client
 from .llm.schemas import CommandEnrichment, CloudCommandEnrichment
@@ -21,6 +22,29 @@ from . import triage as triage_mod
 log = logging.getLogger(__name__)
 
 _WS_RE = re.compile(r"\s+")
+
+# Painless script for escalate — patches only the cloud-overwritten fields so
+# all other enrichment fields (embedding, occurrence_count, cluster.*, etc.) are untouched.
+_ESCALATE_SCRIPT = (
+    "ctx._source.event.provider = params.provider;"
+    "ctx._source.event.reason = params.description;"
+    "if (ctx._source.dshield == null) { ctx._source.dshield = [:]; }"
+    "if (ctx._source.dshield.cowrie == null) { ctx._source.dshield.cowrie = [:]; }"
+    "if (ctx._source.dshield.cowrie.enrichment == null) { ctx._source.dshield.cowrie.enrichment = [:]; }"
+    "def en = ctx._source.dshield.cowrie.enrichment;"
+    "en.intent = params.intent;"
+    "en.confidence = params.confidence;"
+    "en.model = params.model;"
+    "en.triage_reasons = params.triage_reasons;"
+    "en.notes = params.notes;"
+    "en.local_fallback = params.local_fallback;"
+    "if (ctx._source.threat == null) { ctx._source.threat = [:]; }"
+    "if (ctx._source.threat.tactic == null) { ctx._source.threat.tactic = [:]; }"
+    "if (ctx._source.threat.technique == null) { ctx._source.threat.technique = [:]; }"
+    "ctx._source.threat.tactic.id = params.tactics;"
+    "ctx._source.threat.technique.id = params.techniques;"
+    "ctx._source.threat.indicator = params.indicators;"
+)
 
 
 def normalize(cmd: str, max_chars: int) -> tuple[str, bool]:
@@ -288,6 +312,16 @@ def run(cfg: AppConfig, secrets: Secrets, dry_run: bool = False, no_cloud: bool 
                 cloud_client = None
                 cloud_enabled = False
 
+    # Phase 3: load cluster centroids so the novel_embedding triage rule can fire.
+    # Silently skipped if cluster hasn't run yet or clusters index doesn't exist.
+    centroids: list[list[float]] = []
+    if cloud_enabled:
+        from .cluster import get_clusters_index, load_centroids
+        clusters_idx = get_clusters_index(cfg)
+        centroids = load_centroids(es, clusters_idx)
+        if centroids:
+            log.info("Loaded %d cluster centroids for novel_embedding triage", len(centroids))
+
     since = db.get_watermark()
     if since is None and cfg.worker.initial_lookback_days is not None:
         from datetime import timedelta
@@ -423,6 +457,8 @@ def run(cfg: AppConfig, secrets: Secrets, dry_run: bool = False, no_cloud: bool 
                     parsed=parsed,
                     local_failed=(source == "local_failed"),
                     cfg=cfg.cloud,
+                    embedding=embedding if centroids else None,
+                    centroids=centroids if centroids else None,
                 )
                 if triage_reasons:
                     stats["triaged"] += 1
@@ -520,4 +556,215 @@ def run(cfg: AppConfig, secrets: Secrets, dry_run: bool = False, no_cloud: bool 
     if "cloud_cost_usd_x10000" in out:
         out["cloud_cost_usd"] = out.pop("cloud_cost_usd_x10000") / 10000.0
     db.close()
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 escalate: re-triage locally-enriched docs whose novelty rose above
+# the threshold since their initial enrichment.
+# ---------------------------------------------------------------------------
+
+
+def iter_novel_local_docs(
+    es: Elasticsearch,
+    index: str,
+    novelty_threshold: float,
+    confidence_max: int,
+    page_size: int = 50,
+) -> Iterator[dict]:
+    """Yield enrichment docs with event.provider='local', novelty_score >= novelty_threshold,
+    and confidence <= confidence_max. Sorted novelty_score desc so the most interesting
+    commands are escalated first when the daily budget is limited.
+    """
+    body: dict = {
+        "size": page_size,
+        "_source": [
+            "process.command_line",
+            "event.reason",
+            "dshield.cowrie.enrichment.intent",
+            "dshield.cowrie.enrichment.confidence",
+            "dshield.cowrie.enrichment.model",
+            "threat.tactic.id",
+            "threat.technique.id",
+        ],
+        "query": {
+            "bool": {
+                "must": [
+                    {"term": {"event.provider": "local"}},
+                    {"range": {
+                        "dshield.cowrie.enrichment.cluster.novelty_score": {"gte": novelty_threshold}
+                    }},
+                    {"range": {
+                        "dshield.cowrie.enrichment.confidence": {"lte": confidence_max}
+                    }},
+                ]
+            }
+        },
+        "sort": [
+            {"dshield.cowrie.enrichment.cluster.novelty_score": "desc"},
+            {"_doc": "asc"},
+        ],
+    }
+    search_after = None
+    while True:
+        if search_after:
+            body["search_after"] = search_after
+        resp = es.search(index=index, **body)
+        hits = resp["hits"]["hits"]
+        if not hits:
+            return
+        for h in hits:
+            yield h
+        search_after = hits[-1]["sort"]
+
+
+def run_escalate(
+    cfg: AppConfig,
+    secrets: Secrets,
+    dry_run: bool = False,
+) -> dict:
+    """Cloud-escalate locally-enriched docs whose novelty_score >= threshold.
+
+    Intended to run after each `cluster` job. Works entirely from ES state —
+    no watermark, no SQLite cache lookup. Any locally-enriched doc with a
+    novelty_score above the threshold is a candidate, regardless of when it
+    was originally enriched.
+
+    Already cloud-enriched docs (event.provider='claude') are excluded by the
+    query, so re-running is safe.
+    """
+    if not cfg.cloud.enabled:
+        raise RuntimeError(
+            "cloud.enabled is false. Set it in config/local.yaml to use escalate."
+        )
+    if not secrets.anthropic_api_key:
+        raise RuntimeError("ANTHROPIC_API_KEY not set in .env.")
+    if not cfg.prompts.command_deep_dive:
+        raise RuntimeError("prompts.command_deep_dive is unset in config.")
+
+    threshold = cfg.cloud.triage.novel_embedding_threshold
+    es = make_client(cfg.elasticsearch, secrets)
+    db = StateDB(cfg.worker.state_db)
+    cloud_prompt = load_prompt(cfg, "command_deep_dive")
+
+    from .llm.anthropic import AnthropicClient, cost_usd as _cost_usd
+    cloud_client = AnthropicClient(
+        api_key=secrets.anthropic_api_key,
+        model=cfg.cloud.model,
+        max_tokens=cfg.cloud.max_tokens,
+        timeout=cfg.cloud.request_timeout,
+        base_url=cfg.cloud.base_url,
+    )
+    try:
+        cloud_client.ping()
+    except Exception as exc:
+        cloud_client.close()
+        db.close()
+        raise RuntimeError(f"Cloud preflight failed: {exc}") from exc
+
+    confidence_max = cfg.cloud.triage.escalate_confidence_max
+    log.info(
+        "escalate: novelty_threshold=%.2f confidence_max=%d model=%s budget_remaining=$%.4f",
+        threshold, confidence_max, cfg.cloud.model,
+        triage_mod.budget_remaining_usd(db, cfg.cloud),
+    )
+
+    stats: dict = defaultdict(int)
+    actions: list[dict] = []
+
+    for hit in iter_novel_local_docs(
+        es, cfg.elasticsearch.enrichment_index, threshold, confidence_max
+    ):
+        stats["candidates"] += 1
+
+        if not dry_run and not triage_mod.can_spend(db, cfg.cloud):
+            stats["skipped_budget"] += 1
+            log.warning("Budget exhausted; stopping escalate run")
+            break
+
+        if dry_run:
+            continue
+
+        src = hit["_source"]
+        doc_id = hit["_id"]
+        command = (src.get("process") or {}).get("command_line", "")
+        if not command:
+            stats["skipped_no_command"] += 1
+            continue
+
+        # Snapshot local fields before overwriting (for local_fallback).
+        en = ((src.get("dshield") or {}).get("cowrie") or {}).get("enrichment") or {}
+        local_fallback = {
+            "model": en.get("model", ""),
+            "intent": en.get("intent", "unknown"),
+            "confidence": en.get("confidence", 1),
+            "description": (src.get("event") or {}).get("reason", ""),
+            "tactics": ((src.get("threat") or {}).get("tactic") or {}).get("id") or [],
+            "techniques": ((src.get("threat") or {}).get("technique") or {}).get("id") or [],
+        }
+
+        triage_reasons = ["novel_embedding"]
+        cloud_parsed, in_tok, out_tok = cloud_enrich_one(
+            cloud_client, cloud_prompt, command, triage_reasons,
+        )
+        spend = _cost_usd(
+            in_tok, out_tok,
+            cfg.cloud.pricing.input_per_mtok,
+            cfg.cloud.pricing.output_per_mtok,
+        )
+        if in_tok or out_tok:
+            db.add_spend(triage_mod.utc_today(), in_tok, out_tok, spend)
+            stats["cloud_calls"] += 1
+            stats["cloud_input_tokens"] += in_tok
+            stats["cloud_output_tokens"] += out_tok
+            stats["cloud_cost_usd_x10000"] += int(round(spend * 10000))
+
+        if cloud_parsed is None:
+            stats["cloud_failed"] += 1
+            log.warning("cloud parse failed for doc %s", doc_id)
+            continue
+
+        stats["cloud_ok"] += 1
+        actions.append({
+            "_op_type": "update",
+            "_id": doc_id,
+            "script": {
+                "source": _ESCALATE_SCRIPT,
+                "params": {
+                    "provider": "claude",
+                    "description": cloud_parsed.description,
+                    "intent": cloud_parsed.intent,
+                    "confidence": cloud_parsed.confidence,
+                    "model": cfg.cloud.model,
+                    "triage_reasons": triage_reasons,
+                    "notes": cloud_parsed.notes,
+                    "local_fallback": local_fallback,
+                    "tactics": cloud_parsed.tactics,
+                    "techniques": cloud_parsed.techniques,
+                    "indicators": _build_indicators(cloud_parsed.iocs.model_dump()),
+                },
+            },
+        })
+
+        if len(actions) >= 20:
+            ok, errs = bulk_write(es, cfg.elasticsearch.enrichment_index, actions)
+            stats["bulk_ok"] += ok
+            stats["bulk_errors"] += len(errs)
+            if errs:
+                log.warning("escalate bulk errors (%d): %s", len(errs), errs[:2])
+            actions = []
+
+    if actions:
+        ok, errs = bulk_write(es, cfg.elasticsearch.enrichment_index, actions)
+        stats["bulk_ok"] += ok
+        stats["bulk_errors"] += len(errs)
+        if errs:
+            log.warning("escalate bulk errors (%d): %s", len(errs), errs[:2])
+
+    cloud_client.close()
+    db.close()
+
+    out = dict(stats, dry_run=dry_run, novelty_threshold=threshold, confidence_max=confidence_max)
+    if "cloud_cost_usd_x10000" in out:
+        out["cloud_cost_usd"] = out.pop("cloud_cost_usd_x10000") / 10000.0
     return out

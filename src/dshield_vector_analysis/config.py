@@ -30,13 +30,15 @@ class LLMConfig(BaseModel):
 
 
 class CloudTriageConfig(BaseModel):
-    confidence_max: int = 5  # escalate if local confidence <= this (1-10)
+    confidence_max: int = 5  # escalate (during enrich) if local confidence <= this (1-10)
+    escalate_confidence_max: int = 7  # escalate (via `escalate` cmd) if novelty high AND confidence <= this
     sample_rate: float = 0.01  # random sample fraction for monitoring
     base64_min_run: int = 200  # length threshold for suspicious base64 blob
     suspicious_tlds: list[str] = Field(default_factory=lambda: [
         "xyz", "top", "tk", "ml", "ga", "cf", "gq", "club", "icu", "buzz",
         "monster", "rest", "bar", "fit", "online", "site", "stream", "cam",
     ])
+    novel_embedding_threshold: float = 0.5  # fire novel_embedding if novelty_score >= this
 
 
 class CloudPricingConfig(BaseModel):
@@ -56,6 +58,14 @@ class CloudConfig(BaseModel):
     rpm_limit: int = 10
     triage: CloudTriageConfig = Field(default_factory=CloudTriageConfig)
     pricing: CloudPricingConfig = Field(default_factory=CloudPricingConfig)
+
+
+class ClusterConfig(BaseModel):
+    min_cluster_size: int = 5
+    min_samples: int = 2
+    page_size: int = 1000
+    batch_size: int = 200  # docs per bulk-update flush
+    clusters_index: Optional[str] = None  # null = derive from enrichment_index
 
 
 class WorkerConfig(BaseModel):
@@ -78,6 +88,7 @@ class AppConfig(BaseModel):
     worker: WorkerConfig
     prompts: PromptsConfig
     cloud: CloudConfig = Field(default_factory=CloudConfig)
+    cluster: ClusterConfig = Field(default_factory=ClusterConfig)
 
 
 class Secrets(BaseSettings):

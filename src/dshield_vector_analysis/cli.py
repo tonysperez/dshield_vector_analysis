@@ -52,7 +52,7 @@ def main(argv: list[str] | None = None) -> int:
 
     p_init = sub.add_parser(
         "init-index",
-        help="Create the enrichment index using the configured name + mapping JSON",
+        help="Create an index using a mapping JSON (enrichment index by default)",
     )
     p_init.add_argument(
         "--mapping",
@@ -60,9 +60,31 @@ def main(argv: list[str] | None = None) -> int:
         help="Path to mapping JSON",
     )
     p_init.add_argument(
+        "--index",
+        default=None,
+        help="Override target index name (default: cfg.elasticsearch.enrichment_index)",
+    )
+    p_init.add_argument(
         "--update-mapping",
         action="store_true",
         help="If index exists, push additive mapping changes instead of noop",
+    )
+
+    p_escalate = sub.add_parser(
+        "escalate",
+        help=(
+            "Re-triage locally-enriched docs whose novelty_score >= threshold. "
+            "Run after each 'cluster' pass to cloud-escalate newly-novel commands."
+        ),
+    )
+    p_escalate.add_argument("--dry-run", action="store_true", help="Count candidates without making cloud calls")
+
+    p_cluster = sub.add_parser("cluster", help="Run Phase 3 HDBSCAN clustering + novelty scoring")
+    p_cluster.add_argument("--dry-run", action="store_true", help="Fetch + cluster but skip all ES writes")
+    p_cluster.add_argument(
+        "--clusters-index",
+        default=None,
+        help="Override clusters index name (default: derived from enrichment_index)",
     )
 
     args = p.parse_args(argv)
@@ -132,12 +154,34 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "init-index":
         from .es_client import init_index, make_client, update_mapping
         es = make_client(cfg.elasticsearch, secrets)
-        idx = cfg.elasticsearch.enrichment_index
+        idx = args.index or cfg.elasticsearch.enrichment_index
         result = init_index(es, args.mapping, idx)
         if args.update_mapping and result.get("action") == "noop":
             result = update_mapping(es, args.mapping, idx)
         print(json.dumps(result, indent=2))
         return 0
+
+    if args.cmd == "escalate":
+        try:
+            stats = enrich_mod.run_escalate(cfg, secrets, dry_run=args.dry_run)
+        except RuntimeError as exc:
+            print(f"[ERROR] {exc}", flush=True)
+            return 1
+        print(json.dumps(stats, indent=2, default=str))
+        return 0
+
+    if args.cmd == "cluster":
+        from . import cluster as cluster_mod
+        if args.clusters_index:
+            cfg.cluster.clusters_index = args.clusters_index
+        try:
+            stats = cluster_mod.run(cfg, secrets, dry_run=args.dry_run)
+        except ImportError as exc:
+            print(f"[ERROR] {exc}", flush=True)
+            return 1
+        print(json.dumps(stats, indent=2, default=str))
+        return 0
+
     return 2
 
 
