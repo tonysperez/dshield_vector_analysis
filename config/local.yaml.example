@@ -25,10 +25,19 @@ llm:
   embedding_model: "text-embedding-nomic-embed-text-v1.5@q8_0"
   # api_key: "lm-studio"   # uncomment if your server requires auth
 
+  # Fields prepended to the raw command before embedding (Phase 3+).
+  # Changing this requires bumping embed_version and running `re-embed`.
+  # embed_context:
+  #   - intent
+  #   - tactics
+  #   - techniques
+  #   - description
+  # embed_version: "v2"   # bump when embed_context changes; run `re-embed` after
+
 worker:
   state_db: "/var/lib/dshield_vector_analysis/state.sqlite"
   initial_lookback_days: null
-  # prompt_version: "v3"   # bump after editing the prompt to force re-enrichment
+  # prompt_version: "v3"   # bump after editing the prompt to force re-enrichment + re-embedding
 
 # Phase 2 — cloud (Claude) escalation for hard / novel / low-confidence commands.
 # Off by default. To enable: flip enabled, set ANTHROPIC_API_KEY in .env, then
@@ -39,12 +48,16 @@ cloud:
   # model: "claude-sonnet-4-6"
   # daily_budget_usd: 5.0
   # triage:
-  #   confidence_max: 5         # enrich: escalate any command with confidence <= this
+  #   confidence_max: 5           # enrich: escalate any command with confidence <= this (1-10)
   #   escalate_confidence_max: 7  # escalate cmd: re-triage novel docs with confidence <= this
-  #                                 # (novelty is already a strong signal, so this can be
-  #                                 #  higher than confidence_max to cast a wider net)
+  #                               # novel_embedding triage fires from `escalate` only (not `enrich`)
   #   sample_rate: 0.01
   #   novel_embedding_threshold: 0.5
   # pricing:                 # update to match the model picked
   #   input_per_mtok: 3.0
   #   output_per_mtok: 15.0
+
+# Phase 3+ — clustering quality tuning. Defaults are conservative; tune after baseline run.
+# cluster:
+#   scalar_weight: 0.05   # weight of behavioral scalar block vs 768-dim embedding (0.0 = disable)
+#                         # scalars: occurrence_count, unique_source_ips, confidence, session_reuse_rate
