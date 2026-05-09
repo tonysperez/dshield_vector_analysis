@@ -1,5 +1,6 @@
 [project]
 name = "dshield_vector_analysis"
+version = "0.1.0"
 requires-python = ">=3.9"
 dependencies = [
     "elasticsearch>=8.11,<9",
