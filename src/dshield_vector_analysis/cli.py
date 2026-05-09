@@ -23,10 +23,22 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--config", default=None, help="Path to YAML config")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("healthcheck", help="Verify ES/Ollama/SQLite connectivity")
+    p_hc = sub.add_parser("healthcheck", help="Verify ES/LLM/SQLite/cloud connectivity")
+    p_hc.add_argument(
+        "--scope",
+        default="all",
+        help=(
+            "Comma-separated subset of scopes to run: "
+            f"{','.join(hc_mod.VALID_SCOPES)} (or 'all'). "
+            "Example: --scope llm,cloud (used by systemd ExecStartPre to gate enrich)."
+        ),
+    )
 
     p_enrich = sub.add_parser("enrich", help="Run a single enrichment pass")
     p_enrich.add_argument("--dry-run", action="store_true", help="Read events but skip LLM + writes")
+    p_enrich.add_argument("--no-cloud", action="store_true", help="Force-disable Phase 2 cloud escalation for this run")
+
+    sub.add_parser("budget", help="Show today's cloud-LLM spend vs daily cap")
 
     p_reset = sub.add_parser(
         "reset",
@@ -60,10 +72,33 @@ def main(argv: list[str] | None = None) -> int:
     _setup_log(cfg.worker.log_level)
 
     if args.cmd == "healthcheck":
-        return hc_mod.check(cfg, secrets)
+        raw = (args.scope or "all").strip().lower()
+        scopes = None if raw == "all" else [s.strip() for s in raw.split(",") if s.strip()]
+        return hc_mod.check(cfg, secrets, scopes=scopes)
     if args.cmd == "enrich":
-        stats = enrich_mod.run(cfg, secrets, dry_run=args.dry_run)
+        stats = enrich_mod.run(cfg, secrets, dry_run=args.dry_run, no_cloud=args.no_cloud)
         print(json.dumps(stats, indent=2, default=str))
+        return 0
+    if args.cmd == "budget":
+        from .cache import StateDB
+        from . import triage as triage_mod
+        db = StateDB(cfg.worker.state_db)
+        today = triage_mod.utc_today()
+        spent = db.get_spend(today)
+        remaining = max(0.0, cfg.cloud.daily_budget_usd - spent["cost_usd"])
+        out = {
+            "date": today,
+            "daily_budget_usd": cfg.cloud.daily_budget_usd,
+            "spent_usd": round(spent["cost_usd"], 4),
+            "remaining_usd": round(remaining, 4),
+            "calls": spent["calls"],
+            "input_tokens": spent["input_tokens"],
+            "output_tokens": spent["output_tokens"],
+            "cloud_enabled": cfg.cloud.enabled,
+            "model": cfg.cloud.model,
+        }
+        db.close()
+        print(json.dumps(out, indent=2))
         return 0
     if args.cmd == "reset":
         from .cache import StateDB

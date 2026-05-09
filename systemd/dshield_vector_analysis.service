@@ -9,6 +9,11 @@ User=dshield_vector_analysis
 Group=dshield_vector_analysis
 WorkingDirectory=/opt/dshield_vector_analysis
 EnvironmentFile=/opt/dshield_vector_analysis/.env
+# Gate enrich on local LLM reachability — a flaky GPU box fails the unit fast
+# instead of burning a partial pass. Cloud reachability is checked inside
+# enrich (ping → degrade to local-only on failure), so cloud outages do not
+# block the run.
+ExecStartPre=/opt/dshield_vector_analysis/.venv/bin/python -m dshield_vector_analysis.cli --config /opt/dshield_vector_analysis/config/default.yaml healthcheck --scope llm
 ExecStart=/opt/dshield_vector_analysis/.venv/bin/python -m dshield_vector_analysis.cli --config /opt/dshield_vector_analysis/config/default.yaml enrich
 StandardOutput=journal
 StandardError=journal

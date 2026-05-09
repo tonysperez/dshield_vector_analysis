@@ -1,0 +1,584 @@
+PUT _ingest/pipeline/dshield.webhoneypot
+{
+  "description": "DShield web honeypot JSON -> ECS",
+  "processors": [
+
+    {
+      "json": {
+        "field": "message",
+        "target_field": "webhoneypot",
+        "ignore_failure": true
+      }
+    },
+    {
+      "rename": {
+        "field": "message",
+        "target_field": "event.original",
+        "ignore_missing": true
+      }
+    },
+
+    {
+      "date": {
+        "field": "webhoneypot.time",
+        "formats": [
+          "ISO8601"
+        ],
+        "target_field": "@timestamp",
+        "ignore_failure": true
+      }
+    },
+    {
+      "remove": {
+        "field": "webhoneypot.time",
+        "ignore_missing": true
+      }
+    },
+
+    {
+      "rename": {
+        "field": "webhoneypot.sip",
+        "target_field": "source.ip",
+        "ignore_missing": true
+      }
+    },
+    {
+      "rename": {
+        "field": "webhoneypot.sport",
+        "target_field": "source.port",
+        "ignore_missing": true
+      }
+    },
+    {
+      "rename": {
+        "field": "webhoneypot.dip",
+        "target_field": "destination.ip",
+        "ignore_missing": true
+      }
+    },
+    {
+      "rename": {
+        "field": "webhoneypot.dport",
+        "target_field": "destination.port",
+        "ignore_missing": true
+      }
+    },
+    {
+      "set": {
+        "description": "ECS recommends both .ip and .address; .address mirrors .ip when no hostname is known",
+        "field": "source.address",
+        "value": "{{{source.ip}}}",
+        "if": "ctx.source?.ip != null",
+        "ignore_failure": true
+      }
+    },
+    {
+      "set": {
+        "field": "destination.address",
+        "value": "{{{destination.ip}}}",
+        "if": "ctx.destination?.ip != null",
+        "ignore_failure": true
+      }
+    },
+
+    {
+      "rename": {
+        "field": "webhoneypot.method",
+        "target_field": "http.request.method",
+        "ignore_missing": true
+      }
+    },
+    {
+      "rename": {
+        "field": "webhoneypot.url",
+        "target_field": "url.original",
+        "ignore_missing": true
+      }
+    },
+    {
+      "rename": {
+        "field": "webhoneypot.version",
+        "target_field": "http.version",
+        "ignore_missing": true
+      }
+    },
+    {
+      "rename": {
+        "field": "webhoneypot.data",
+        "target_field": "http.request.body.content",
+        "ignore_missing": true
+      }
+    },
+    {
+      "rename": {
+        "description": "Whole headers object is promoted; each header key remains individually addressable as http.request.headers.<Header-Name>",
+        "field": "webhoneypot.headers",
+        "target_field": "http.request.headers",
+        "ignore_missing": true
+      }
+    },
+
+    {
+      "rename": {
+        "field": "webhoneypot.response_id",
+        "target_field": "dshield.response_id",
+        "ignore_missing": true
+      }
+    },
+    {
+      "rename": {
+        "field": "webhoneypot.signature_id.id",
+        "target_field": "rule.id",
+        "ignore_missing": true
+      }
+    },
+    {
+      "rename": {
+        "description": "signature_id.comment describes the signature; ECS rule.name fits this best",
+        "field": "webhoneypot.signature_id.comment",
+        "target_field": "rule.name",
+        "ignore_missing": true
+      }
+    },
+    {
+      "rename": {
+        "field": "webhoneypot.signature_id.max_score",
+        "target_field": "dshield.signature.max_score",
+        "ignore_missing": true
+      }
+    },
+    {
+      "rename": {
+        "field": "webhoneypot.signature_id.min_score",
+        "target_field": "dshield.signature.min_score",
+        "ignore_missing": true
+      }
+    },
+    {
+      "rename": {
+        "field": "webhoneypot.signature_id.responses",
+        "target_field": "dshield.signature.responses",
+        "ignore_missing": true
+      }
+    },
+    {
+      "rename": {
+        "description": "Array of {condition, attribute, value, score} objects. Each sub-field is filterable as dshield.signature.rules.<sub-field>.",
+        "field": "webhoneypot.signature_id.rules",
+        "target_field": "dshield.signature.rules",
+        "ignore_missing": true
+      }
+    },
+    {
+      "remove": {
+        "field": "webhoneypot.signature_id",
+        "ignore_missing": true
+      }
+    },
+    {
+      "set": {
+        "field": "rule.category",
+        "value": "dshield.signature",
+        "if": "ctx.rule?.id != null"
+      }
+    },
+
+    {
+      "convert": {
+        "field": "source.port",
+        "type": "integer",
+        "ignore_missing": true
+      }
+    },
+    {
+      "convert": {
+        "field": "destination.port",
+        "type": "integer",
+        "ignore_missing": true
+      }
+    },
+    {
+      "convert": {
+        "field": "rule.id",
+        "type": "string",
+        "ignore_missing": true
+      }
+    },
+    {
+      "convert": {
+        "field": "dshield.signature.max_score",
+        "type": "integer",
+        "ignore_missing": true
+      }
+    },
+    {
+      "convert": {
+        "field": "dshield.signature.min_score",
+        "type": "integer",
+        "ignore_missing": true
+      }
+    },
+    {
+      "convert": {
+        "field": "dshield.response_id",
+        "type": "integer",
+        "ignore_missing": true
+      }
+    },
+
+    {
+      "uppercase": {
+        "field": "http.request.method",
+        "ignore_missing": true
+      }
+    },
+    {
+      "gsub": {
+        "description": "Strip HTTP/ prefix per ECS (e.g. HTTP/1.1 -> 1.1)",
+        "field": "http.version",
+        "pattern": "^HTTP/",
+        "replacement": "",
+        "ignore_missing": true
+      }
+    },
+
+    {
+      "grok": {
+        "description": "Extract url.domain (and optional embedded port) from the Host header",
+        "field": "http.request.headers.Host",
+        "patterns": [
+          "^%{IPORHOST:url.domain}:%{POSINT:_host_port}$",
+          "^%{IPORHOST:url.domain}$"
+        ],
+        "if": "ctx.http?.request?.headers?.Host != null",
+        "ignore_failure": true
+      }
+    },
+    {
+      "convert": {
+        "field": "_host_port",
+        "type": "integer",
+        "ignore_missing": true
+      }
+    },
+    {
+      "script": {
+        "description": "Backfill destination.port from Host header port when dport was absent",
+        "lang": "painless",
+        "source": "if (ctx._host_port == null) return; if (ctx.destination == null) ctx.destination = [:]; if (ctx.destination.port == null) ctx.destination.port = ctx._host_port; ctx.remove('_host_port');",
+        "ignore_failure": true
+      }
+    },
+
+    {
+      "rename": {
+        "description": "Promote Content-Type to ECS http.request.mime_type while leaving the original header in place via the rename target",
+        "field": "http.request.headers.Content-Type",
+        "target_field": "http.request.mime_type",
+        "ignore_missing": true
+      }
+    },
+    {
+      "rename": {
+        "description": "Promote Referer to ECS http.request.referrer",
+        "field": "http.request.headers.Referer",
+        "target_field": "http.request.referrer",
+        "ignore_missing": true
+      }
+    },
+
+    {
+      "script": {
+        "description": "Normalise top-level useragent (string or array) to user_agent.original; empty strings are dropped",
+        "lang": "painless",
+        "source": "if (ctx.webhoneypot?.useragent == null) { return; } def ua = ctx.webhoneypot.useragent; if (ctx.user_agent == null) { ctx.user_agent = [:]; } if (ua instanceof List && !ua.isEmpty()) { def first = ua.get(0); if (first instanceof String && first.length() > 0) { ctx.user_agent.original = first; } } else if (ua instanceof String && ua.length() > 0) { ctx.user_agent.original = ua; } ctx.webhoneypot.remove('useragent');",
+        "ignore_failure": true
+      }
+    },
+    {
+      "user_agent": {
+        "description": "Parse user_agent.original into name/version/os/device sub-fields",
+        "field": "user_agent.original",
+        "target_field": "user_agent",
+        "ignore_missing": true,
+        "ignore_failure": true
+      }
+    },
+
+    {
+      "script": {
+        "description": "Compute http.request.body.bytes; drop body.content when it is the empty string to keep documents tidy without losing information",
+        "lang": "painless",
+        "source": "if (ctx.http?.request?.body?.content == null) { return; } def c = ctx.http.request.body.content; if (c instanceof String) { if (c.length() == 0) { ctx.http.request.body.remove('content'); if (ctx.http.request.body.isEmpty()) { ctx.http.request.remove('body'); } } else { ctx.http.request.body.bytes = c.getBytes('UTF-8').length; } }",
+        "ignore_failure": true
+      }
+    },
+
+    {
+      "script": {
+        "description": "Set network.type from source.ip (ipv4|ipv6)",
+        "lang": "painless",
+        "source": "if (ctx.source?.ip != null) { ctx.network = ctx.network ?: [:]; ctx.network.type = ctx.source.ip.contains(':') ? 'ipv6' : 'ipv4'; }",
+        "ignore_failure": true
+      }
+    },
+
+    {
+      "grok": {
+        "description": "Parse url.original into scheme, domain, path, query, and fragment. Pattern 1 handles full URLs (scheme://host[:port]/path?query#fragment); pattern 2 handles path-only inputs (/path?query#fragment). Grok tries patterns in order and stops at the first match.",
+        "field": "url.original",
+        "patterns": [
+          "^(?<_url_scheme>[a-zA-Z][a-zA-Z0-9+\\-.]*):\/\/(?<_url_domain>[^/?#:]+)(?::%{POSINT:_url_port})?(?<_url_path>[^?#]*)(?:\\?(?<_url_query>[^#]*))?(?:#(?<_url_fragment>.*))?$",
+          "^(?<_url_path>[^?#]*)(?:\\?(?<_url_query>[^#]*))?(?:#(?<_url_fragment>.*))?$"
+        ],
+        "if": "ctx.url?.original != null",
+        "ignore_failure": true
+      }
+    },
+    {
+      "rename": {
+        "description": "Promote scheme captured from a full URL to ECS url.scheme (e.g. http, https)",
+        "field": "_url_scheme",
+        "target_field": "url.scheme",
+        "ignore_missing": true
+      }
+    },
+    {
+      "script": {
+        "description": "Promote _url_domain to url.domain when the request line contains a full URL (overrides the Host-header value, which is the same host in practice). Promote _url_port to destination.port only when dport and the Host-header port were both absent. Clean up temp fields.",
+        "lang": "painless",
+        "source": "if (ctx._url_domain != null) { if (ctx.url == null) ctx.url = [:]; ctx.url.domain = ctx._url_domain; ctx.remove('_url_domain'); } if (ctx._url_port != null) { if (ctx.destination == null) ctx.destination = [:]; if (ctx.destination.port == null) ctx.destination.port = Integer.parseInt(ctx._url_port); ctx.remove('_url_port'); }",
+        "ignore_failure": true
+      }
+    },
+    {
+      "rename": {
+        "field": "_url_path",
+        "target_field": "url.path",
+        "ignore_missing": true
+      }
+    },
+    {
+      "rename": {
+        "field": "_url_query",
+        "target_field": "url.query",
+        "ignore_missing": true
+      }
+    },
+    {
+      "rename": {
+        "field": "_url_fragment",
+        "target_field": "url.fragment",
+        "ignore_missing": true
+      }
+    },
+    {
+      "grok": {
+        "description": "Extract trailing extension from url.path for easy filtering on file types being probed",
+        "field": "url.path",
+        "patterns": [
+          "\\.(?<_url_ext>[a-zA-Z0-9]{1,10})$"
+        ],
+        "if": "ctx.url?.path != null",
+        "ignore_failure": true
+      }
+    },
+    {
+      "rename": {
+        "field": "_url_ext",
+        "target_field": "url.extension",
+        "ignore_missing": true
+      }
+    },
+
+    {
+      "geoip": {
+        "description": "Enrich source.ip with geographic data",
+        "field": "source.ip",
+        "target_field": "source.geo",
+        "ignore_missing": true,
+        "ignore_failure": true
+      }
+    },
+    {
+      "geoip": {
+        "description": "Enrich source.ip with ASN data",
+        "field": "source.ip",
+        "target_field": "source.as",
+        "database_file": "GeoLite2-ASN.mmdb",
+        "properties": [
+          "asn",
+          "organization_name"
+        ],
+        "ignore_missing": true,
+        "ignore_failure": true
+      }
+    },
+    {
+      "rename": {
+        "field": "source.as.asn",
+        "target_field": "source.as.number",
+        "ignore_missing": true
+      }
+    },
+    {
+      "rename": {
+        "field": "source.as.organization_name",
+        "target_field": "source.as.organization.name",
+        "ignore_missing": true
+      }
+    },
+
+    {
+      "set": {
+        "description": "Synthesise a human-readable message from method + URL",
+        "field": "message",
+        "value": "{{{http.request.method}}} {{{url.original}}}",
+        "if": "ctx.http?.request?.method != null && ctx.url?.original != null",
+        "ignore_failure": true
+      }
+    },
+
+    {
+      "set": {
+        "field": "event.kind",
+        "value": "event"
+      }
+    },
+    {
+      "set": {
+        "field": "event.module",
+        "value": "dshield"
+      }
+    },
+    {
+      "set": {
+        "field": "event.dataset",
+        "value": "dshield.webhoneypot"
+      }
+    },
+    {
+      "set": {
+        "field": "event.provider",
+        "value": "dshield"
+      }
+    },
+    {
+      "set": {
+        "field": "event.category",
+        "value": [
+          "web",
+          "intrusion_detection"
+        ]
+      }
+    },
+    {
+      "set": {
+        "field": "event.type",
+        "value": [
+          "access"
+        ]
+      }
+    },
+    {
+      "set": {
+        "field": "network.direction",
+        "value": "inbound"
+      }
+    },
+    {
+      "set": {
+        "field": "observer.type",
+        "value": "honeypot"
+      }
+    },
+    {
+      "set": {
+        "field": "observer.vendor",
+        "value": "SANS-ISC"
+      }
+    },
+    {
+      "set": {
+        "field": "observer.product",
+        "value": "DShield Web Honeypot"
+      }
+    },
+    {
+      "set": {
+        "field": "observer.ip",
+        "value": "{{{destination.ip}}}",
+        "if": "ctx.destination?.ip != null"
+      }
+    },
+    {
+      "set": {
+        "field": "labels.pipeline",
+        "value": "dshield.webhoneypot.v3"
+      }
+    },
+
+    {
+      "append": {
+        "field": "related.ip",
+        "value": "{{{source.ip}}}",
+        "allow_duplicates": false,
+        "if": "ctx.source?.ip != null"
+      }
+    },
+    {
+      "append": {
+        "field": "related.ip",
+        "value": "{{{destination.ip}}}",
+        "allow_duplicates": false,
+        "if": "ctx.destination?.ip != null"
+      }
+    },
+    {
+      "append": {
+        "field": "related.hosts",
+        "value": "{{{url.domain}}}",
+        "allow_duplicates": false,
+        "if": "ctx.url?.domain != null"
+      }
+    },
+
+    {
+      "script": {
+        "description": "Lossless guarantee: any webhoneypot.* field not explicitly promoted above is moved to dshield.unmapped.* and the document is tagged so the pipeline can be extended later. Empty parent is removed.",
+        "lang": "painless",
+        "source": "if (ctx.webhoneypot != null && ctx.webhoneypot instanceof Map && !ctx.webhoneypot.isEmpty()) { if (ctx.dshield == null) { ctx.dshield = [:]; } ctx.dshield.unmapped = ctx.webhoneypot; if (ctx.tags == null) { ctx.tags = []; } if (!ctx.tags.contains('_dshield_unmapped_fields')) { ctx.tags.add('_dshield_unmapped_fields'); } } ctx.remove('webhoneypot');",
+        "ignore_failure": true
+      }
+    }
+  ],
+  "on_failure": [
+    {
+      "append": {
+        "field": "tags",
+        "value": "_pipeline_error_dshield_webhoneypot"
+      }
+    },
+    {
+      "set": {
+        "field": "error.message",
+        "value": "{{{_ingest.on_failure_message}}}",
+        "ignore_failure": true
+      }
+    },
+    {
+      "set": {
+        "field": "error.type",
+        "value": "{{{_ingest.on_failure_processor_type}}}",
+        "ignore_failure": true
+      }
+    },
+    {
+      "set": {
+        "field": "error.processor",
+        "value": "{{{_ingest.on_failure_processor_tag}}}",
+        "ignore_failure": true
+      }
+    }
+  ]
+}
