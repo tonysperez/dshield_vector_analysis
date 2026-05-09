@@ -1,0 +1,30 @@
+[project]
+name = "dshield_vector_analysis"
+requires-python = ">=3.9"
+dependencies = [
+    "elasticsearch>=8.11,<9",
+    "httpx>=0.27",
+    "pydantic>=2.5",
+    "pydantic-settings>=2.1",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+# Phase 2: cloud LLM escalation
+cloud = ["anthropic>=0.40"]
+# Phase 3: clustering / novelty scoring
+cluster = [
+    "numpy>=1.26",
+    "hdbscan>=0.8.33",
+    "scikit-learn>=1.4",
+]
+
+[project.scripts]
+dshield_vector_analysis = "dshield_vector_analysis.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

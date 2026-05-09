@@ -1,0 +1,474 @@
+PUT _ingest/pipeline/dshield.cowrie.sessions
+{
+  "description": "Cowrie SSH/Telnet JSON events -> ECS",
+  "processors": [
+    {
+      "json": {
+        "field": "message",
+        "target_field": "cowrie",
+        "ignore_failure": true
+      }
+    },
+    {
+      "rename": {
+        "field": "message",
+        "target_field": "event.original",
+        "ignore_missing": true
+      }
+    },
+    {
+      "rename": {
+        "field": "cowrie.message",
+        "target_field": "message",
+        "ignore_missing": true
+      }
+    },
+    {
+      "date": {
+        "field": "cowrie.timestamp",
+        "formats": [
+          "ISO8601"
+        ],
+        "target_field": "@timestamp",
+        "ignore_failure": true
+      }
+    },
+    {
+      "remove": {
+        "field": "cowrie.timestamp",
+        "ignore_missing": true
+      }
+    },
+
+    {
+      "rename": {
+        "field": "cowrie.src_ip",
+        "target_field": "source.ip",
+        "ignore_missing": true
+      }
+    },
+    {
+      "rename": {
+        "field": "cowrie.src_port",
+        "target_field": "source.port",
+        "ignore_missing": true
+      }
+    },
+    {
+      "rename": {
+        "field": "cowrie.dst_ip",
+        "target_field": "destination.ip",
+        "ignore_missing": true
+      }
+    },
+    {
+      "rename": {
+        "field": "cowrie.dst_port",
+        "target_field": "destination.port",
+        "ignore_missing": true
+      }
+    },
+    {
+      "rename": {
+        "field": "cowrie.protocol",
+        "target_field": "network.protocol",
+        "ignore_missing": true
+      }
+    },
+    {
+      "rename": {
+        "field": "cowrie.sensor",
+        "target_field": "observer.name",
+        "ignore_missing": true
+      }
+    },
+    {
+      "remove": {
+        "field": "observer.name",
+        "if": "ctx.observer?.name == ''"
+      }
+    },
+
+    {
+      "rename": {
+        "field": "cowrie.session",
+        "target_field": "cowrie.session_id",
+        "ignore_missing": true
+      }
+    },
+    {
+      "rename": {
+        "field": "cowrie.eventid",
+        "target_field": "event.action",
+        "ignore_missing": true
+      }
+    },
+
+    {
+      "rename": {
+        "field": "cowrie.username",
+        "target_field": "user.name",
+        "ignore_missing": true
+      }
+    },
+
+    {
+      "rename": {
+        "description": "cowrie.password has no ECS equivalent; kept in the cowrie.* custom namespace intentionally",
+        "field": "cowrie.password",
+        "target_field": "cowrie.password",
+        "ignore_missing": true
+      }
+    },
+
+    {
+      "rename": {
+        "field": "cowrie.shasum",
+        "target_field": "file.hash.sha256",
+        "ignore_missing": true
+      }
+    },
+    {
+      "rename": {
+        "field": "cowrie.outfile",
+        "target_field": "file.path",
+        "ignore_missing": true
+      }
+    },
+    {
+      "grok": {
+        "description": "Extract file.name from the last path component of file.path",
+        "field": "file.path",
+        "patterns": [
+          ".*/(?<_file_name>[^/]+)$",
+          "^(?<_file_name>[^/]+)$"
+        ],
+        "if": "ctx.file?.path != null",
+        "ignore_failure": true
+      }
+    },
+    {
+      "rename": {
+        "field": "_file_name",
+        "target_field": "file.name",
+        "ignore_missing": true
+      }
+    },
+
+    {
+      "rename": {
+        "field": "cowrie.url",
+        "target_field": "url.original",
+        "ignore_missing": true
+      }
+    },
+    {
+      "grok": {
+        "description": "Parse url.original into scheme, domain, path, query, fragment",
+        "field": "url.original",
+        "patterns": [
+          "^(?<_url_scheme>[a-zA-Z][a-zA-Z0-9+\\-.]*):(?://(?<_url_domain>[^/?#]*))?(?<_url_path>[^?#]*)(?:\\?(?<_url_query>[^#]*))?(?:#(?<_url_fragment>.*))?$",
+          "^(?<_url_path>[^?#]*)(?:\\?(?<_url_query>[^#]*))?(?:#(?<_url_fragment>.*))?$"
+        ],
+        "if": "ctx.url?.original != null",
+        "ignore_failure": true
+      }
+    },
+    {
+      "rename": {
+        "field": "_url_scheme",
+        "target_field": "url.scheme",
+        "ignore_missing": true
+      }
+    },
+    {
+      "rename": {
+        "field": "_url_domain",
+        "target_field": "url.domain",
+        "ignore_missing": true
+      }
+    },
+    {
+      "rename": {
+        "field": "_url_path",
+        "target_field": "url.path",
+        "ignore_missing": true
+      }
+    },
+    {
+      "rename": {
+        "field": "_url_query",
+        "target_field": "url.query",
+        "ignore_missing": true
+      }
+    },
+    {
+      "rename": {
+        "field": "_url_fragment",
+        "target_field": "url.fragment",
+        "ignore_missing": true
+      }
+    },
+    {
+      "grok": {
+        "description": "Extract file extension from url.path",
+        "field": "url.path",
+        "patterns": [
+          "\\.(?<_url_ext>[a-zA-Z0-9]{1,10})$"
+        ],
+        "if": "ctx.url?.path != null",
+        "ignore_failure": true
+      }
+    },
+    {
+      "rename": {
+        "field": "_url_ext",
+        "target_field": "url.extension",
+        "ignore_missing": true
+      }
+    },
+
+    {
+      "rename": {
+        "field": "cowrie.input",
+        "target_field": "process.command_line",
+        "ignore_missing": true
+      }
+    },
+
+    {
+      "rename": {
+        "field": "cowrie.version",
+        "target_field": "user_agent.original",
+        "ignore_missing": true
+      }
+    },
+
+    {
+      "rename": {
+        "field": "cowrie.duration",
+        "target_field": "event.duration",
+        "ignore_missing": true
+      }
+    },
+    {
+      "script": {
+        "description": "Convert event.duration from seconds (Cowrie float) to nanoseconds (ECS long)",
+        "lang": "painless",
+        "source": "if (ctx.event?.duration != null) { ctx.event.duration = (long)(ctx.event.duration * 1000000000L); }",
+        "ignore_failure": true
+      }
+    },
+
+    {
+      "rename": {
+        "description": "Normalize cowrie.client.kex fields to snake_case",
+        "field": "cowrie.hasshAlgorithms",
+        "target_field": "cowrie.hassh_algorithms",
+        "ignore_missing": true
+      }
+    },
+    {
+      "rename": {
+        "field": "cowrie.kexAlgs",
+        "target_field": "cowrie.kex_algorithms",
+        "ignore_missing": true
+      }
+    },
+    {
+      "rename": {
+        "field": "cowrie.keyAlgs",
+        "target_field": "cowrie.key_algorithms",
+        "ignore_missing": true
+      }
+    },
+    {
+      "rename": {
+        "field": "cowrie.encCS",
+        "target_field": "cowrie.enc_cs",
+        "ignore_missing": true
+      }
+    },
+    {
+      "rename": {
+        "field": "cowrie.macCS",
+        "target_field": "cowrie.mac_cs",
+        "ignore_missing": true
+      }
+    },
+    {
+      "rename": {
+        "field": "cowrie.compCS",
+        "target_field": "cowrie.comp_cs",
+        "ignore_missing": true
+      }
+    },
+    {
+      "rename": {
+        "field": "cowrie.langCS",
+        "target_field": "cowrie.lang_cs",
+        "ignore_missing": true
+      }
+    },
+
+    {
+      "convert": {
+        "field": "source.port",
+        "type": "integer",
+        "ignore_missing": true
+      }
+    },
+    {
+      "convert": {
+        "field": "destination.port",
+        "type": "integer",
+        "ignore_missing": true
+      }
+    },
+
+    {
+      "set": {
+        "field": "event.kind",
+        "value": "event"
+      }
+    },
+    {
+      "set": {
+        "field": "event.module",
+        "value": "cowrie"
+      }
+    },
+    {
+      "set": {
+        "field": "event.dataset",
+        "value": "dshield.cowrie.session"
+      }
+    },
+    {
+      "set": {
+        "field": "event.provider",
+        "value": "cowrie"
+      }
+    },
+    {
+      "set": {
+        "field": "network.direction",
+        "value": "inbound"
+      }
+    },
+    {
+      "set": {
+        "field": "observer.type",
+        "value": "honeypot"
+      }
+    },
+    {
+      "set": {
+        "field": "observer.vendor",
+        "value": "SANS-ISC"
+      }
+    },
+    {
+      "set": {
+        "field": "observer.ip",
+        "value": "{{{destination.ip}}}",
+        "if": "ctx.destination?.ip != null"
+      }
+    },
+
+    {
+      "script": {
+        "description": "Set network.type from source.ip",
+        "lang": "painless",
+        "source": "if (ctx.source?.ip != null) { ctx.network = ctx.network ?: [:]; ctx.network.type = ctx.source.ip.contains(':') ? 'ipv6' : 'ipv4'; }"
+      }
+    },
+
+    {
+      "script": {
+        "description": "ECS event.category / event.type / event.outcome per Cowrie eventid",
+        "lang": "painless",
+        "source": "String a = ctx.event?.action; if (a == null) return; if (a == 'cowrie.login.success') { ctx.event.category = ['authentication']; ctx.event.type = ['start']; ctx.event.outcome = 'success'; } else if (a == 'cowrie.login.failed') { ctx.event.category = ['authentication']; ctx.event.type = ['start']; ctx.event.outcome = 'failure'; } else if (a == 'cowrie.session.connect') { ctx.event.category = ['network']; ctx.event.type = ['connection']; ctx.event.outcome = 'success'; } else if (a == 'cowrie.session.closed') { ctx.event.category = ['network']; ctx.event.type = ['end']; ctx.event.outcome = 'success'; } else if (a == 'cowrie.client.version') { ctx.event.category = ['network']; ctx.event.type = ['info']; } else if (a == 'cowrie.client.kex') { ctx.event.category = ['network']; ctx.event.type = ['info']; } else if (['cowrie.command.input', 'cowrie.command.failed', 'cowrie.command.success'].contains(a)) { ctx.event.category = ['process']; ctx.event.type = ['info']; } else if (['cowrie.session.file_download', 'cowrie.session.file_upload', 'cowrie.session.file_download.failed'].contains(a)) { ctx.event.category = ['file']; ctx.event.type = ['creation']; } else if (a.startsWith('cowrie.direct-tcpip')) { ctx.event.category = ['intrusion_detection']; ctx.event.type = ['info']; }"
+      }
+    },
+
+    {
+      "geoip": {
+        "description": "Enrich source.ip with geographic data",
+        "field": "source.ip",
+        "target_field": "source.geo",
+        "ignore_missing": true,
+        "ignore_failure": true
+      }
+    },
+    {
+      "geoip": {
+        "description": "Enrich source.ip with ASN data",
+        "field": "source.ip",
+        "target_field": "source.as",
+        "database_file": "GeoLite2-ASN.mmdb",
+        "properties": [
+          "asn",
+          "organization_name"
+        ],
+        "ignore_missing": true,
+        "ignore_failure": true
+      }
+    },
+    {
+      "rename": {
+        "field": "source.as.asn",
+        "target_field": "source.as.number",
+        "ignore_missing": true
+      }
+    },
+    {
+      "rename": {
+        "field": "source.as.organization_name",
+        "target_field": "source.as.organization.name",
+        "ignore_missing": true
+      }
+    },
+
+    {
+      "append": {
+        "field": "related.ip",
+        "value": "{{{source.ip}}}",
+        "allow_duplicates": false,
+        "if": "ctx.source?.ip != null"
+      }
+    },
+    {
+      "append": {
+        "field": "related.ip",
+        "value": "{{{destination.ip}}}",
+        "allow_duplicates": false,
+        "if": "ctx.destination?.ip != null"
+      }
+    },
+    {
+      "append": {
+        "field": "related.user",
+        "value": "{{{user.name}}}",
+        "allow_duplicates": false,
+        "if": "ctx.user?.name != null"
+      }
+    },
+    {
+      "append": {
+        "field": "related.hash",
+        "value": "{{{file.hash.sha256}}}",
+        "allow_duplicates": false,
+        "if": "ctx.file?.hash?.sha256 != null"
+      }
+    }
+  ],
+  "on_failure": [
+    {
+      "append": {
+        "field": "tags",
+        "value": "_pipeline_error_cowrie_session"
+      }
+    }
+  ]
+}

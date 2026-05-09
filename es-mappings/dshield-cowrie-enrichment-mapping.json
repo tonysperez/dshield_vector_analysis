@@ -1,0 +1,113 @@
+{
+  "_comment": "ECS-compliant where ECS has a fitting field; cowrie-specific enrichment values nested under dshield.cowrie.enrichment.*. Field-namespace convention follows misc/cowrie-pipelinev2.yml + misc/webhoneypot-pipelinev2.yml (dshield.<source>.*). ECS version target: 8.x.",
+  "settings": {
+    "number_of_shards": 1,
+    "number_of_replicas": 0,
+    "refresh_interval": "30s"
+  },
+  "mappings": {
+    "properties": {
+      "@timestamp":   { "type": "date" },
+
+      "event": {
+        "properties": {
+          "kind":      { "type": "keyword" },
+          "category":  { "type": "keyword" },
+          "type":      { "type": "keyword" },
+          "module":    { "type": "keyword" },
+          "dataset":   { "type": "keyword" },
+          "provider":  { "type": "keyword" },
+          "ingested":  { "type": "date" },
+          "start":     { "type": "date" },
+          "end":       { "type": "date" },
+          "id":        { "type": "keyword" },
+          "reason":    { "type": "text" }
+        }
+      },
+
+      "process": {
+        "properties": {
+          "command_line": {
+            "type": "text",
+            "fields": { "keyword": { "type": "keyword", "ignore_above": 8192 } }
+          },
+          "hash": {
+            "properties": {
+              "sha256": { "type": "keyword" }
+            }
+          }
+        }
+      },
+
+      "observer": {
+        "properties": {
+          "type":   { "type": "keyword" },
+          "vendor": { "type": "keyword" }
+        }
+      },
+
+      "threat": {
+        "properties": {
+          "framework": { "type": "keyword" },
+          "tactic": {
+            "properties": {
+              "id":   { "type": "keyword" },
+              "name": { "type": "keyword" }
+            }
+          },
+          "technique": {
+            "properties": {
+              "id":   { "type": "keyword" },
+              "name": { "type": "keyword" }
+            }
+          },
+          "indicator": {
+            "type": "nested",
+            "properties": {
+              "type":   { "type": "keyword" },
+              "ip":     { "type": "ip" },
+              "domain": { "type": "keyword" },
+              "url":    { "properties": { "full": { "type": "keyword" } } },
+              "file": {
+                "properties": {
+                  "name": { "type": "keyword" },
+                  "hash": { "properties": { "sha256": { "type": "keyword" } } }
+                }
+              }
+            }
+          }
+        }
+      },
+
+      "dshield": {
+        "properties": {
+          "cowrie": {
+            "properties": {
+              "enrichment": {
+                "properties": {
+                  "intent":             { "type": "keyword" },
+                  "confidence":         { "type": "byte" },
+                  "model":              { "type": "keyword" },
+                  "prompt_version":     { "type": "keyword" },
+                  "occurrence_count":   { "type": "long" },
+                  "unique_sessions":    { "type": "long" },
+                  "unique_source_ips":  { "type": "long" },
+                  "command_truncated":  { "type": "boolean" },
+                  "embedding":          { "type": "dense_vector", "dims": 768, "index": true, "similarity": "cosine" },
+                  "cluster": {
+                    "properties": {
+                      "id":            { "type": "keyword" },
+                      "novelty_score": { "type": "float" },
+                      "is_outlier":    { "type": "boolean" },
+                      "scored_at":     { "type": "date" }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

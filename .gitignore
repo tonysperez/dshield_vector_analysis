@@ -1,0 +1,16 @@
+# Per-deploy / secret config — never commit
+.env
+config/local.yaml
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+build/
+dist/
+
+# Worker state
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm

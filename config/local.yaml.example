@@ -1,0 +1,30 @@
+# Per-deploy overrides. Copy to config/local.yaml (or local.yml) and edit. DO NOT COMMIT.
+# Any key here overrides the same key in default.yaml. Omit anything you don't want to override.
+
+elasticsearch:
+  hosts: ["https://localhost:9200"]
+  verify_certs: false
+  ca_certs: null    # e.g. "/etc/pki/ca-trust/source/anchors/so-ca.pem"
+  # If your SO instance uses a different cowrie index pattern:
+  # events_index: "logs-dshield.cowrie.session-*"
+  # Index that enriched docs are written to. Change to namespace per-sensor or per-env.
+  # `apply-template` CLI uses this name for both the template and initial index.
+  # enrichment_index: "enriched-dsheild_cowrie_sessions-default"
+
+llm:
+  # "ollama" or "openai_compat" (LM Studio / vLLM / llama.cpp server)
+  provider: "openai_compat"
+  # REQUIRED: server URL. Examples:
+  #   Ollama:     http://192.0.2.10:11434
+  #   LM Studio:  http://192.0.2.10:1234   (or whatever port you set)
+  # Model identifiers — must match what's loaded on the server.
+  # Ollama uses name:tag (e.g. "qwen2.5:7b-instruct-q4_K_M").
+  # LM Studio uses the model name as shown in its UI.
+  generation_model: "qwen2.5-7b-instruct"
+  embedding_model: "text-embedding-nomic-embed-text-v1.5@q8_0"
+  # api_key: "lm-studio"   # uncomment if your server requires auth
+
+worker:
+  state_db: "/var/lib/dshield_vector_analysis/state.sqlite"
+  initial_lookback_days: null
+  # prompt_version: "v2"   # bump after editing the prompt to force re-enrichment

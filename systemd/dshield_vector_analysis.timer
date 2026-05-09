@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Cowrie enrichment hourly
+Requires=dshield_vector_analysis.service
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=300
+Persistent=true
+Unit=dshield_vector_analysis.service
+
+[Install]
+WantedBy=timers.target

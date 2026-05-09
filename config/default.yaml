@@ -1,0 +1,31 @@
+# Default config. Safe to commit. Per-deploy overrides go in config/local.yaml (or local.yml; gitignored).
+# Final config = default.yaml deep-merged with local.yaml. Secrets (ES creds) live in .env.
+
+elasticsearch:
+  hosts: ["https://localhost:9200"]
+  verify_certs: false
+  ca_certs: null
+  events_index: "logs-dshield.cowrie.session-*"
+  enrichment_index: "enriched-dsheild_cowrie_sessions-default"
+  request_timeout: 60
+
+llm:
+  # provider: "ollama" (Ollama API) or "openai_compat" (LM Studio, vLLM, llama.cpp server)
+  provider: "ollama"
+  # base_url MUST be overridden in local.yaml.
+  generation_model: "qwen2.5:7b-instruct-q4_K_M"
+  embedding_model: "nomic-embed-text"
+  request_timeout: 120
+  max_retries: 2
+  api_key: null   # only needed for openai_compat servers that require auth
+
+worker:
+  state_db: "/var/lib/dshield_vector_analysis/state.sqlite"
+  page_size: 1000
+  command_max_chars: 4000
+  prompt_version: "v2"
+  initial_lookback_days: null
+  log_level: "INFO"
+
+prompts:
+  command_enrichment: "config/prompts/command_enrichment.txt"
