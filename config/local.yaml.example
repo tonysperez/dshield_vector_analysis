@@ -17,6 +17,7 @@ llm:
   # REQUIRED: server URL. Examples:
   #   Ollama:     http://192.0.2.10:11434
   #   LM Studio:  http://192.0.2.10:1234   (or whatever port you set)
+  base_url: "http://192.0.2.10:11434"
   # Model identifiers — must match what's loaded on the server.
   # Ollama uses name:tag (e.g. "qwen2.5:7b-instruct-q4_K_M").
   # LM Studio uses the model name as shown in its UI.
