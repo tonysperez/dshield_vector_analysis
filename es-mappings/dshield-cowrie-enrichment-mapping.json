@@ -94,6 +94,18 @@
                   "unique_source_ips":  { "type": "long" },
                   "command_truncated":  { "type": "boolean" },
                   "embedding":          { "type": "dense_vector", "dims": 768, "index": true, "similarity": "cosine" },
+                  "triage_reasons":     { "type": "keyword" },
+                  "notes":              { "type": "text" },
+                  "local_fallback": {
+                    "properties": {
+                      "intent":      { "type": "keyword" },
+                      "confidence":  { "type": "byte" },
+                      "model":       { "type": "keyword" },
+                      "description": { "type": "text" },
+                      "tactics":     { "type": "keyword" },
+                      "techniques":  { "type": "keyword" }
+                    }
+                  },
                   "cluster": {
                     "properties": {
                       "id":            { "type": "keyword" },

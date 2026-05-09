@@ -29,6 +29,35 @@ class LLMConfig(BaseModel):
     api_key: Optional[str] = None  # for openai_compat servers that require it
 
 
+class CloudTriageConfig(BaseModel):
+    confidence_max: int = 5  # escalate if local confidence <= this (1-10)
+    sample_rate: float = 0.01  # random sample fraction for monitoring
+    base64_min_run: int = 200  # length threshold for suspicious base64 blob
+    suspicious_tlds: list[str] = Field(default_factory=lambda: [
+        "xyz", "top", "tk", "ml", "ga", "cf", "gq", "club", "icu", "buzz",
+        "monster", "rest", "bar", "fit", "online", "site", "stream", "cam",
+    ])
+
+
+class CloudPricingConfig(BaseModel):
+    """USD per 1M tokens. Override in local.yaml to match the model picked."""
+    input_per_mtok: float = 3.0
+    output_per_mtok: float = 15.0
+
+
+class CloudConfig(BaseModel):
+    enabled: bool = False
+    provider: str = "anthropic"
+    base_url: Optional[str] = None  # default Anthropic API
+    model: str = "claude-sonnet-4-6"
+    max_tokens: int = 1024
+    request_timeout: int = 120
+    daily_budget_usd: float = 5.0
+    rpm_limit: int = 10
+    triage: CloudTriageConfig = Field(default_factory=CloudTriageConfig)
+    pricing: CloudPricingConfig = Field(default_factory=CloudPricingConfig)
+
+
 class WorkerConfig(BaseModel):
     state_db: str
     page_size: int = 1000
@@ -40,6 +69,7 @@ class WorkerConfig(BaseModel):
 
 class PromptsConfig(BaseModel):
     command_enrichment: str
+    command_deep_dive: Optional[str] = None
 
 
 class AppConfig(BaseModel):
@@ -47,6 +77,7 @@ class AppConfig(BaseModel):
     llm: LLMConfig
     worker: WorkerConfig
     prompts: PromptsConfig
+    cloud: CloudConfig = Field(default_factory=CloudConfig)
 
 
 class Secrets(BaseSettings):
@@ -61,6 +92,7 @@ class Secrets(BaseSettings):
     es_username: Optional[str] = None
     es_password: Optional[str] = None
     es_api_key: Optional[str] = None
+    anthropic_api_key: Optional[str] = None
 
 
 def _deep_merge(base: dict, over: dict) -> dict:

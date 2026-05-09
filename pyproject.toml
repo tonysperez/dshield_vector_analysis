@@ -11,8 +11,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Phase 2: cloud LLM escalation
-cloud = ["anthropic>=0.40"]
 # Phase 3: clustering / novelty scoring
 cluster = [
     "numpy>=1.26",

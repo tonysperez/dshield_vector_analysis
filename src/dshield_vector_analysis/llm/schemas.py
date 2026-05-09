@@ -51,3 +51,8 @@ class CommandEnrichment(BaseModel):
     @classmethod
     def _strip_upper(cls, v: list[str]) -> list[str]:
         return [s.strip().upper() for s in v if s and s.strip()]
+
+
+class CloudCommandEnrichment(CommandEnrichment):
+    """Cloud (Claude) variant adds optional analyst notes (actor/campaign hypotheses)."""
+    notes: str = ""

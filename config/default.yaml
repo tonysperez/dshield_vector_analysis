@@ -6,14 +6,14 @@ elasticsearch:
   verify_certs: false
   ca_certs: null
   events_index: "logs-dshield.cowrie.session-*"
-  enrichment_index: "enriched-dsheild_cowrie_sessions-default"
+  enrichment_index: "enriched-dshield_cowrie_sessions-default"
   request_timeout: 60
 
 llm:
   # provider: "ollama" (Ollama API) or "openai_compat" (LM Studio, vLLM, llama.cpp server)
   provider: "ollama"
   # base_url MUST be overridden in local.yaml.
-  generation_model: "qwen2.5:7b-instruct-q4_K_M"
+  generation_model: "lmstudio-community/qwen2.5:7b-instruct-q4_K_M"
   embedding_model: "nomic-embed-text"
   request_timeout: 120
   max_retries: 2
@@ -23,9 +23,49 @@ worker:
   state_db: "/var/lib/dshield_vector_analysis/state.sqlite"
   page_size: 1000
   command_max_chars: 4000
-  prompt_version: "v2"
+  # Bump after editing either prompt to force re-enrichment. v3 = Phase 2 (cloud).
+  prompt_version: "v3"
   initial_lookback_days: null
   log_level: "INFO"
 
+# Phase 2 — cloud LLM escalation. Off by default; enable per-deploy in local.yaml.
+cloud:
+  enabled: false
+  provider: "anthropic"
+  base_url: null            # null = Anthropic public API
+  model: "claude-sonnet-4-6"
+  max_tokens: 1024
+  request_timeout: 120
+  daily_budget_usd: 5.0
+  rpm_limit: 10
+  triage:
+    confidence_max: 5       # escalate when local confidence is <= this (1-10)
+    sample_rate: 0.01       # 1% random sampling for quality monitoring
+    base64_min_run: 200     # length threshold for "suspicious base64 blob"
+    suspicious_tlds:
+      - xyz
+      - top
+      - tk
+      - ml
+      - ga
+      - cf
+      - gq
+      - club
+      - icu
+      - buzz
+      - monster
+      - rest
+      - bar
+      - fit
+      - online
+      - site
+      - stream
+      - cam
+  pricing:
+    # USD per 1M tokens. Update to match the model you point at.
+    input_per_mtok: 3.0
+    output_per_mtok: 15.0
+
 prompts:
   command_enrichment: "config/prompts/command_enrichment.txt"
+  command_deep_dive:  "config/prompts/command_deep_dive.txt"

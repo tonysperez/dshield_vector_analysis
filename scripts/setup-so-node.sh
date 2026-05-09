@@ -231,12 +231,39 @@ fi
 # ---- G. systemd ------------------------------------------------------------
 
 if (( INSTALL_SYSTEMD )); then
-    log "Installing systemd units"
-    install -m 0644 "${INSTALL_DIR}/systemd/dshield_vector_analysis.service" "${SYSTEMD_DIR}/dshield_vector_analysis.service"
-    install -m 0644 "${INSTALL_DIR}/systemd/dshield_vector_analysis.timer"   "${SYSTEMD_DIR}/dshield_vector_analysis.timer"
+    log "Syncing systemd units"
 
-    systemctl daemon-reload
-    systemctl enable --now dshield_vector_analysis.timer
+    # Install unit only if missing or content differs from source. Track which
+    # units changed so we can daemon-reload + restart the timer exactly once
+    # when needed (and skip churn when nothing changed).
+    UNITS_CHANGED=0
+    for unit in dshield_vector_analysis.service dshield_vector_analysis.timer; do
+        src="${INSTALL_DIR}/systemd/${unit}"
+        dst="${SYSTEMD_DIR}/${unit}"
+        if [[ ! -f "${dst}" ]]; then
+            log "  ${unit}: installing (missing)"
+            install -m 0644 "${src}" "${dst}"
+            UNITS_CHANGED=1
+        elif ! cmp -s "${src}" "${dst}"; then
+            log "  ${unit}: updating (outdated)"
+            install -m 0644 "${src}" "${dst}"
+            UNITS_CHANGED=1
+        else
+            log "  ${unit}: up-to-date"
+        fi
+    done
+
+    if (( UNITS_CHANGED )); then
+        log "Reloading systemd"
+        systemctl daemon-reload
+        # Re-enable in case unit content changed enable behavior; --now is a no-op if already active.
+        systemctl enable --now dshield_vector_analysis.timer
+        # Bounce timer so new OnCalendar/Unit settings take effect immediately.
+        systemctl restart dshield_vector_analysis.timer
+    else
+        # Still ensure timer is enabled + active on first run after a no-change re-deploy.
+        systemctl enable --now dshield_vector_analysis.timer
+    fi
 
     log "Timer status:"
     systemctl --no-pager list-timers dshield_vector_analysis.timer || true

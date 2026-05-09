@@ -14,22 +14,22 @@ This project adds an offline analysis layer which:
 2. **Deduplicates** repeated payloads by hashing the normalized event text. Common bot commands collapse into one doc to keep the long tail distinct.
 3. **Enriches** each unique payload with a local LLM: attack description, MITRE ATT&CK tactic / technique IDs, IOC extraction, intent classification, and a self-rated confidence score.
 4. **Embeds** each payload into a 768-dimensional vector for similarity search and clustering.
-5. **Writes** the result to separate, project-owned, ECS-compliant indecies that can be queried, joined back to their associated log events, and pivoted on in Kibana without risking the SO-managed pipelines.
+5. **Writes** the result to separate, project-owned, ECS-compliant indices that can be queried, joined back to their associated log events, and pivoted on in Kibana without risking the SO-managed pipelines.
 
 Output is structured, timestamped, and queryable the same way any other ECS data on the box. The current scope is Cowrie SSH honeypot data. The field-namespace convention (`dshield.<source>.enrichment.*`) is designed to extend to other DShield log sources later.
 
 ## Intended environment
 
 - A small-to-medium DShield sensor
-- A SecurityOnion 2.x box doing the SIEM work, with the cowrie ingest pipeline from `elastic_pipeline/cowrie-pipeline.yml` already in place (While designed to run on SecurityOnion, this should work on any ElasticSearch stack).
-- A separate machine with a GPU or NPU (8 GB VRAM fits a 7B Q4 generation model + 768-dim embedding model side by side) running either Ollama or an OpenAI-compatable equivilent.
+- A SecurityOnion 2.x box doing the SIEM work, with the cowrie ingest pipeline from `es-pipelines/cowrie-pipeline.yml` already in place (While designed to run on SecurityOnion, this should work on any ElasticSearch stack).
+- A separate machine with a GPU or NPU (8 GB VRAM fits a 7B Q4 generation model + 768-dim embedding model side by side) running either Ollama or an OpenAI-compatible equivalent.
 
 ## Roadmap
 
 | Phase | Status | What it adds |
 |---|---|---|
 | **1 - Command enrichment (local LLM)** | implemented | Per-unique-command doc with description, intent, MITRE IDs, IOCs, embedding, confidence. SQLite cache + watermark for incremental runs |
-| **2 - Cloud escalation** | planned | Selectively route hard / novel / low-confidence commands to Claude for better labels. Daily $$ budget cap. Triage reasons logged on each escalated doc |
+| **2 - Cloud escalation** | implemented | Selectively route hard / novel / low-confidence commands to Claude for better labels. Daily $$ budget cap. Triage reasons logged on each escalated doc |
 | **3 - Clustering + novelty** | planned | HDBSCAN over command embeddings; populates `dshield.cowrie.enrichment.cluster.{id, novelty_score, is_outlier}`. "Show me everything weird this week" becomes one query |
 | **4 - Session + IP rollups** | planned | Aggregate command embeddings into per-session and per-IP vectors; cluster IPs into "campaigns"; surface IPs that don't fit any cluster (lone-wolf or new-campaign signal) |
 | **5 - Eval + monitoring** | planned | Hand-labeled regression set; weekly F1 against ground truth; structured worker logs to ES; alerts on budget / drift / failure rate |
@@ -95,7 +95,7 @@ The worker only **reads** from the SO-managed Cowrie events index. All enriched 
 | `config/default.yaml` | Default worker config (committed) |
 | `config/local.yaml.example` | Template for per-deploy overrides — copy to `local.yaml` (gitignored) |
 | `config/prompts/command_enrichment.txt` | LLM prompt template |
-| `src/dshield_vector_analysis/` | Python package: `cli`, `config`, `cache`, `es_client`, `enrich`, `healthcheck`, `llm/{ollama,openai_compat,schemas}` |
+| `src/dshield_vector_analysis/` | Python package: `cli`, `config`, `cache`, `es_client`, `enrich`, `healthcheck`, `triage`, `llm/{ollama,openai_compat,anthropic,schemas}` |
 | `es-mappings/dshield-cowrie-enrichment-mapping.json` | Settings + ECS-compliant mappings for the enrichment index |
 | `systemd/dshield_vector_analysis.service` + `.timer` | Hourly oneshot service + timer |
 | `scripts/setup-so-node.sh` | One-shot, idempotent SO-box installer |
@@ -114,11 +114,14 @@ sudo -u dshield_vector_analysis .venv/bin/python -m dshield_vector_analysis.cli 
 
 | Subcommand | What it does |
 |---|---|
-| `healthcheck` | Verify ES + LLM server + models + SQLite. Exits non-zero on failure. |
+| `healthcheck` | Verify ES + LLM server + models + SQLite + cloud. Exits non-zero on failure. |
+| `healthcheck --scope <s>` | Run a subset. Comma-separated; valid: `es`, `llm`, `sqlite`, `cloud-conn`, `cloud`, or `all` (default). **Default / `all` runs the *cheap* cloud check (`cloud-conn`)** — `GET /v1/models` against Anthropic, zero generation tokens — so scripts, timers, and the setup runner can call `healthcheck` without burning budget. The full `cloud` scope (~16-token round-trip + budget readout) is **opt-in for user troubleshooting only**: `healthcheck --scope cloud`. Output is `[ok]` / `[warn]` / `[FAIL]` lines plus a summary, suitable for `ExecStartPre` gating — the systemd unit uses `--scope llm` so only a local-LLM outage blocks `enrich`. Cloud reachability is preflighted inside `enrich` itself (Anthropic `ping`); on failure the run degrades to local-only and logs a warning rather than failing. |
 | `init-index` | `PUT <enrichment_index>` with explicit ECS settings + mappings. Idempotent (no-op if index exists). |
 | `init-index --update-mapping` | If index exists, push **additive** mapping changes (new fields). Cannot change existing field types. |
 | `enrich` | One enrichment pass: read new events, dedup, embed, LLM-classify, bulk-write, advance watermark. |
 | `enrich --dry-run` | Read + group events, print stats; skip LLM and writes. |
+| `enrich --no-cloud` | Force-disable Phase 2 cloud escalation for this run, even if `cloud.enabled=true` in config. |
+| `budget` | Print today's cloud-LLM spend, daily cap, calls, token totals (Phase 2). |
 | `reset` | Clear local SQLite state. Default: cache + watermark. Flags: `--cache`, `--watermark`, `--all`, `--yes` (skip confirmation). Does NOT touch ES. |
 
 ---
@@ -179,7 +182,7 @@ sudo -u dshield_vector_analysis /opt/dshield_vector_analysis/.venv/bin/python \
 
 ### 1. GPU box — install your LLM server
 
-The worker is currently compatiable with both ollama and OpenAI via the `llm.provider` config field.
+The worker is currently compatible with both ollama and OpenAI via the `llm.provider` config field.
 
 #### Option A — Ollama
 
@@ -343,7 +346,7 @@ journalctl -u dshield_vector_analysis.service -n 200 --no-pager
 
 ### 10. Quick Kibana sanity
 
-In Kibana, add an index pattern matching your `enrichment_index` (default `enriched-dsheild_cowrie_sessions-default*`, time field `@timestamp`).
+In Kibana, add an index pattern matching your `enrichment_index` (default `enriched-dshield_cowrie_sessions-default*`, time field `@timestamp`).
 
 Sample queries (KQL):
 - `dshield.cowrie.enrichment.intent : "cryptomining"` — top miner droppers
@@ -352,6 +355,56 @@ Sample queries (KQL):
 - `threat.framework : "MITRE ATT&CK" and threat.tactic.id : "TA0011"` — C2 traffic
 - Sort by `dshield.cowrie.enrichment.occurrence_count desc` — top-N commodity payloads
 - IOC pivot (nested): `threat.indicator : { type : "url" }` then drill into `threat.indicator.url.full`
+
+---
+
+## Phase 2 — enabling cloud escalation
+
+Off by default. Phase 1 must already be running and producing docs. To turn it on:
+
+1. **Get an Anthropic API key** and add it to `.env`:
+   ```
+   ANTHROPIC_API_KEY=sk-ant-...
+   ```
+2. **Flip cloud on in `config/local.yaml`**:
+   ```yaml
+   cloud:
+     enabled: true
+     # model: "claude-sonnet-4-6"
+     # daily_budget_usd: 5.0
+   ```
+3. **Push the additive mapping** so `triage_reasons`, `notes`, and `local_fallback.*` exist on the index:
+   ```bash
+   sudo -u dshield_vector_analysis .venv/bin/python -m dshield_vector_analysis.cli init-index --update-mapping
+   ```
+4. **Bump `prompt_version`** (default already `v3`) and `reset --cache --yes` if you want previously-cached commands re-evaluated through the new triage path.
+5. **Healthcheck** — confirms Anthropic reachability + budget:
+   ```bash
+   sudo -u dshield_vector_analysis .venv/bin/python -m dshield_vector_analysis.cli healthcheck
+   ```
+6. **Run** as normal. After a pass, `enrich` returns extra stats: `triaged`, `cloud_calls`, `cloud_input_tokens`, `cloud_output_tokens`, `cloud_cost_usd`, `cloud_skipped_budget`. Daily spend is also queryable via:
+   ```bash
+   sudo -u dshield_vector_analysis .venv/bin/python -m dshield_vector_analysis.cli budget
+   ```
+
+**Triage rules** (any rule fires → escalate; recorded in `dshield.cowrie.enrichment.triage_reasons`):
+
+| Rule code | When it fires |
+|---|---|
+| `low_confidence<=N` | Local model's `confidence` is at or below `cloud.triage.confidence_max` |
+| `local_failed` | Local LLM returned invalid JSON twice |
+| `base64_blob` | Command contains a base64-ish run ≥ `cloud.triage.base64_min_run` chars |
+| `ip_literal` | An IPv4 literal appears in the command |
+| `rare_tld` | A domain in the command uses a TLD listed in `cloud.triage.suspicious_tlds` |
+| `sample` | Random `cloud.triage.sample_rate` fraction (default 1%) — quality monitoring |
+| `budget_exhausted` | Triage wanted to escalate but daily cap was already hit; no cloud call made |
+| `cloud_parse_failed` | Cloud was called but returned unparseable JSON; doc keeps local fields |
+
+The "novel embedding" rule from the original plan depends on Phase 3 cluster output and will be added once clustering ships.
+
+**Cost control:** every cloud call's input + output tokens are converted to USD via `cloud.pricing.{input,output}_per_mtok` and tallied per UTC day in SQLite. Once the day's spend ≥ `cloud.daily_budget_usd`, further escalations are skipped (the doc still gets the local-only enrichment, with `triage_reasons: ["…", "budget_exhausted"]`). Update `pricing` if you change models — the defaults track Claude Sonnet 4.6 and may not match your model.
+
+**Cache semantics:** a successful local-only enrichment is cached with key `(short_hash, generation_model, prompt_version)`. A cloud rewrite of that same hash is also cached (under the same key — `prompt_version` covers both prompts together; bump it when either prompt changes). `local_failed` results without a cloud rescue stay uncached so they retry next run.
 
 ---
 
@@ -365,7 +418,7 @@ The doc shape is ECS-compliant: standard fields under `event.*`, `process.*`, `o
 | `event.kind` | keyword | `"enrichment"` |
 | `event.category` / `event.type` | keyword[] | `["process"]` / `["info"]` |
 | `event.module` / `event.dataset` | keyword | `"cowrie"` / `"dshield.cowrie.enrichment.command"` |
-| `event.provider` | keyword | `"local"` or `"local_failed"` (Phase 2 will add `"claude"`) |
+| `event.provider` | keyword | `"local"`, `"local_failed"`, or `"claude"` (Phase 2 cloud-rewritten doc) |
 | `event.start` / `event.end` | date | First / last seen across grouped events |
 | `event.id` | keyword | 16-char sha256 prefix; same as ES `_id` |
 | `event.reason` | text | LLM-generated description (length scales with command complexity) |
@@ -386,6 +439,9 @@ The doc shape is ECS-compliant: standard fields under `event.*`, `process.*`, `o
 | `dshield.cowrie.enrichment.unique_source_ips` | long | Distinct attacker IPs |
 | `dshield.cowrie.enrichment.command_truncated` | boolean | True if command was >4000 chars |
 | `dshield.cowrie.enrichment.embedding` | dense_vector(768) | For kNN / clustering |
+| `dshield.cowrie.enrichment.triage_reasons` | keyword[] | Phase 2: rule codes that fired for this doc (`low_confidence<=N`, `local_failed`, `base64_blob`, `ip_literal`, `rare_tld`, `sample`, `budget_exhausted`, `cloud_parse_failed`) |
+| `dshield.cowrie.enrichment.notes` | text | Phase 2: free-text analyst notes from the cloud model (actor/family/campaign hypotheses) |
+| `dshield.cowrie.enrichment.local_fallback.*` | object | Phase 2: snapshot of the local model's output, retained when the doc is rewritten by cloud |
 | `dshield.cowrie.enrichment.cluster.*` | object | Phase 3 placeholder (id / novelty_score / is_outlier / scored_at) |
 
 ### Pivoting between events and enrichment

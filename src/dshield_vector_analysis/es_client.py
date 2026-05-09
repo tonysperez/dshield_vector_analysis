@@ -27,7 +27,7 @@ def init_index(es: Elasticsearch, mapping_path: str, index_name: str) -> dict:
     """
     if es.indices.exists(index=index_name):
         return {"index_exists": index_name, "action": "noop"}
-    es.indices.create(index=index_name, body=_load_mapping(mapping_path))
+    es.indices.create(index=index_name, **_load_mapping(mapping_path))
     return {"index_created": index_name, "action": "created"}
 
 
@@ -40,7 +40,7 @@ def update_mapping(es: Elasticsearch, mapping_path: str, index_name: str) -> dic
     mappings = _load_mapping(mapping_path).get("mappings", {})
     if not mappings:
         return {"action": "noop", "reason": "no mappings in file"}
-    es.indices.put_mapping(index=index_name, body=mappings)
+    es.indices.put_mapping(index=index_name, **mappings)
     return {"action": "mapping_updated", "index": index_name}
 
 
@@ -95,7 +95,7 @@ def iter_command_events(
     while True:
         if search_after:
             body["search_after"] = search_after
-        resp = es.search(index=index, body=body)
+        resp = es.search(index=index, **body)
         hits = resp["hits"]["hits"]
         if not hits:
             return

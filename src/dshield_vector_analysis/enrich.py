@@ -15,7 +15,8 @@ from .cache import StateDB
 from .config import AppConfig, Secrets, load_prompt
 from .es_client import bulk_write, iter_command_events, make_client
 from .llm import make_llm_client
-from .llm.schemas import CommandEnrichment
+from .llm.schemas import CommandEnrichment, CloudCommandEnrichment
+from . import triage as triage_mod
 
 log = logging.getLogger(__name__)
 
@@ -109,7 +110,27 @@ def _build_ecs_doc(
     techniques: list[str],
     indicators: list[dict],
     embedding: list[float],
+    triage_reasons: Optional[list[str]] = None,
+    notes: str = "",
+    local_fallback: Optional[dict] = None,
 ) -> dict:
+    enrichment_block = {
+        "intent": intent,
+        "confidence": confidence,
+        "model": model,
+        "prompt_version": prompt_version,
+        "occurrence_count": occurrence_count,
+        "unique_sessions": unique_sessions,
+        "unique_source_ips": unique_source_ips,
+        "command_truncated": truncated,
+        "embedding": embedding,
+    }
+    if triage_reasons:
+        enrichment_block["triage_reasons"] = triage_reasons
+    if notes:
+        enrichment_block["notes"] = notes
+    if local_fallback:
+        enrichment_block["local_fallback"] = local_fallback
     return {
         "@timestamp": now,
         "event": {
@@ -141,17 +162,7 @@ def _build_ecs_doc(
         },
         "dshield": {
             "cowrie": {
-                "enrichment": {
-                    "intent": intent,
-                    "confidence": confidence,
-                    "model": model,
-                    "prompt_version": prompt_version,
-                    "occurrence_count": occurrence_count,
-                    "unique_sessions": unique_sessions,
-                    "unique_source_ips": unique_source_ips,
-                    "command_truncated": truncated,
-                    "embedding": embedding,
-                },
+                "enrichment": enrichment_block,
             },
         },
     }
@@ -166,6 +177,42 @@ def _try_parse(raw: str) -> Optional[CommandEnrichment]:
 
 
 _ENRICHMENT_SCHEMA = CommandEnrichment.model_json_schema()
+
+
+def _build_local_fallback(parsed: Optional[CommandEnrichment], model: str) -> Optional[dict]:
+    if parsed is None:
+        return {"model": model, "intent": "unknown", "confidence": 1, "description": "",
+                "tactics": [], "techniques": []}
+    return {
+        "model": model,
+        "intent": parsed.intent,
+        "confidence": parsed.confidence,
+        "description": parsed.description,
+        "tactics": parsed.tactics,
+        "techniques": parsed.techniques,
+    }
+
+
+def cloud_enrich_one(
+    cloud_client,
+    prompt_template: str,
+    command: str,
+    triage_reasons: list[str],
+) -> tuple[Optional[CloudCommandEnrichment], int, int]:
+    """Returns (parsed_or_None, input_tokens, output_tokens). Tokens are 0 on hard failure."""
+    from .llm.anthropic import parse_cloud_json, _strip_code_fences
+    prompt = (
+        prompt_template
+        .replace("<<<COMMAND>>>", command)
+        .replace("<<<TRIAGE_REASONS>>>", ", ".join(triage_reasons) if triage_reasons else "(none)")
+    )
+    try:
+        text, in_tok, out_tok = cloud_client.generate_with_usage(prompt)
+    except Exception as e:
+        log.warning("cloud generate failed: %s", e)
+        return None, 0, 0
+    parsed = parse_cloud_json(_strip_code_fences(text))
+    return parsed, in_tok, out_tok
 
 
 def enrich_one(
@@ -201,11 +248,45 @@ def enrich_one(
     return None, "local_failed", llm.gen_model
 
 
-def run(cfg: AppConfig, secrets: Secrets, dry_run: bool = False) -> dict:
+def run(cfg: AppConfig, secrets: Secrets, dry_run: bool = False, no_cloud: bool = False) -> dict:
     """Main worker entry. Returns stats dict."""
     es = make_client(cfg.elasticsearch, secrets)
     db = StateDB(cfg.worker.state_db)
     prompt = load_prompt(cfg, "command_enrichment")
+
+    cloud_enabled = bool(cfg.cloud.enabled and not no_cloud and secrets.anthropic_api_key)
+    cloud_prompt: Optional[str] = None
+    cloud_client = None
+    if cloud_enabled:
+        if cfg.prompts.command_deep_dive is None:
+            log.warning("cloud enabled but prompts.command_deep_dive is unset; skipping cloud")
+            cloud_enabled = False
+        else:
+            cloud_prompt = load_prompt(cfg, "command_deep_dive")
+            from .llm.anthropic import AnthropicClient
+            cloud_client = AnthropicClient(
+                api_key=secrets.anthropic_api_key,
+                model=cfg.cloud.model,
+                max_tokens=cfg.cloud.max_tokens,
+                timeout=cfg.cloud.request_timeout,
+                base_url=cfg.cloud.base_url,
+            )
+            # Preflight ping — connectivity + auth only, no generation tokens.
+            # Failure here means rotated key, network glitch, or Anthropic
+            # outage; degrade to local-only instead of failing the whole run.
+            try:
+                cloud_client.ping()
+                log.info("cloud escalation enabled: model=%s daily_budget=$%.2f remaining=$%.2f",
+                         cfg.cloud.model, cfg.cloud.daily_budget_usd,
+                         triage_mod.budget_remaining_usd(db, cfg.cloud))
+            except Exception as e:
+                log.warning("cloud preflight failed (%s); continuing local-only", e)
+                try:
+                    cloud_client.close()
+                except Exception:
+                    pass
+                cloud_client = None
+                cloud_enabled = False
 
     since = db.get_watermark()
     if since is None and cfg.worker.initial_lookback_days is not None:
@@ -329,6 +410,57 @@ def run(cfg: AppConfig, secrets: Secrets, dry_run: bool = False) -> dict:
                 indicators = []
                 stats["enriched_failed"] += 1
 
+            # --- Phase 2 triage + cloud escalation ---------------------------
+            triage_reasons: list[str] = []
+            notes = ""
+            local_fallback_doc: Optional[dict] = None
+            doc_provider = source
+            doc_model = model
+
+            if cloud_enabled:
+                triage_reasons = triage_mod.reasons_to_escalate(
+                    command=g["command"],
+                    parsed=parsed,
+                    local_failed=(source == "local_failed"),
+                    cfg=cfg.cloud,
+                )
+                if triage_reasons:
+                    stats["triaged"] += 1
+                    if not triage_mod.can_spend(db, cfg.cloud):
+                        stats["cloud_skipped_budget"] += 1
+                        triage_reasons.append("budget_exhausted")
+                    else:
+                        cloud_parsed, in_tok, out_tok = cloud_enrich_one(
+                            cloud_client, cloud_prompt, g["command"], triage_reasons,
+                        )
+                        from .llm.anthropic import cost_usd as _cost_usd
+                        spend = _cost_usd(
+                            in_tok, out_tok,
+                            cfg.cloud.pricing.input_per_mtok,
+                            cfg.cloud.pricing.output_per_mtok,
+                        )
+                        if in_tok or out_tok:
+                            db.add_spend(triage_mod.utc_today(), in_tok, out_tok, spend)
+                            stats["cloud_calls"] += 1
+                            stats["cloud_input_tokens"] += in_tok
+                            stats["cloud_output_tokens"] += out_tok
+                            stats["cloud_cost_usd_x10000"] += int(round(spend * 10000))
+                        if cloud_parsed is not None:
+                            local_fallback_doc = _build_local_fallback(parsed, model)
+                            description = cloud_parsed.description
+                            intent = cloud_parsed.intent
+                            confidence = cloud_parsed.confidence
+                            tactics = cloud_parsed.tactics
+                            techniques = cloud_parsed.techniques
+                            indicators = _build_indicators(cloud_parsed.iocs.model_dump())
+                            notes = cloud_parsed.notes
+                            doc_provider = "claude"
+                            doc_model = cfg.cloud.model
+                            stats["cloud_enriched_ok"] += 1
+                        else:
+                            stats["cloud_enriched_failed"] += 1
+                            triage_reasons.append("cloud_parse_failed")
+
             doc = _build_ecs_doc(
                 now=now,
                 short_hash=h,
@@ -341,8 +473,8 @@ def run(cfg: AppConfig, secrets: Secrets, dry_run: bool = False) -> dict:
                 unique_sessions=len(g["sessions"]),
                 unique_source_ips=len(g["ips"]),
                 description=description,
-                provider=source,
-                model=model,
+                provider=doc_provider,
+                model=doc_model,
                 prompt_version=cfg.worker.prompt_version,
                 intent=intent,
                 confidence=confidence,
@@ -350,10 +482,14 @@ def run(cfg: AppConfig, secrets: Secrets, dry_run: bool = False) -> dict:
                 techniques=techniques,
                 indicators=indicators,
                 embedding=embedding,
+                triage_reasons=triage_reasons,
+                notes=notes,
+                local_fallback=local_fallback_doc,
             )
             actions.append({"_op_type": "index", "_id": h, "_source": doc})
-            # Only cache successful enrichments. local_failed gets re-tried next run.
-            if source == "local":
+            # Cache on successful enrichment (local or cloud). local_failed without
+            # successful cloud rescue stays uncached so a retry happens next run.
+            if doc_provider in ("local", "claude"):
                 db.mark_cached(h, cfg.llm.generation_model, cfg.worker.prompt_version, now)
 
             # Flush periodically
@@ -376,5 +512,12 @@ def run(cfg: AppConfig, secrets: Secrets, dry_run: bool = False) -> dict:
         db.set_watermark(last_ts)
         log.info("Watermark advanced to %s", last_ts)
 
+    if cloud_client is not None:
+        cloud_client.close()
+
+    out = dict(stats, unique_commands=len(groups))
+    # Convert the integerized cost back to USD for human-readable output.
+    if "cloud_cost_usd_x10000" in out:
+        out["cloud_cost_usd"] = out.pop("cloud_cost_usd_x10000") / 10000.0
     db.close()
-    return dict(stats, unique_commands=len(groups))
+    return out

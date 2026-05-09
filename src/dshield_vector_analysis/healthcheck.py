@@ -134,7 +134,6 @@ def _check_es(cfg: AppConfig, secrets: Secrets) -> int:
             n = cnt["count"]
             if n == 0:
                 print(f"[warn] events index '{cfg.elasticsearch.events_index}' exists but has 0 docs")
-                failures += 0  # warn, not fail
             else:
                 print(f"[ok] events index '{cfg.elasticsearch.events_index}' has {n} docs")
         else:

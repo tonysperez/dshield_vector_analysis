@@ -28,7 +28,7 @@ class OpenAICompatClient:
         timeout: int = 120,
         api_key: Optional[str] = None,
     ) -> None:
-        self.base_url = base_url.rstrip("/").rstrip("/v1")
+        self.base_url = base_url.rstrip("/").removesuffix("/v1")
         self.gen_model = generation_model
         self.embed_model = embedding_model
         headers = {"Content-Type": "application/json"}
@@ -82,6 +82,28 @@ class OpenAICompatClient:
         else:
             payload["response_format"] = {"type": "text"}
 
+        r = self._client.post(f"{self.base_url}/v1/chat/completions", json=payload)
+        if r.status_code != 200:
+            raise LLMError(f"chat {r.status_code}: {r.text[:300]}")
+        data = r.json()
+        try:
+            return data["choices"][0]["message"]["content"] or ""
+        except (KeyError, IndexError, TypeError) as e:
+            raise LLMError(f"chat: malformed response: {e}; body={str(data)[:300]}")
+
+    def generate_text(self, prompt: str, *, max_tokens: int = 16) -> str:
+        """Plain text completion with no response_format constraint. Used by
+        healthcheck. LM Studio is picky about response_format — omitting it
+        entirely (rather than sending {"type":"text"}) avoids edge-case
+        rejections on some loaded models.
+        """
+        payload = {
+            "model": self.gen_model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.1,
+            "max_tokens": max_tokens,
+            "stream": False,
+        }
         r = self._client.post(f"{self.base_url}/v1/chat/completions", json=payload)
         if r.status_code != 200:
             raise LLMError(f"chat {r.status_code}: {r.text[:300]}")

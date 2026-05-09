@@ -67,6 +67,24 @@ class OllamaClient:
         data = r.json()
         return data.get("response", "")
 
+    def generate_text(self, prompt: str, *, max_tokens: int = 16) -> str:
+        """Plain text generation with no JSON-mode coercion. Used by healthcheck.
+
+        IMPORTANT: do NOT set format='json' here — that forces the model to
+        emit a JSON document and on a small prompt it can loop until num_predict
+        is hit, blowing past the request timeout.
+        """
+        payload = {
+            "model": self.gen_model,
+            "prompt": prompt,
+            "stream": False,
+            "options": {"temperature": 0.1, "num_predict": max_tokens, "num_ctx": 1024},
+        }
+        r = self._client.post(f"{self.base_url}/api/generate", json=payload)
+        if r.status_code != 200:
+            raise OllamaError(f"generate {r.status_code}: {r.text[:300]}")
+        return (r.json().get("response") or "")
+
     def embed(self, text: str) -> list[float]:
         """Call /api/embeddings. Returns vector."""
         payload = {"model": self.embed_model, "prompt": text}

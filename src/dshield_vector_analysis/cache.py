@@ -18,6 +18,14 @@ CREATE TABLE IF NOT EXISTS watermark (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS cloud_spend (
+    day            TEXT PRIMARY KEY,  -- ISO date YYYY-MM-DD UTC
+    calls          INTEGER NOT NULL DEFAULT 0,
+    input_tokens   INTEGER NOT NULL DEFAULT 0,
+    output_tokens  INTEGER NOT NULL DEFAULT 0,
+    cost_usd       REAL    NOT NULL DEFAULT 0.0
+);
 """
 
 
@@ -60,6 +68,30 @@ class StateDB:
         )
 
     # --- maintenance --------------------------------------------------------
+
+    # --- cloud spend --------------------------------------------------------
+
+    def get_spend(self, day: str) -> dict:
+        cur = self.conn.execute(
+            "SELECT calls, input_tokens, output_tokens, cost_usd FROM cloud_spend WHERE day=?",
+            (day,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return {"calls": 0, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
+        return {"calls": row[0], "input_tokens": row[1], "output_tokens": row[2], "cost_usd": row[3]}
+
+    def add_spend(self, day: str, input_tokens: int, output_tokens: int, cost_usd: float) -> None:
+        self.conn.execute(
+            """INSERT INTO cloud_spend(day, calls, input_tokens, output_tokens, cost_usd)
+               VALUES (?, 1, ?, ?, ?)
+               ON CONFLICT(day) DO UPDATE SET
+                 calls=calls+1,
+                 input_tokens=input_tokens+excluded.input_tokens,
+                 output_tokens=output_tokens+excluded.output_tokens,
+                 cost_usd=cost_usd+excluded.cost_usd""",
+            (day, input_tokens, output_tokens, cost_usd),
+        )
 
     def clear_cache(self) -> int:
         cur = self.conn.execute("DELETE FROM enrichment_cache")
