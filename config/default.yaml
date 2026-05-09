@@ -18,6 +18,15 @@ llm:
   request_timeout: 120
   max_retries: 2
   api_key: null   # only needed for openai_compat servers that require auth
+  # Fields prepended to the raw command before embedding (Phase 3+: enrich-then-embed).
+  # Empty list = embed raw command only (pre-Phase-3+ behavior).
+  # Bump embed_version whenever you change this list to force re-embedding.
+  embed_context:
+    - intent
+    - tactics
+    - techniques
+    - description
+  embed_version: "v2"
 
 worker:
   state_db: "/var/lib/dshield_vector_analysis/state.sqlite"
@@ -39,8 +48,8 @@ cloud:
   daily_budget_usd: 5.0
   rpm_limit: 10
   triage:
-    confidence_max: 5           # enrich: escalate when local confidence is <= this (1-10)
-    escalate_confidence_max: 7  # escalate cmd: only re-triage novel docs with confidence <= this
+    confidence_max: 6           # enrich: escalate when local confidence is <= this (1-10)
+    escalate_confidence_max: 8  # escalate cmd: only re-triage novel docs with confidence <= this
     sample_rate: 0.01           # 1% random sampling for quality monitoring
     base64_min_run: 200         # length threshold for "suspicious base64 blob"
     suspicious_tlds:
@@ -82,3 +91,7 @@ cluster:
   batch_size: 200
   # null = derive from enrichment_index (replace trailing -default with -clusters-default)
   clusters_index: null
+  # Phase 3+: weight of scalar feature block (occurrence_count, unique_source_ips, confidence)
+  # appended to the L2-normalized embedding matrix before HDBSCAN.
+  # Semantic signal (1.0 norm) dominates; scalars break ties. Tune 0.0–0.15.
+  scalar_weight: 0.05

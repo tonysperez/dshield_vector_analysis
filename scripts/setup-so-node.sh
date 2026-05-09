@@ -10,23 +10,28 @@
 #   4. The GPU-side LLM server is reachable from this box (Ollama / LM Studio).
 #
 # Steps performed (each is a no-op if already done):
-#   A. Sanity checks (root, python>=3.11, source files present, .env + local config present)
+#   A. Sanity checks (root, python>=3.9, source files present, .env + local config present)
 #   B. Create system user + state directory
 #   C. Rsync source -> INSTALL_DIR
-#   D. Create venv + pip install -e .
-#   E. Run healthcheck (fails loudly if ES/LLM unreachable)
-#   F. Run init-index (creates the enrichment index if missing)
-#   G. Install + enable systemd service + timer
+#   D. Create venv + pip install (base package + [cluster] extra for HDBSCAN / numpy)
+#   E. Run healthcheck
+#   F. Run init-index for the enrichment index and the clusters index
+#   G. Install + enable systemd units:
+#        dshield_vector_analysis.timer        — hourly enrich
+#        dshield_vector_analysis_cluster.timer — 6-hourly cluster + escalate
 #
 # Skipped on purpose:
-#   - First enrichment run. Trigger manually with:
+#   - First enrichment run. Trigger manually:
 #       sudo -u "${SERVICE_USER}" "${INSTALL_DIR}/.venv/bin/python" \
 #         -m dshield_vector_analysis.cli enrich --dry-run
 #       sudo -u "${SERVICE_USER}" "${INSTALL_DIR}/.venv/bin/python" \
 #         -m dshield_vector_analysis.cli enrich
+#   - First cluster run. Run after the first successful enrich:
+#       sudo -u "${SERVICE_USER}" "${INSTALL_DIR}/.venv/bin/python" \
+#         -m dshield_vector_analysis.cli cluster
 #
 # Usage:
-#   sudo bash scripts/setup-so-node.sh [--no-systemd] [--skip-healthcheck]
+#   sudo bash scripts/setup-so-node.sh [--no-systemd] [--skip-healthcheck] [--skip-init-index]
 #
 
 set -euo pipefail
@@ -51,7 +56,7 @@ while [[ $# -gt 0 ]]; do
         --skip-healthcheck) RUN_HEALTHCHECK=0 ;;
         --skip-init-index)  RUN_INIT_INDEX=0 ;;
         -h|--help)
-            sed -n '1,40p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '1,45p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         *)
@@ -87,7 +92,7 @@ if [[ "${EUID}" -ne 0 ]]; then
     die "This script must run as root (use sudo)."
 fi
 
-# Python >= 3.11
+# Python >= 3.9
 if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
     die "${PYTHON_BIN} not found in PATH. Install Python 3.9+ first."
 fi
@@ -105,8 +110,11 @@ for required in \
     "${SRC_DIR}/src/dshield_vector_analysis/cli.py" \
     "${SRC_DIR}/config/default.yaml" \
     "${SRC_DIR}/es-mappings/dshield-cowrie-enrichment-mapping.json" \
+    "${SRC_DIR}/es-mappings/dshield-cowrie-clusters-mapping.json" \
     "${SRC_DIR}/systemd/dshield_vector_analysis.service" \
-    "${SRC_DIR}/systemd/dshield_vector_analysis.timer"
+    "${SRC_DIR}/systemd/dshield_vector_analysis.timer" \
+    "${SRC_DIR}/systemd/dshield_vector_analysis_cluster.service" \
+    "${SRC_DIR}/systemd/dshield_vector_analysis_cluster.timer"
 do
     [[ -f "${required}" ]] || die "Missing source file: ${required}"
 done
@@ -159,8 +167,6 @@ chmod 750 "${STATE_DIR}"
 log "Deploying source to ${INSTALL_DIR}"
 mkdir -p "${INSTALL_DIR}"
 
-# rsync excludes: anything generated locally we don't want to ship.
-# Keep .env and config/local.yaml so the install dir is self-sufficient.
 rsync -a --delete \
     --exclude='.venv/' \
     --exclude='__pycache__/' \
@@ -184,27 +190,34 @@ else
     sudo -u "${SERVICE_USER}" "${PYTHON_BIN}" -m venv "${VENV}"
 fi
 
-log "Installing project (pip install -e .)"
+log "Installing project (base package)"
 sudo -u "${SERVICE_USER}" "${VENV}/bin/pip" install --quiet --upgrade pip
 sudo -u "${SERVICE_USER}" "${VENV}/bin/pip" install --quiet -e "${INSTALL_DIR}"
 
+log "Installing cluster deps (numpy + scikit-learn for HDBSCAN)"
+sudo -u "${SERVICE_USER}" "${VENV}/bin/pip" install --quiet -e "${INSTALL_DIR}[cluster]"
+
 # Sanity: import works
 if ! sudo -u "${SERVICE_USER}" "${VENV}/bin/python" -c \
-    'import dshield_vector_analysis, sys; print(dshield_vector_analysis.__version__)' >/dev/null 2>&1
+    'import dshield_vector_analysis' >/dev/null 2>&1
 then
     die "Post-install import failed. Check pip output above."
 fi
+if ! sudo -u "${SERVICE_USER}" "${VENV}/bin/python" -c \
+    'from sklearn.cluster import HDBSCAN' >/dev/null 2>&1
+then
+    die "Cluster deps import failed (sklearn.cluster.HDBSCAN not found)."
+fi
 
-# ---- E. healthcheck --------------------------------------------------------
-
-# Helper: run the CLI as the service user with the right env + cwd. We use
-# `env` because `sudo -u` doesn't pass DSHIELD_VECTOR_ANALYSIS_ENV through.
+# Helper: run the CLI as the service user with the right env + cwd.
 run_cli() {
     sudo -u "${SERVICE_USER}" env \
         DSHIELD_VECTOR_ANALYSIS_ENV="${INSTALL_DIR}/.env" \
         "${VENV}/bin/python" -m dshield_vector_analysis.cli \
         --config "${INSTALL_DIR}/config/default.yaml" "$@"
 }
+
+# ---- E. healthcheck --------------------------------------------------------
 
 if (( RUN_HEALTHCHECK )); then
     log "Running healthcheck"
@@ -219,11 +232,30 @@ else
     warn "Skipping healthcheck (--skip-healthcheck)"
 fi
 
-# ---- F. init-index ---------------------------------------------------------
+# ---- F. init indexes -------------------------------------------------------
 
 if (( RUN_INIT_INDEX )); then
-    log "Running init-index (idempotent)"
+    log "Creating enrichment index (idempotent)"
     ( cd "${INSTALL_DIR}" && run_cli init-index )
+
+    # Derive the clusters index name from the config using the same logic as the
+    # Python code so they are guaranteed to match.
+    log "Deriving clusters index name from config"
+    CLUSTERS_IDX=$(
+        cd "${INSTALL_DIR}" && \
+        sudo -u "${SERVICE_USER}" env \
+            DSHIELD_VECTOR_ANALYSIS_ENV="${INSTALL_DIR}/.env" \
+            "${VENV}/bin/python" -c "
+from dshield_vector_analysis.config import load_config
+from dshield_vector_analysis.cluster import get_clusters_index
+cfg = load_config('${INSTALL_DIR}/config/default.yaml')
+print(get_clusters_index(cfg))
+"
+    )
+    log "Creating clusters index: ${CLUSTERS_IDX} (idempotent)"
+    ( cd "${INSTALL_DIR}" && run_cli init-index \
+        --mapping "${INSTALL_DIR}/es-mappings/dshield-cowrie-clusters-mapping.json" \
+        --index "${CLUSTERS_IDX}" )
 else
     warn "Skipping init-index (--skip-init-index)"
 fi
@@ -233,11 +265,13 @@ fi
 if (( INSTALL_SYSTEMD )); then
     log "Syncing systemd units"
 
-    # Install unit only if missing or content differs from source. Track which
-    # units changed so we can daemon-reload + restart the timer exactly once
-    # when needed (and skip churn when nothing changed).
     UNITS_CHANGED=0
-    for unit in dshield_vector_analysis.service dshield_vector_analysis.timer; do
+    for unit in \
+        dshield_vector_analysis.service \
+        dshield_vector_analysis.timer \
+        dshield_vector_analysis_cluster.service \
+        dshield_vector_analysis_cluster.timer
+    do
         src="${INSTALL_DIR}/systemd/${unit}"
         dst="${SYSTEMD_DIR}/${unit}"
         if [[ ! -f "${dst}" ]]; then
@@ -256,17 +290,20 @@ if (( INSTALL_SYSTEMD )); then
     if (( UNITS_CHANGED )); then
         log "Reloading systemd"
         systemctl daemon-reload
-        # Re-enable in case unit content changed enable behavior; --now is a no-op if already active.
-        systemctl enable --now dshield_vector_analysis.timer
-        # Bounce timer so new OnCalendar/Unit settings take effect immediately.
+    fi
+
+    # Enable + activate both timers.
+    systemctl enable --now dshield_vector_analysis.timer
+    systemctl enable --now dshield_vector_analysis_cluster.timer
+    if (( UNITS_CHANGED )); then
         systemctl restart dshield_vector_analysis.timer
-    else
-        # Still ensure timer is enabled + active on first run after a no-change re-deploy.
-        systemctl enable --now dshield_vector_analysis.timer
+        systemctl restart dshield_vector_analysis_cluster.timer
     fi
 
     log "Timer status:"
-    systemctl --no-pager list-timers dshield_vector_analysis.timer || true
+    systemctl --no-pager list-timers \
+        dshield_vector_analysis.timer \
+        dshield_vector_analysis_cluster.timer || true
 else
     warn "Skipping systemd install (--no-systemd)"
 fi
@@ -277,14 +314,20 @@ cat <<EOF
 
 ${GREEN}Setup complete.${RESET}
 
-Manual first run (recommended before relying on the timer):
+First enrichment run (recommended before relying on the timer):
 
   sudo -u ${SERVICE_USER} ${VENV}/bin/python -m dshield_vector_analysis.cli enrich --dry-run
   sudo -u ${SERVICE_USER} ${VENV}/bin/python -m dshield_vector_analysis.cli enrich
 
-Tail the timer-driven runs:
+First cluster run (run after the first successful enrich; subsequent runs are timer-driven):
 
-  journalctl -fu dshield_vector_analysis.service
+  sudo -u ${SERVICE_USER} ${VENV}/bin/python -m dshield_vector_analysis.cli cluster
+  sudo -u ${SERVICE_USER} ${VENV}/bin/python -m dshield_vector_analysis.cli escalate
+
+Tail timer-driven runs:
+
+  journalctl -fu dshield_vector_analysis.service          # hourly enrich
+  journalctl -fu dshield_vector_analysis_cluster.service  # 6-hourly cluster + escalate
 
 Re-running this script is safe — every step is idempotent.
 EOF

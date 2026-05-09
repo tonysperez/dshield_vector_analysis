@@ -79,7 +79,19 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_escalate.add_argument("--dry-run", action="store_true", help="Count candidates without making cloud calls")
 
-    p_cluster = sub.add_parser("cluster", help="Run Phase 3 HDBSCAN clustering + novelty scoring")
+    p_reembed = sub.add_parser(
+        "re-embed",
+        help=(
+            "Re-embed all enrichment docs using stored enrichment fields — no LLM generation. "
+            "Use after changing embed_context or bumping embed_version."
+        ),
+    )
+    p_reembed.add_argument(
+        "--dry-run", action="store_true",
+        help="Count docs that would be re-embedded without calling the embedding model or writing to ES",
+    )
+
+    p_cluster = sub.add_parser("cluster", help="Run HDBSCAN clustering + novelty scoring")
     p_cluster.add_argument("--dry-run", action="store_true", help="Fetch + cluster but skip all ES writes")
     p_cluster.add_argument(
         "--clusters-index",
@@ -159,6 +171,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.update_mapping and result.get("action") == "noop":
             result = update_mapping(es, args.mapping, idx)
         print(json.dumps(result, indent=2))
+        return 0
+
+    if args.cmd == "re-embed":
+        stats = enrich_mod.run_reembed(cfg, secrets, dry_run=args.dry_run)
+        print(json.dumps(stats, indent=2, default=str))
         return 0
 
     if args.cmd == "escalate":

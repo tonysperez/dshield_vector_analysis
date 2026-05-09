@@ -27,6 +27,10 @@ class LLMConfig(BaseModel):
     request_timeout: int = 120
     max_retries: int = 2
     api_key: Optional[str] = None  # for openai_compat servers that require it
+    embed_context: list[str] = Field(
+        default_factory=lambda: ["intent", "tactics", "description"]
+    )
+    embed_version: str = "v1"  # bump when embed_context changes to force re-embed
 
 
 class CloudTriageConfig(BaseModel):
@@ -66,6 +70,7 @@ class ClusterConfig(BaseModel):
     page_size: int = 1000
     batch_size: int = 200  # docs per bulk-update flush
     clusters_index: Optional[str] = None  # null = derive from enrichment_index
+    scalar_weight: float = 0.05  # weight of scalar block appended to embedding matrix
 
 
 class WorkerConfig(BaseModel):

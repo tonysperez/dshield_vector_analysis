@@ -62,11 +62,21 @@ def iter_enriched_docs(
     es: Elasticsearch,
     index: str,
     page_size: int = 1000,
-) -> Iterator[tuple[str, list[float], str]]:
-    """Yield (doc_id, embedding, command) for all docs that have an embedding."""
+) -> Iterator[tuple[str, list[float], str, dict]]:
+    """Yield (doc_id, embedding, command, scalars) for all docs that have an embedding.
+
+    scalars keys: occurrence_count, unique_source_ips, confidence.
+    """
     body: dict = {
         "size": page_size,
-        "_source": ["dshield.cowrie.enrichment.embedding", "process.command_line"],
+        "_source": [
+            "dshield.cowrie.enrichment.embedding",
+            "dshield.cowrie.enrichment.occurrence_count",
+            "dshield.cowrie.enrichment.unique_sessions",
+            "dshield.cowrie.enrichment.unique_source_ips",
+            "dshield.cowrie.enrichment.confidence",
+            "process.command_line",
+        ],
         "query": {"exists": {"field": "dshield.cowrie.enrichment.embedding"}},
         "sort": [{"@timestamp": "asc"}, {"_doc": "asc"}],
     }
@@ -80,15 +90,23 @@ def iter_enriched_docs(
             return
         for h in hits:
             src = h["_source"]
-            emb = (
+            en = (
                 ((src.get("dshield") or {}).get("cowrie") or {})
                 .get("enrichment", {})
-                .get("embedding")
             )
+            emb = en.get("embedding")
             if not emb:
                 continue
             cmd = (src.get("process") or {}).get("command_line", "")
-            yield h["_id"], emb, cmd
+            occ = en.get("occurrence_count") or 1
+            scalars = {
+                "occurrence_count": occ,
+                "unique_sessions": en.get("unique_sessions") or 1,
+                "unique_source_ips": en.get("unique_source_ips") or 1,
+                "confidence": en.get("confidence") or 5,
+                "session_reuse_rate": min((en.get("unique_sessions") or 1) / occ, 1.0),
+            }
+            yield h["_id"], emb, cmd, scalars
         search_after = hits[-1]["sort"]
 
 
@@ -194,6 +212,35 @@ def novelty_score_from_lists(
     return float(1.0 - max(0.0, best))
 
 
+def build_scalar_block(scalars_list: list[dict], weight: float) -> "np.ndarray":
+    """Build an (n, 4) weighted scalar matrix to append to the normalized embedding matrix.
+
+    Features (all scaled by weight):
+      col 0: log-normalized occurrence_count     — commodity vs rare
+      col 1: log-normalized unique_source_ips    — scanning campaign vs one-off
+      col 2: confidence / 10                     — LLM certainty proxy
+      col 3: session_reuse_rate (unique_sessions / occurrence_count, clamped [0,1])
+             — near 1.0 = fresh session per occurrence (scanner); < 1.0 = repeated
+               within sessions (interactive attacker)
+
+    Centroids are computed from the pure 768-dim portion — this block only affects HDBSCAN.
+    """
+    counts = np.array([s.get("occurrence_count") or 1 for s in scalars_list], dtype=np.float32)
+    ips = np.array([s.get("unique_source_ips") or 1 for s in scalars_list], dtype=np.float32)
+    conf = np.array([s.get("confidence") or 5 for s in scalars_list], dtype=np.float32)
+    reuse = np.array([s.get("session_reuse_rate", 1.0) for s in scalars_list], dtype=np.float32)
+
+    max_count = float(np.max(counts)) if counts.max() > 0 else 1.0
+    max_ips = float(np.max(ips)) if ips.max() > 0 else 1.0
+
+    block = np.zeros((len(scalars_list), 4), dtype=np.float32)
+    block[:, 0] = (np.log1p(counts) / np.log1p(max_count)) * weight
+    block[:, 1] = (np.log1p(ips) / np.log1p(max_ips)) * weight
+    block[:, 2] = (conf / 10.0) * weight
+    block[:, 3] = np.clip(reuse, 0.0, 1.0) * weight
+    return block
+
+
 def run(
     cfg: AppConfig,
     secrets: Secrets,
@@ -223,11 +270,13 @@ def run(
     doc_ids: list[str] = []
     embeddings_list: list[list[float]] = []
     commands: list[str] = []
+    scalars_list: list[dict] = []
 
-    for doc_id, emb, cmd in iter_enriched_docs(es, enrich_idx, ccfg.page_size):
+    for doc_id, emb, cmd, scalars in iter_enriched_docs(es, enrich_idx, ccfg.page_size):
         doc_ids.append(doc_id)
         embeddings_list.append(emb)
         commands.append(cmd)
+        scalars_list.append(scalars)
 
     n_docs = len(doc_ids)
     log.info("Fetched %d docs with embeddings", n_docs)
@@ -247,6 +296,17 @@ def run(
     del matrix  # normalized copy is all we need from here on
 
     # --- 3. HDBSCAN ---------------------------------------------------------------
+    # Optionally augment the L2-normalized embedding matrix with a small scalar block
+    # (occurrence_count, unique_source_ips, confidence). Centroids and novelty scores
+    # are computed from the pure 768-dim normalized matrix so triage.py is unaffected.
+    cluster_matrix = normalized
+    if ccfg.scalar_weight > 0.0:
+        scalar_block = build_scalar_block(scalars_list, ccfg.scalar_weight)
+        cluster_matrix = np.hstack([normalized, scalar_block])
+        log.info("Scalar augmentation enabled: weight=%.3f, cluster_matrix shape=%s",
+                 ccfg.scalar_weight, cluster_matrix.shape)
+    del scalars_list
+
     log.info("Running HDBSCAN (min_cluster_size=%d, min_samples=%d) on %d docs ...",
              ccfg.min_cluster_size, ccfg.min_samples, n_docs)
     clusterer = _HDBSCAN(
@@ -254,7 +314,8 @@ def run(
         min_samples=ccfg.min_samples,
         metric="euclidean",
     )
-    labels = clusterer.fit_predict(normalized)
+    labels = clusterer.fit_predict(cluster_matrix)
+    del cluster_matrix
 
     unique_labels = [int(l) for l in np.unique(labels)]
     cluster_labels = [l for l in unique_labels if l >= 0]

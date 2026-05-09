@@ -21,6 +21,14 @@ from . import triage as triage_mod
 
 log = logging.getLogger(__name__)
 
+# Painless script that patches only the embedding vector; all other fields untouched.
+_REEMBED_SCRIPT = (
+    "if (ctx._source.dshield == null) { ctx._source.dshield = [:]; }"
+    "if (ctx._source.dshield.cowrie == null) { ctx._source.dshield.cowrie = [:]; }"
+    "if (ctx._source.dshield.cowrie.enrichment == null) { ctx._source.dshield.cowrie.enrichment = [:]; }"
+    "ctx._source.dshield.cowrie.enrichment.embedding = params.embedding;"
+)
+
 _WS_RE = re.compile(r"\s+")
 
 # Painless script for escalate — patches only the cloud-overwritten fields so
@@ -203,6 +211,31 @@ def _try_parse(raw: str) -> Optional[CommandEnrichment]:
 _ENRICHMENT_SCHEMA = CommandEnrichment.model_json_schema()
 
 
+def _build_embed_text(
+    command: str,
+    parsed: Optional[CommandEnrichment],
+    context_fields: list[str],
+) -> str:
+    """Build the text string to embed. Prepends enrichment fields when context_fields is set.
+
+    Falls back to raw command if context_fields is empty or enrichment failed.
+    """
+    if not context_fields or parsed is None:
+        return command
+    parts: list[str] = []
+    if "intent" in context_fields and parsed.intent:
+        parts.append(f"intent: {parsed.intent}.")
+    if "tactics" in context_fields and parsed.tactics:
+        parts.append(f"tactics: {', '.join(parsed.tactics)}.")
+    if "techniques" in context_fields and parsed.techniques:
+        parts.append(f"techniques: {', '.join(parsed.techniques)}.")
+    if "description" in context_fields and parsed.description:
+        parts.append(parsed.description)
+    if not parts:
+        return command
+    return " ".join(parts) + f"\nCommand: {command}"
+
+
 def _build_local_fallback(parsed: Optional[CommandEnrichment], model: str) -> Optional[dict]:
     if parsed is None:
         return {"model": model, "intent": "unknown", "confidence": 1, "description": "",
@@ -312,15 +345,10 @@ def run(cfg: AppConfig, secrets: Secrets, dry_run: bool = False, no_cloud: bool 
                 cloud_client = None
                 cloud_enabled = False
 
-    # Phase 3: load cluster centroids so the novel_embedding triage rule can fire.
-    # Silently skipped if cluster hasn't run yet or clusters index doesn't exist.
-    centroids: list[list[float]] = []
-    if cloud_enabled:
-        from .cluster import get_clusters_index, load_centroids
-        clusters_idx = get_clusters_index(cfg)
-        centroids = load_centroids(es, clusters_idx)
-        if centroids:
-            log.info("Loaded %d cluster centroids for novel_embedding triage", len(centroids))
+    # The novel_embedding triage rule (cosine distance to cluster centroids) is handled
+    # by the `escalate` command, which runs after each `cluster` pass and uses ES-stored
+    # novelty scores. Enrich does not load centroids or pre-embed — embedding is always
+    # the final step, after all LLM calls are complete.
 
     since = db.get_watermark()
     if since is None and cfg.worker.initial_lookback_days is not None:
@@ -386,7 +414,7 @@ def run(cfg: AppConfig, secrets: Secrets, dry_run: bool = False, no_cloud: bool 
 
     with make_llm_client(cfg.llm) as llm:
         for h, g in groups.items():
-            cached = db.is_cached(h, cfg.llm.generation_model, cfg.worker.prompt_version)
+            cached = db.is_cached(h, cfg.llm.generation_model, cfg.worker.prompt_version, cfg.llm.embed_version)
             if cached:
                 # Bulk-update aggregate stats only via scripted update.
                 stats["cache_hits"] += 1
@@ -414,15 +442,7 @@ def run(cfg: AppConfig, secrets: Secrets, dry_run: bool = False, no_cloud: bool 
                 continue
 
             stats["cache_miss"] += 1
-            # 1) embedding
-            try:
-                embedding = llm.embed(g["command"])
-            except Exception as e:
-                log.error("embed failed for %s: %s", h, e)
-                stats["embed_failed"] += 1
-                continue
-
-            # 2) enrichment
+            # 1) local enrichment
             parsed, source, model = enrich_one(
                 llm, prompt, g["command"], cfg.llm.max_retries
             )
@@ -445,11 +465,15 @@ def run(cfg: AppConfig, secrets: Secrets, dry_run: bool = False, no_cloud: bool 
                 stats["enriched_failed"] += 1
 
             # --- Phase 2 triage + cloud escalation ---------------------------
+            # novel_embedding triage (cosine distance to centroids) is handled by
+            # the `escalate` command after each cluster run — not here — so
+            # embedding is not needed before this block.
             triage_reasons: list[str] = []
             notes = ""
             local_fallback_doc: Optional[dict] = None
             doc_provider = source
             doc_model = model
+            final_parsed = parsed  # updated to cloud result if escalation succeeds
 
             if cloud_enabled:
                 triage_reasons = triage_mod.reasons_to_escalate(
@@ -457,8 +481,8 @@ def run(cfg: AppConfig, secrets: Secrets, dry_run: bool = False, no_cloud: bool 
                     parsed=parsed,
                     local_failed=(source == "local_failed"),
                     cfg=cfg.cloud,
-                    embedding=embedding if centroids else None,
-                    centroids=centroids if centroids else None,
+                    embedding=None,
+                    centroids=None,
                 )
                 if triage_reasons:
                     stats["triaged"] += 1
@@ -492,10 +516,21 @@ def run(cfg: AppConfig, secrets: Secrets, dry_run: bool = False, no_cloud: bool 
                             notes = cloud_parsed.notes
                             doc_provider = "claude"
                             doc_model = cfg.cloud.model
+                            final_parsed = cloud_parsed
                             stats["cloud_enriched_ok"] += 1
                         else:
                             stats["cloud_enriched_failed"] += 1
                             triage_reasons.append("cloud_parse_failed")
+
+            # 2) embed — always last, after all LLM calls are complete.
+            #    Uses final enrichment output (cloud if escalated, local otherwise).
+            embed_text = _build_embed_text(g["command"], final_parsed, cfg.llm.embed_context)
+            try:
+                embedding = llm.embed(embed_text)
+            except Exception as e:
+                log.error("embed failed for %s: %s", h, e)
+                stats["embed_failed"] += 1
+                continue
 
             doc = _build_ecs_doc(
                 now=now,
@@ -526,7 +561,7 @@ def run(cfg: AppConfig, secrets: Secrets, dry_run: bool = False, no_cloud: bool 
             # Cache on successful enrichment (local or cloud). local_failed without
             # successful cloud rescue stays uncached so a retry happens next run.
             if doc_provider in ("local", "claude"):
-                db.mark_cached(h, cfg.llm.generation_model, cfg.worker.prompt_version, now)
+                db.mark_cached(h, cfg.llm.generation_model, cfg.worker.prompt_version, cfg.llm.embed_version, now)
 
             # Flush periodically
             if len(actions) >= 50:
@@ -768,3 +803,145 @@ def run_escalate(
     if "cloud_cost_usd_x10000" in out:
         out["cloud_cost_usd"] = out.pop("cloud_cost_usd_x10000") / 10000.0
     return out
+
+
+# ---------------------------------------------------------------------------
+# re-embed: rebuild embeddings from stored enrichment fields without calling
+# the LLM. Use this after changing embed_context or embed_version instead of
+# clearing the cache and re-running enrich from scratch.
+# ---------------------------------------------------------------------------
+
+def iter_docs_for_reembed(
+    es: Elasticsearch,
+    index: str,
+    page_size: int = 200,
+) -> Iterator[dict]:
+    """Yield dicts with the enrichment fields needed to rebuild an embedding.
+
+    Keys: doc_id, command, intent, tactics, techniques, description.
+    Only docs that already have an embedding are included.
+    """
+    body: dict = {
+        "size": page_size,
+        "_source": [
+            "process.command_line",
+            "event.reason",
+            "dshield.cowrie.enrichment.intent",
+            "threat.tactic.id",
+            "threat.technique.id",
+        ],
+        "query": {"exists": {"field": "dshield.cowrie.enrichment.embedding"}},
+        "sort": [{"@timestamp": "asc"}, {"_doc": "asc"}],
+    }
+    search_after = None
+    while True:
+        if search_after:
+            body["search_after"] = search_after
+        resp = es.search(index=index, **body)
+        hits = resp["hits"]["hits"]
+        if not hits:
+            return
+        for h in hits:
+            src = h["_source"]
+            en = ((src.get("dshield") or {}).get("cowrie") or {}).get("enrichment") or {}
+            yield {
+                "doc_id": h["_id"],
+                "command": (src.get("process") or {}).get("command_line", ""),
+                "intent": en.get("intent", ""),
+                "tactics": ((src.get("threat") or {}).get("tactic") or {}).get("id") or [],
+                "techniques": ((src.get("threat") or {}).get("technique") or {}).get("id") or [],
+                "description": (src.get("event") or {}).get("reason", ""),
+            }
+        search_after = hits[-1]["sort"]
+
+
+def run_reembed(cfg: AppConfig, secrets: Secrets, dry_run: bool = False) -> dict:
+    """Re-embed all enrichment docs using stored fields — no LLM generation calls.
+
+    Reads intent/tactics/techniques/description from ES, builds the embed text
+    with the current embed_context config, calls the embedding model, and
+    bulk-updates only the embedding field in ES.
+
+    On success each doc's SQLite cache entry is advanced to the current
+    embed_version so the next `enrich` run treats them as cache hits and skips
+    the LLM entirely. Docs that fail to embed stay uncached and fall back to
+    normal re-enrichment on the next `enrich` run.
+    """
+    from types import SimpleNamespace
+
+    es = make_client(cfg.elasticsearch, secrets)
+    db = StateDB(cfg.worker.state_db)
+
+    log.info(
+        "re-embed: embed_context=%s embed_version=%s index=%s dry_run=%s",
+        cfg.llm.embed_context, cfg.llm.embed_version,
+        cfg.elasticsearch.enrichment_index, dry_run,
+    )
+
+    stats: dict = defaultdict(int)
+    actions: list[dict] = []
+    now = _now()
+
+    with make_llm_client(cfg.llm) as llm:
+        for doc in iter_docs_for_reembed(es, cfg.elasticsearch.enrichment_index):
+            stats["docs_seen"] += 1
+            if not doc["command"]:
+                stats["skipped_no_command"] += 1
+                continue
+
+            # Reconstruct just enough structure for _build_embed_text.
+            parsed_stub = SimpleNamespace(
+                intent=doc["intent"],
+                tactics=doc["tactics"],
+                techniques=doc["techniques"],
+                description=doc["description"],
+            )
+            embed_text = _build_embed_text(doc["command"], parsed_stub, cfg.llm.embed_context)
+
+            if dry_run:
+                stats["would_embed"] += 1
+                continue
+
+            try:
+                embedding = llm.embed(embed_text)
+            except Exception as e:
+                log.error("embed failed for doc %s: %s", doc["doc_id"], e)
+                stats["embed_failed"] += 1
+                continue
+
+            stats["embedded_ok"] += 1
+            actions.append({
+                "_op_type": "update",
+                "_id": doc["doc_id"],
+                "script": {
+                    "source": _REEMBED_SCRIPT,
+                    "params": {"embedding": embedding},
+                },
+            })
+
+            # Advance the cache entry so next `enrich` sees this as a cache hit.
+            db.mark_cached(
+                doc["doc_id"],
+                cfg.llm.generation_model,
+                cfg.worker.prompt_version,
+                cfg.llm.embed_version,
+                now,
+            )
+
+            if len(actions) >= 50:
+                ok, errs = bulk_write(es, cfg.elasticsearch.enrichment_index, actions)
+                stats["bulk_ok"] += ok
+                stats["bulk_errors"] += len(errs)
+                if errs:
+                    log.warning("re-embed bulk errors (%d): %s", len(errs), errs[:2])
+                actions = []
+
+    if actions:
+        ok, errs = bulk_write(es, cfg.elasticsearch.enrichment_index, actions)
+        stats["bulk_ok"] += ok
+        stats["bulk_errors"] += len(errs)
+        if errs:
+            log.warning("re-embed bulk errors (%d): %s", len(errs), errs[:2])
+
+    db.close()
+    return dict(stats, dry_run=dry_run, embed_version=cfg.llm.embed_version)

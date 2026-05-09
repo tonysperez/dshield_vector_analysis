@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS enrichment_cache (
     command_hash    TEXT PRIMARY KEY,
     model           TEXT NOT NULL,
     prompt_version  TEXT NOT NULL,
+    embed_version   TEXT NOT NULL DEFAULT 'v0',
     enriched_at     TEXT NOT NULL
 );
 
@@ -35,23 +36,33 @@ class StateDB:
         self.conn = sqlite3.connect(path, isolation_level=None)  # autocommit
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
+        # Migration: add embed_version column to pre-Phase-3+ databases.
+        try:
+            self.conn.execute(
+                "ALTER TABLE enrichment_cache ADD COLUMN embed_version TEXT NOT NULL DEFAULT 'v0'"
+            )
+        except sqlite3.OperationalError:
+            pass  # column already exists
 
     def close(self) -> None:
         self.conn.close()
 
     # --- cache --------------------------------------------------------------
 
-    def is_cached(self, command_hash: str, model: str, prompt_version: str) -> bool:
+    def is_cached(self, command_hash: str, model: str, prompt_version: str, embed_version: str = "v0") -> bool:
         cur = self.conn.execute(
-            "SELECT 1 FROM enrichment_cache WHERE command_hash=? AND model=? AND prompt_version=?",
-            (command_hash, model, prompt_version),
+            "SELECT 1 FROM enrichment_cache"
+            " WHERE command_hash=? AND model=? AND prompt_version=? AND embed_version=?",
+            (command_hash, model, prompt_version, embed_version),
         )
         return cur.fetchone() is not None
 
-    def mark_cached(self, command_hash: str, model: str, prompt_version: str, enriched_at: str) -> None:
+    def mark_cached(self, command_hash: str, model: str, prompt_version: str, embed_version: str, enriched_at: str) -> None:
         self.conn.execute(
-            "INSERT OR REPLACE INTO enrichment_cache(command_hash, model, prompt_version, enriched_at) VALUES (?,?,?,?)",
-            (command_hash, model, prompt_version, enriched_at),
+            "INSERT OR REPLACE INTO enrichment_cache"
+            "(command_hash, model, prompt_version, embed_version, enriched_at)"
+            " VALUES (?,?,?,?,?)",
+            (command_hash, model, prompt_version, embed_version, enriched_at),
         )
 
     # --- watermark ----------------------------------------------------------
