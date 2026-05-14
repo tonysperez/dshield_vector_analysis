@@ -45,20 +45,20 @@ Output is structured, timestamped, and queryable the same way any other ECS data
 sudo bash scripts/setup-security-onion-node.sh
 ```
 
-The script handles user creation, deploy to `/opt/dshield_enrich`, venv + install, healthcheck, index creation, and systemd enablement. It's fully idempotent — safe to re-run after fixing anything. See [Automated setup](#automated-setup-script) for flags. For the manual step-by-step (or to understand what the script does), see the [Setup guide](#setup-guide--step-by-step).
+The script handles user creation, deploy to `/opt/dshield_prism`, venv + install, healthcheck, index creation, and systemd enablement. It's fully idempotent — safe to re-run after fixing anything. See [Automated setup](#automated-setup-script) for flags. For the manual step-by-step (or to understand what the script does), see the [Setup guide](#setup-guide--step-by-step).
 
 **Daily / recurring use:**
 
 ```bash
-sudo -u dshield_enrich .venv/bin/python -m dshield_enrich.cli healthcheck
-sudo -u dshield_enrich .venv/bin/python -m dshield_enrich.cli enrich --dry-run
-sudo -u dshield_enrich .venv/bin/python -m dshield_enrich.cli enrich
+sudo -u dshield_prism .venv/bin/python -m enrich.cli healthcheck
+sudo -u dshield_prism .venv/bin/python -m enrich.cli enrich --dry-run
+sudo -u dshield_prism .venv/bin/python -m enrich.cli enrich
 ```
 
 **Recovery / re-scan everything:**
 ```bash
-sudo -u dshield_enrich .venv/bin/python -m dshield_enrich.cli reset --yes
-sudo -u dshield_enrich .venv/bin/python -m dshield_enrich.cli enrich
+sudo -u dshield_prism .venv/bin/python -m enrich.cli reset --yes
+sudo -u dshield_prism .venv/bin/python -m enrich.cli enrich
 ```
 
 **Investigation console.** A standalone, read-only browser GUI lives in [`console/`](console/). It reads the same Elasticsearch indices this pipeline writes and lets you search any IOC (IP, session ID, command sha256, playbook name, campaign name, MITRE ID, …) and pivot through the resulting graph. Install and run instructions: [`console/README.md`](console/README.md).
@@ -70,7 +70,7 @@ sudo -u dshield_enrich .venv/bin/python -m dshield_enrich.cli enrich
 ```
 +-------------------------+        +---------------------------------+
 |   GPU box               |        |   SecurityOnion box             |
-|   Ollama OR LM Studio   | <----- |   dshield_enrich       |
+|   Ollama OR LM Studio   | <----- |   dshield_prism       |
 |   - 7B instruct model   | (LAN)  |   (this project)                |
 |   - 768-dim embed model |        |   - systemd timer               |
 +-------------------------+        |   - SQLite state                |
@@ -101,7 +101,7 @@ The worker only **reads** from the SO-managed Cowrie events index. All enrichmen
 | `config/prompts/command_enrichment.txt` | Local-LLM command-classification prompt |
 | `config/prompts/command_deep_dive.txt` | Cloud-LLM deep-dive prompt used during escalation |
 | `config/prompts/playbook_name.txt` | LLM prompt for naming each session-cluster playbook |
-| `src/dshield_enrich/` | Python package: `cli`, `config`, `cache`, `es_client`, `clustering`, `healthcheck`, `triage`, `llm/{ollama,openai_compat,anthropic,schemas}`, plus `sources/cowrie/{commands,sessions,ips,campaigns}.py` (one module per layer) |
+| `src/enrich/` | Python package: `cli`, `config`, `cache`, `es_client`, `clustering`, `healthcheck`, `triage`, `llm/{ollama,openai_compat,anthropic,schemas}`, plus `sources/cowrie/{commands,sessions,ips,campaigns}.py` (one module per layer) |
 | `es-mappings/cowrie/commands.json` | Settings + ECS-compliant mappings for the per-command enrichment index |
 | `es-mappings/cowrie/command_clusters.json` | Settings + mappings for the command cluster centroids index (Phase 3) |
 | `es-mappings/cowrie/sessions.json` | Settings + mappings for the session rollup index (Phase 4) |
@@ -114,8 +114,8 @@ The worker only **reads** from the SO-managed Cowrie events index. All enrichmen
 | `console/` | Standalone, read-only investigation GUI (FastAPI + Cytoscape.js) — see [`console/README.md`](console/README.md) |
 | `docs/pipeline.md` | Mermaid flowcharts of the full enrichment / rollup / clustering pipeline |
 | `docs/PLAYBOOKS_AND_CAMPAIGNS.md` | Reference doc for the two higher-level abstractions over the raw stream |
-| `systemd/dshield_enrich-ingest.service` + `.timer` | Hourly oneshot: `enrich` + `rollup sessions` |
-| `systemd/dshield_enrich-analytics.service` + `.timer` | 6-hourly oneshot: `cluster commands` + `escalate` + `cluster sessions` + `name playbooks` + `rollup ips` + `cluster ips` + `mine campaigns` |
+| `systemd/dshield_prism-ingest.service` + `.timer` | Hourly oneshot: `enrich` + `rollup sessions` |
+| `systemd/dshield_prism-analytics.service` + `.timer` | 6-hourly oneshot: `cluster commands` + `escalate` + `cluster sessions` + `name playbooks` + `rollup ips` + `cluster ips` + `mine campaigns` |
 | `scripts/setup-security-onion-node.sh` | One-shot, idempotent SO-box installer |
 | `.env.example` | Secrets template (copy to `.env`) |
 | `.gitignore` | Excludes `.env`, `config/local.yaml`, `config/local.yml`, `*.sqlite`, `__pycache__` |
@@ -127,7 +127,7 @@ The worker only **reads** from the SO-managed Cowrie events index. All enrichmen
 All run as the service user from the install dir:
 
 ```bash
-sudo -u dshield_enrich .venv/bin/python -m dshield_enrich.cli <subcommand>
+sudo -u dshield_prism .venv/bin/python -m enrich.cli <subcommand>
 ```
 
 The CLI groups verbs by layer: `<verb> [<layer>] [--source <source>]`. Every layer-bearing verb accepts `--source` (default `cowrie`), so adding a new sensor in the future is a sibling module under `sources/<source>/` rather than a new verb.
@@ -194,9 +194,9 @@ sudo bash scripts/setup-security-onion-node.sh
 **Environment overrides:**
 | Var | Default |
 |---|---|
-| `SERVICE_USER` | `dshield_enrich` |
-| `INSTALL_DIR` | `/opt/dshield_enrich` |
-| `STATE_DIR` | `/var/lib/dshield_enrich` |
+| `SERVICE_USER` | `dshield_prism` |
+| `INSTALL_DIR` | `/opt/dshield_prism` |
+| `STATE_DIR` | `/var/lib/dshield_prism` |
 | `SYSTEMD_DIR` | `/etc/systemd/system` |
 | `PYTHON_BIN` | `python3` |
 
@@ -204,16 +204,16 @@ The script is idempotent — re-run it after editing config or fixing healthchec
 
 The first enrichment and cluster runs are **not** triggered by the script (enrich can take hours on a backlog). Run them manually:
 ```bash
-sudo -u dshield_enrich /opt/dshield_enrich/.venv/bin/python \
-    -m dshield_enrich.cli enrich --dry-run
-sudo -u dshield_enrich /opt/dshield_enrich/.venv/bin/python \
-    -m dshield_enrich.cli enrich
+sudo -u dshield_prism /opt/dshield_prism/.venv/bin/python \
+    -m enrich.cli enrich --dry-run
+sudo -u dshield_prism /opt/dshield_prism/.venv/bin/python \
+    -m enrich.cli enrich
 
 # After the first successful enrich, seed the cluster index:
-sudo -u dshield_enrich /opt/dshield_enrich/.venv/bin/python \
-    -m dshield_enrich.cli cluster
-sudo -u dshield_enrich /opt/dshield_enrich/.venv/bin/python \
-    -m dshield_enrich.cli escalate   # only if cloud.enabled=true
+sudo -u dshield_prism /opt/dshield_prism/.venv/bin/python \
+    -m enrich.cli cluster
+sudo -u dshield_prism /opt/dshield_prism/.venv/bin/python \
+    -m enrich.cli escalate   # only if cloud.enabled=true
 ```
 
 ---
@@ -262,22 +262,22 @@ llm:
 ### 2. SO box — create the worker user
 
 ```bash
-sudo useradd --system --home /opt/dshield_enrich --shell /usr/sbin/nologin dshield_enrich
-sudo mkdir -p /opt/dshield_enrich /var/lib/dshield_enrich
-sudo chown -R dshield_enrich:dshield_enrich /opt/dshield_enrich /var/lib/dshield_enrich
+sudo useradd --system --home /opt/dshield_prism --shell /usr/sbin/nologin dshield_prism
+sudo mkdir -p /opt/dshield_prism /var/lib/dshield_prism
+sudo chown -R dshield_prism:dshield_prism /opt/dshield_prism /var/lib/dshield_prism
 ```
 
 ### 3. SO box — deploy this folder
 
-Clone this repo to your SecurityOnion node, to /opt/dshield_enrich
+Clone this repo to your SecurityOnion node, to /opt/dshield_prism
 
 ### 4. SO box — Python venv + install
 
 ```bash
-cd /opt/dshield_enrich
-sudo -u dshield_enrich python3 -m venv .venv
-sudo -u dshield_enrich .venv/bin/pip install --upgrade pip
-sudo -u dshield_enrich .venv/bin/pip install -e .
+cd /opt/dshield_prism
+sudo -u dshield_prism python3 -m venv .venv
+sudo -u dshield_prism .venv/bin/pip install --upgrade pip
+sudo -u dshield_prism .venv/bin/pip install -e .
 ```
 
 ### 5. SO box — configure
@@ -285,15 +285,15 @@ sudo -u dshield_enrich .venv/bin/pip install -e .
 All per-deploy values (LLM URL, ES hosts, index names, paths) live in `config/local.yaml` (gitignored). `config/default.yaml` ships safe defaults; `local.yaml` overrides on top via deep-merge. The loader also accepts `local.yml`. Secrets live in `.env`.
 
 ```bash
-cd /opt/dshield_enrich
-sudo -u dshield_enrich cp config/local.yaml.example config/local.yaml
-sudo -u dshield_enrich cp .env.example              .env
+cd /opt/dshield_prism
+sudo -u dshield_prism cp config/local.yaml.example config/local.yaml
+sudo -u dshield_prism cp .env.example              .env
 
 # At minimum set: llm.{provider,base_url}, elasticsearch.indexes.cowrie.sessions_raw
-sudo -u dshield_enrich $EDITOR config/local.yaml
+sudo -u dshield_prism $EDITOR config/local.yaml
 
 # Set ES credentials (ES_USERNAME/ES_PASSWORD or ES_API_KEY)
-sudo -u dshield_enrich $EDITOR .env
+sudo -u dshield_prism $EDITOR .env
 sudo chmod 600 .env config/local.yaml
 ```
 
@@ -314,7 +314,7 @@ The CLI does a plain `PUT <index>` with explicit ECS settings + mappings from `e
 
 ```bash
 # Create all six indexes for the cowrie source in one shot.
-sudo -u dshield_enrich .venv/bin/python -m dshield_enrich.cli init-indexes
+sudo -u dshield_prism .venv/bin/python -m enrich.cli init-indexes
 # -> [{"index_created": "<name>", "layer": "commands", ...}, ...]
 # Re-running is idempotent — already-existing indexes return action: "noop".
 ```
@@ -322,14 +322,14 @@ sudo -u dshield_enrich .venv/bin/python -m dshield_enrich.cli init-indexes
 To init a single layer (e.g. when you only need Phase 1):
 
 ```bash
-sudo -u dshield_enrich .venv/bin/python -m dshield_enrich.cli init-indexes --layer commands
+sudo -u dshield_prism .venv/bin/python -m enrich.cli init-indexes --layer commands
 ```
 
 For destructive mapping changes (changing field types — e.g. `confidence` float→byte), delete and recreate the affected index:
 ```bash
 curl -k -u admin:PWD -X DELETE 'https://localhost:9200/<INDEX_NAME>'
-sudo -u dshield_enrich .venv/bin/python -m dshield_enrich.cli init-indexes --layer commands
-sudo -u dshield_enrich .venv/bin/python -m dshield_enrich.cli reset --yes
+sudo -u dshield_prism .venv/bin/python -m enrich.cli init-indexes --layer commands
+sudo -u dshield_prism .venv/bin/python -m enrich.cli reset --yes
 ```
 
 Manual / curl alternative when you can't use the CLI:
@@ -343,7 +343,7 @@ curl -k -u admin:PWD \
 ### 7. SO box — healthcheck
 
 ```bash
-sudo -u dshield_enrich .venv/bin/python -m dshield_enrich.cli healthcheck
+sudo -u dshield_prism .venv/bin/python -m enrich.cli healthcheck
 ```
 
 Expected (all `[ok]`):
@@ -355,7 +355,7 @@ Expected (all `[ok]`):
 [ok] model present: <generation_model>
 [ok] model present: <embedding_model>
 [ok] embedding works (dim=768)
-[ok] SQLite writable at /var/lib/dshield_enrich/state.sqlite, watermark=None
+[ok] SQLite writable at /var/lib/dshield_prism/state.sqlite, watermark=None
 All checks OK
 ```
 
@@ -365,10 +365,10 @@ If `[FAIL] embedding dim X != 768`: pick a 768-dim embedding model OR change `de
 
 ```bash
 # Dry-run: read events, compute hashes, but skip LLM + writes
-sudo -u dshield_enrich .venv/bin/python -m dshield_enrich.cli enrich --dry-run
+sudo -u dshield_prism .venv/bin/python -m enrich.cli enrich --dry-run
 
 # Real run — backfills all historical command events
-sudo -u dshield_enrich .venv/bin/python -m dshield_enrich.cli enrich
+sudo -u dshield_prism .venv/bin/python -m enrich.cli enrich
 ```
 
 The first run can take hours depending on history size and unique-command count. Stats print at the end:
@@ -389,14 +389,14 @@ Subsequent runs only see new events past the watermark and hit the cache for rep
 ### 9. Install + enable systemd timer
 
 ```bash
-sudo cp /opt/dshield_enrich/systemd/dshield_enrich-ingest.service /etc/systemd/system/
-sudo cp /opt/dshield_enrich/systemd/dshield_enrich-ingest.timer   /etc/systemd/system/
+sudo cp /opt/dshield_prism/systemd/dshield_prism-ingest.service /etc/systemd/system/
+sudo cp /opt/dshield_prism/systemd/dshield_prism-ingest.timer   /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now dshield_enrich-ingest.timer
+sudo systemctl enable --now dshield_prism-ingest.timer
 
 # Verify
-systemctl list-timers dshield_enrich-ingest.timer
-journalctl -u dshield_enrich-ingest.service -n 200 --no-pager
+systemctl list-timers dshield_prism-ingest.timer
+journalctl -u dshield_prism-ingest.service -n 200 --no-pager
 ```
 
 ### 10. Quick Kibana sanity
@@ -430,16 +430,16 @@ Off by default. Phase 1 must already be running and producing docs. To turn it o
    ```
 3. **Push the additive mapping** so `triage_reasons`, `notes`, and `local_fallback.*` exist on the commands index:
    ```bash
-   sudo -u dshield_enrich .venv/bin/python -m dshield_enrich.cli init-indexes --update-mapping --layer commands
+   sudo -u dshield_prism .venv/bin/python -m enrich.cli init-indexes --update-mapping --layer commands
    ```
 4. **Bump `worker.prompt_version`** (default `v4`) and `reset --cache --yes` if you want previously-cached commands re-evaluated through the new triage path.
 5. **Healthcheck** — confirms Anthropic reachability + budget:
    ```bash
-   sudo -u dshield_enrich .venv/bin/python -m dshield_enrich.cli healthcheck
+   sudo -u dshield_prism .venv/bin/python -m enrich.cli healthcheck
    ```
 6. **Run** as normal. After a pass, `enrich` returns extra stats: `triaged`, `cloud_calls`, `cloud_input_tokens`, `cloud_output_tokens`, `cloud_cost_usd`, `cloud_skipped_budget`. Daily spend is also queryable via:
    ```bash
-   sudo -u dshield_enrich .venv/bin/python -m dshield_enrich.cli budget
+   sudo -u dshield_prism .venv/bin/python -m enrich.cli budget
    ```
 
 **Triage rules** (any rule fires → escalate; recorded in `dshield.cowrie.enrichment.triage_reasons`):
@@ -469,7 +469,7 @@ Phase 1 and 2 must already be running and producing docs with embeddings. Phase 
 ### 1. Install cluster deps
 
 ```bash
-sudo -u dshield_enrich .venv/bin/pip install -e ".[cluster]"
+sudo -u dshield_prism .venv/bin/pip install -e ".[cluster]"
 ```
 
 This installs `numpy` and `scikit-learn` (which bundles HDBSCAN since 1.3). No Cython or compiler needed — both ship as pre-built wheels. No other changes required — the cluster deps are isolated to the `[cluster]` extra.
@@ -477,7 +477,7 @@ This installs `numpy` and `scikit-learn` (which bundles HDBSCAN since 1.3). No C
 ### 2. Create the command-clusters index
 
 ```bash
-sudo -u dshield_enrich .venv/bin/python -m dshield_enrich.cli \
+sudo -u dshield_prism .venv/bin/python -m enrich.cli \
     init-indexes --layer command_clusters
 ```
 
@@ -486,7 +486,7 @@ Idempotent — safe to re-run. The command-clusters index stores one centroid do
 ### 3. Dry-run to verify
 
 ```bash
-sudo -u dshield_enrich .venv/bin/python -m dshield_enrich.cli cluster commands --dry-run
+sudo -u dshield_prism .venv/bin/python -m enrich.cli cluster commands --dry-run
 ```
 
 Expected output (no writes):
@@ -505,19 +505,19 @@ If `docs_fetched` is 0, Phase 1 hasn't written any docs yet or `elasticsearch.in
 ### 4. Run for real
 
 ```bash
-sudo -u dshield_enrich .venv/bin/python -m dshield_enrich.cli cluster commands
+sudo -u dshield_prism .venv/bin/python -m enrich.cli cluster commands
 ```
 
 Stats include `docs_updated`, `cluster_docs_written`, and `runtime_seconds`. After a successful run, every command doc has its `dshield.cowrie.enrichment.cluster.*` fields populated.
 
 ### 5. Schedule it
 
-The setup script installs `dshield_enrich-analytics.timer`, which runs the full analytics chain (`cluster commands` → `escalate` → `cluster sessions` → `name playbooks` → `rollup ips` → `cluster ips` → `mine campaigns`) every 6 hours at 00:00, 06:00, 12:00, and 18:00 UTC (with up to 5 minutes of random jitter). No cron entry needed.
+The setup script installs `dshield_prism-analytics.timer`, which runs the full analytics chain (`cluster commands` → `escalate` → `cluster sessions` → `name playbooks` → `rollup ips` → `cluster ips` → `mine campaigns`) every 6 hours at 00:00, 06:00, 12:00, and 18:00 UTC (with up to 5 minutes of random jitter). No cron entry needed.
 
 To monitor it:
 ```bash
-journalctl -fu dshield_enrich-analytics.service
-systemctl list-timers dshield_enrich-analytics.timer
+journalctl -fu dshield_prism-analytics.service
+systemctl list-timers dshield_prism-analytics.timer
 ```
 
 Every step except `cluster commands` is declared with a `-` prefix in the service unit so its failure (e.g. `cloud.enabled=false` for `escalate`, or `[cluster]` extras missing) does not fail the unit — `cluster commands` is required because every downstream step depends on its novelty scores.
@@ -603,10 +603,10 @@ Set `embed_context: []` to revert to pre-Phase-3+ behavior (raw command only). A
 ```bash
 # Re-embed all docs using stored enrichment fields — no LLM calls.
 # Updates SQLite cache entries to the new embed_version so next enrich skips the LLM.
-sudo -u dshield_enrich .venv/bin/python -m dshield_enrich.cli reembed
+sudo -u dshield_prism .venv/bin/python -m enrich.cli reembed
 
 # Rebuild cluster centroids from the new vectors.
-sudo -u dshield_enrich .venv/bin/python -m dshield_enrich.cli cluster commands
+sudo -u dshield_prism .venv/bin/python -m enrich.cli cluster commands
 ```
 
 If any docs fail to re-embed (network blip, embedding model timeout), they are left uncached and fall back to normal LLM re-enrichment on the next `enrich` run.
@@ -686,8 +686,8 @@ Phase 4 is purely additive. Nothing in the upgrade touches the enrichment index,
 **Step 1 — Pull the updated code**
 
 ```bash
-cd /opt/dshield_enrich
-sudo -u dshield_enrich git pull
+cd /opt/dshield_prism
+sudo -u dshield_prism git pull
 ```
 
 **Step 2 — Confirm cluster deps are installed**
@@ -695,7 +695,7 @@ sudo -u dshield_enrich git pull
 Phase 4 uses the same `numpy` + `scikit-learn` extras as Phase 3. If Phase 3 is already running, skip this.
 
 ```bash
-sudo -u dshield_enrich .venv/bin/pip install -e ".[cluster]"
+sudo -u dshield_prism .venv/bin/pip install -e ".[cluster]"
 ```
 
 **Step 3 — Find your index names**
@@ -712,8 +712,8 @@ Index names live under `elasticsearch.indexes.cowrie.*` in your config. With the
 If you override any of these in `local.yaml`, print the resolved names:
 
 ```bash
-sudo -u dshield_enrich .venv/bin/python -c "
-from dshield_enrich.config import load_config
+sudo -u dshield_prism .venv/bin/python -c "
+from enrich.config import load_config
 cfg = load_config('config/default.yaml')
 ix = cfg.elasticsearch.indexes.cowrie
 print('sessions:         ', ix.sessions_rollup)
@@ -728,18 +728,18 @@ print('ips-clusters:     ', ix.ip_clusters)
 `init-indexes` is idempotent — already-existing layers return `action: "noop"`. You can run it once with no `--layer` to create every missing layer for the source:
 
 ```bash
-CLI=".venv/bin/python -m dshield_enrich.cli"
+CLI=".venv/bin/python -m enrich.cli"
 
-sudo -u dshield_enrich $CLI init-indexes
+sudo -u dshield_prism $CLI init-indexes
 ```
 
 Or scope to a single layer when you want to verify one at a time:
 
 ```bash
-sudo -u dshield_enrich $CLI init-indexes --layer sessions
-sudo -u dshield_enrich $CLI init-indexes --layer session_clusters
-sudo -u dshield_enrich $CLI init-indexes --layer ips
-sudo -u dshield_enrich $CLI init-indexes --layer ip_clusters
+sudo -u dshield_prism $CLI init-indexes --layer sessions
+sudo -u dshield_prism $CLI init-indexes --layer session_clusters
+sudo -u dshield_prism $CLI init-indexes --layer ips
+sudo -u dshield_prism $CLI init-indexes --layer ip_clusters
 ```
 
 > **Tip:** `rollup sessions` and `rollup ips` also auto-create their respective rollup indices on first run (same pattern as `cluster commands` auto-creates the command-clusters index). The explicit `init-indexes` steps above let you verify the mapping before data arrives.
@@ -747,7 +747,7 @@ sudo -u dshield_enrich $CLI init-indexes --layer ip_clusters
 **Step 5 — Dry-run to verify event access**
 
 ```bash
-sudo -u dshield_enrich .venv/bin/python -m dshield_enrich.cli rollup sessions --dry-run
+sudo -u dshield_prism .venv/bin/python -m enrich.cli rollup sessions --dry-run
 ```
 
 Expected output:
@@ -766,7 +766,7 @@ GET <events_index>/_count
 With no session watermark, the first run processes every closed session ever recorded. It reads from ES and mgets enrichment docs — no LLM calls.
 
 ```bash
-sudo -u dshield_enrich .venv/bin/python -m dshield_enrich.cli rollup sessions
+sudo -u dshield_prism .venv/bin/python -m enrich.cli rollup sessions
 ```
 
 Example output:
@@ -786,8 +786,8 @@ Example output:
 **Step 7 — Cluster sessions**
 
 ```bash
-sudo -u dshield_enrich .venv/bin/python -m dshield_enrich.cli cluster sessions --dry-run
-sudo -u dshield_enrich .venv/bin/python -m dshield_enrich.cli cluster sessions
+sudo -u dshield_prism .venv/bin/python -m enrich.cli cluster sessions --dry-run
+sudo -u dshield_prism .venv/bin/python -m enrich.cli cluster sessions
 ```
 
 Every session doc with an embedding now has `dshield.cowrie.enrichment.session.cluster.*` fields.
@@ -797,8 +797,8 @@ Every session doc with an embedding now has `dshield.cowrie.enrichment.session.c
 `rollup ips` finds all IPs that had sessions updated since the IP watermark (none yet, so it processes everything).
 
 ```bash
-sudo -u dshield_enrich .venv/bin/python -m dshield_enrich.cli rollup ips --dry-run
-sudo -u dshield_enrich .venv/bin/python -m dshield_enrich.cli rollup ips
+sudo -u dshield_prism .venv/bin/python -m enrich.cli rollup ips --dry-run
+sudo -u dshield_prism .venv/bin/python -m enrich.cli rollup ips
 ```
 
 Example output:
@@ -815,8 +815,8 @@ Example output:
 **Step 9 — Cluster IPs**
 
 ```bash
-sudo -u dshield_enrich .venv/bin/python -m dshield_enrich.cli cluster ips --dry-run
-sudo -u dshield_enrich .venv/bin/python -m dshield_enrich.cli cluster ips
+sudo -u dshield_prism .venv/bin/python -m enrich.cli cluster ips --dry-run
+sudo -u dshield_prism .venv/bin/python -m enrich.cli cluster ips
 ```
 
 **Step 10 — Name playbooks**
@@ -824,8 +824,8 @@ sudo -u dshield_enrich .venv/bin/python -m dshield_enrich.cli cluster ips
 Always uses the **local** LLM — never escalates to cloud regardless of `cloud.enabled`. Naming is a short, low-stakes generation where consistency across runs matters more than per-call quality. Dry-run first to preview which clusters will be named and what commands they'll be shown.
 
 ```bash
-sudo -u dshield_enrich .venv/bin/python -m dshield_enrich.cli name playbooks --dry-run
-sudo -u dshield_enrich .venv/bin/python -m dshield_enrich.cli name playbooks
+sudo -u dshield_prism .venv/bin/python -m enrich.cli name playbooks --dry-run
+sudo -u dshield_prism .venv/bin/python -m enrich.cli name playbooks
 ```
 
 Each cluster logs: `Session cluster cluster_N (42 sessions) → 'XMRig Mining Dropper'`. The name and the stable `playbook_id` are written to the cluster centroid doc and to every member session doc.
@@ -835,8 +835,8 @@ Prompt template: `config/prompts/playbook_name.txt`.
 **Step 11 — Mine campaigns**
 
 ```bash
-sudo -u dshield_enrich .venv/bin/python -m dshield_enrich.cli mine campaigns --dry-run
-sudo -u dshield_enrich .venv/bin/python -m dshield_enrich.cli mine campaigns --kind all
+sudo -u dshield_prism .venv/bin/python -m enrich.cli mine campaigns --dry-run
+sudo -u dshield_prism .venv/bin/python -m enrich.cli mine campaigns --kind all
 ```
 
 This is purely algorithmic — no LLM involvement. Output goes to the `campaigns-dshield.cowrie-default` index. See [`docs/PLAYBOOKS_AND_CAMPAIGNS.md`](docs/PLAYBOOKS_AND_CAMPAIGNS.md) for tuning knobs.
@@ -859,11 +859,11 @@ If your index names differ from the defaults, edit the imported data views after
 The two systemd units shipped in `systemd/` already cover the full cadence — no manual edits required if you used `scripts/setup-security-onion-node.sh`. For reference, the chain is:
 
 ```
-# Hourly (dshield_enrich-ingest.service)
+# Hourly (dshield_prism-ingest.service)
 enrich
 rollup sessions
 
-# 6-hourly (dshield_enrich-analytics.service)
+# 6-hourly (dshield_prism-analytics.service)
 cluster commands
 escalate                       (skipped if cloud disabled or budget exhausted)
 cluster sessions               (requires .[cluster] extras)
@@ -891,12 +891,12 @@ sudo systemctl daemon-reload
 | `session_last_processed_at` | nothing | `DELETE FROM watermark WHERE key = 'session_last_processed_at';` |
 | `ip_rollup_last_processed_at` | nothing | `DELETE FROM watermark WHERE key = 'ip_rollup_last_processed_at';` |
 
-Run `sqlite3 /var/lib/dshield_enrich/state.sqlite` to open the SQLite shell.
+Run `sqlite3 /var/lib/dshield_prism/state.sqlite` to open the SQLite shell.
 
 **Re-rollup after enrichment changes** — if you bump `prompt_version` and re-enrich (changing intent, novelty, or confidence in the enrichment docs), session and IP docs become stale. Full refresh:
 
 ```bash
-# sqlite3 /var/lib/dshield_enrich/state.sqlite
+# sqlite3 /var/lib/dshield_prism/state.sqlite
 DELETE FROM watermark WHERE key IN ('session_last_processed_at', 'ip_rollup_last_processed_at');
 ```
 
@@ -911,7 +911,7 @@ Then run the full Phase 4 pipeline in order: `rollup sessions` → `cluster sess
 **Re-naming playbooks** — to update names after the LLM prompt changes:
 
 ```bash
-sudo -u dshield_enrich .venv/bin/python -m dshield_enrich.cli name playbooks --force
+sudo -u dshield_prism .venv/bin/python -m enrich.cli name playbooks --force
 ```
 
 This regenerates names for all clusters and updates both centroid docs and member session docs.
@@ -1117,7 +1117,7 @@ Note: Kibana's `_score` field is the ES query relevance score — not a severity
 ## Operational notes
 
 - **Cache key** = `(short_command_hash, generation_model, prompt_version, embed_version)`. Bump `worker.prompt_version` after prompt edits (forces LLM re-enrichment + re-embedding). Bump `llm.embed_version` after changing `llm.embed_context`, then run `reembed` to update vectors without re-running the LLM.
-- **Watermarks** — there are three, all in SQLite (`/var/lib/dshield_enrich/state.sqlite`):
+- **Watermarks** — there are three, all in SQLite (`/var/lib/dshield_prism/state.sqlite`):
   - `last_processed_at` — command watermark, advanced by `enrich`. Cleared by `reset --watermark`.
   - `session_last_processed_at` — session watermark, advanced by `rollup sessions`. **Not** cleared by `reset`. To reset: `DELETE FROM watermark WHERE key = 'session_last_processed_at';` via `sqlite3`.
   - `ip_rollup_last_processed_at` — IP watermark, advanced by `rollup ips`. **Not** cleared by `reset`. To reset: `DELETE FROM watermark WHERE key = 'ip_rollup_last_processed_at';` via `sqlite3`.
@@ -1127,7 +1127,7 @@ Note: Kibana's `_score` field is the ES query relevance score — not a severity
 - **Phase 3/4 cluster deps** (`numpy`, `scikit-learn`) are an optional extra — `pip install -e ".[cluster]"`. Both ship as pre-built wheels; no Cython or compiler needed. The base package (`pip install -e .`) does not pull them in, so Phase 1/2 work on any SO box without the heavy ML deps.
 - **Re-enrich / re-scan from scratch**:
   ```bash
-  sudo -u dshield_enrich .venv/bin/python -m dshield_enrich.cli reset --yes
+  sudo -u dshield_prism .venv/bin/python -m enrich.cli reset --yes
   ```
 - **Index management**: SO 2.x manages its own indices but does NOT touch the enrichment or sessions indices. Add an ILM policy if you want rollover/retention; not required for Phase 1-4 volumes (likely <1GB/year combined).
 - **Provider switch**: changing `llm.provider` mid-stream is fine — but bump `prompt_version` so cached results from the old provider get re-run if you want consistency.
@@ -1144,7 +1144,7 @@ Note: Kibana's `_score` field is the ES query relevance score — not a severity
 | `enriched_failed` high | LLM returning malformed JSON. Check raw output in journal logs; tune the prompt or move to a stronger model |
 | `chat 400: 'response_format.type' must be 'json_schema' or 'text'` | LM Studio rejects `json_object`. Already handled by passing the Pydantic schema as `json_schema` — make sure you are on the latest code |
 | `dense_vector` mapping conflict on first write | Index was auto-created by a write before `init-indexes` ran. Delete the index and re-run `init-indexes --layer commands` (or whichever layer is affected) |
-| Worker hangs on first run | Generation slow on cold model. Check `journalctl -fu dshield_enrich-ingest.service`; service has `TimeoutStartSec=2h` |
+| Worker hangs on first run | Generation slow on cold model. Check `journalctl -fu dshield_prism-ingest.service`; service has `TimeoutStartSec=2h` |
 | `rollup sessions` → `closed_sessions_found: 0` | No `cowrie.session.closed` events in the events index, or wrong index pattern. Verify: `GET <events_index>/_count {"query":{"term":{"event.action":"cowrie.session.closed"}}}` |
 | `sessions_with_embedding` much lower than `sessions_built` | Most sessions are pure credential spray with no commands — this is expected. For sessions that did have commands, run `enrich` first, then re-run `rollup sessions`. Session docs overwrite idempotently. |
 | `cluster sessions` → `skipped_too_few` | Fewer session docs with embeddings than `session.cluster_min_cluster_size` (default 3). Either run more `rollup sessions` passes after `enrich`, or lower `cluster_min_cluster_size` in `local.yaml`. |

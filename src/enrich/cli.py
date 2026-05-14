@@ -13,6 +13,7 @@ import json
 import logging
 import sys
 
+from .__about__ import CLI_NAME
 from .config import load_config, load_secrets
 from . import healthcheck as hc_mod
 
@@ -230,7 +231,7 @@ def _resolve_index_for_layer(cfg, source: str, layer: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="dshield_enrich")
+    p = argparse.ArgumentParser(prog=CLI_NAME)
     p.add_argument("--config", default=None, help="Path to YAML config")
     sub = p.add_subparsers(dest="verb", required=True)
 

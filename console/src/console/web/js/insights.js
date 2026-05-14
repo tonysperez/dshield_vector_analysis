@@ -105,7 +105,7 @@
   }
 
   function renderMinedCampaigns(rows) {
-    // Multi-session campaigns mined by `dshield-enrich mine campaigns`.
+    // Multi-session campaigns mined by `dshield_prism mine campaigns`.
     // `rows` shape (from queries.list_campaigns):
     //   { campaign_id, kind, name, rationale, ip_count, session_count,
     //     first_seen, last_seen, support, member_playbook_ids }
@@ -114,7 +114,7 @@
     if (!rows || !rows.length) {
       wrap.innerHTML = "";
       const e = el("em", "ins-empty",
-        "No mined campaigns yet — run `dshield-enrich mine campaigns` to discover them.");
+        "No mined campaigns yet — run `dshield_prism mine campaigns` to discover them.");
       wrap.appendChild(e);
       return;
     }

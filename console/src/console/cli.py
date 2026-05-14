@@ -1,10 +1,12 @@
-"""CLI entrypoint: `dshield-console serve`."""
+"""CLI entrypoint: `<CLI_NAME> serve` (CLI_NAME from __about__.py)."""
 from __future__ import annotations
 
 import argparse
 import sys
 import webbrowser
 from pathlib import Path
+
+from .__about__ import CLI_NAME
 
 
 def _serve(args: argparse.Namespace) -> int:
@@ -41,7 +43,7 @@ def _healthcheck(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(prog="dshield-console")
+    p = argparse.ArgumentParser(prog=CLI_NAME)
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("serve", help="Run the web UI")

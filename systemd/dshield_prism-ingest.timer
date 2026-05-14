@@ -1,12 +1,12 @@
 [Unit]
 Description=Run Cowrie ingest (enrich + session rollup) hourly
-Requires=dshield_enrich-ingest.service
+Requires=dshield_prism-ingest.service
 
 [Timer]
 OnCalendar=hourly
 RandomizedDelaySec=300
 Persistent=true
-Unit=dshield_enrich-ingest.service
+Unit=dshield_prism-ingest.service
 
 [Install]
 WantedBy=timers.target

@@ -1,5 +1,5 @@
 [project]
-name = "dshield_enrich"
+name = "dshield_prism"
 version = "0.2.0"
 requires-python = ">=3.9"
 dependencies = [
@@ -19,7 +19,7 @@ cluster = [
 ]
 
 [project.scripts]
-dshield_enrich = "dshield_enrich.cli:main"
+dshield_prism = "enrich.cli:main"
 
 [build-system]
 requires = ["setuptools>=68"]
@@ -29,4 +29,4 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 
 [tool.setuptools.package-data]
-"dshield_enrich" = ["data/*.json"]
+"enrich" = ["data/*.json"]

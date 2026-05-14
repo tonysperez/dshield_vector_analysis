@@ -6,7 +6,7 @@ cluster-ips: HDBSCAN over IP embeddings (delegates to clustering core).
 
 IP clusters are unnamed "actor profile" buckets. An IP's playbook membership
 is derived from its sessions at query time, and campaigns (the multi-session
-concept) are mined into a separate index by `dshield-enrich mine campaigns`.
+concept) are mined into a separate index by `dshield_prism mine campaigns`.
 """
 from __future__ import annotations
 

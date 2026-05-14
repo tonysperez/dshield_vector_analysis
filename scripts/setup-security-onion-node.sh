@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# setup-security-onion-node.sh — one-shot Security Onion-side installer for dshield_enrich.
+# setup-security-onion-node.sh — one-shot Security Onion-side installer for enrich.
 #
 # Idempotent. Safe to re-run on a fresh node OR an existing deploy to upgrade.
 # Requires root (or sudo).
@@ -18,28 +18,28 @@
 #   E. Run healthcheck (ES + local LLM + SQLite + cloud connectivity)
 #   F. Init all six ES indexes for the cowrie source, additive-mapping safe.
 #   G. Install + enable systemd timers:
-#        dshield_enrich-ingest.timer
+#        dshield_prism-ingest.timer
 #          → enrich + rollup sessions          (hourly)
-#        dshield_enrich-analytics.timer
+#        dshield_prism-analytics.timer
 #          → cluster commands + escalate + cluster sessions + name playbooks
 #            + rollup ips + cluster ips + mine campaigns
 #            (every 6h)
 #
 # Skipped on purpose (first run can take hours on a backlog):
 #   - Initial enrichment + clustering pass. Trigger manually after setup:
-#       sudo systemctl start dshield_enrich-ingest.service
-#       sudo systemctl start dshield_enrich-analytics.service
+#       sudo systemctl start dshield_prism-ingest.service
+#       sudo systemctl start dshield_prism-analytics.service
 #     Or via the CLI:
 #       sudo -u "${SERVICE_USER}" "${INSTALL_DIR}/.venv/bin/python" \
-#         -m dshield_enrich.cli enrich
+#         -m enrich.cli enrich
 #
 # Usage:
 #   sudo bash scripts/setup-security-onion-node.sh [--no-systemd] [--skip-healthcheck] [--skip-init-index]
 #
 # Environment overrides:
-#   SERVICE_USER   default: dshield_enrich
-#   INSTALL_DIR    default: /opt/dshield_enrich
-#   STATE_DIR      default: /var/lib/dshield_enrich
+#   SERVICE_USER   default: dshield_prism
+#   INSTALL_DIR    default: /opt/dshield_prism
+#   STATE_DIR      default: /var/lib/dshield_prism
 #   SYSTEMD_DIR    default: /etc/systemd/system
 #   PYTHON_BIN     default: python3
 
@@ -47,9 +47,9 @@ set -euo pipefail
 
 # ---- configurable ----------------------------------------------------------
 
-SERVICE_USER="${SERVICE_USER:-dshield_enrich}"
-INSTALL_DIR="${INSTALL_DIR:-/opt/dshield_enrich}"
-STATE_DIR="${STATE_DIR:-/var/lib/dshield_enrich}"
+SERVICE_USER="${SERVICE_USER:-dshield_prism}"
+INSTALL_DIR="${INSTALL_DIR:-/opt/dshield_prism}"
+STATE_DIR="${STATE_DIR:-/var/lib/dshield_prism}"
 SYSTEMD_DIR="${SYSTEMD_DIR:-/etc/systemd/system}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
@@ -113,10 +113,10 @@ log "  python: ${PY_VER}"
 
 REQUIRED_FILES=(
     "${SRC_DIR}/pyproject.toml"
-    "${SRC_DIR}/src/dshield_enrich/cli.py"
-    "${SRC_DIR}/src/dshield_enrich/sources/cowrie/commands.py"
-    "${SRC_DIR}/src/dshield_enrich/sources/cowrie/sessions.py"
-    "${SRC_DIR}/src/dshield_enrich/sources/cowrie/ips.py"
+    "${SRC_DIR}/src/enrich/cli.py"
+    "${SRC_DIR}/src/enrich/sources/cowrie/commands.py"
+    "${SRC_DIR}/src/enrich/sources/cowrie/sessions.py"
+    "${SRC_DIR}/src/enrich/sources/cowrie/ips.py"
     "${SRC_DIR}/config/default.yaml"
     "${SRC_DIR}/config/prompts/command_enrichment.txt"
     "${SRC_DIR}/config/prompts/command_deep_dive.txt"
@@ -127,10 +127,10 @@ REQUIRED_FILES=(
     "${SRC_DIR}/es-mappings/cowrie/session_clusters.json"
     "${SRC_DIR}/es-mappings/cowrie/ips.json"
     "${SRC_DIR}/es-mappings/cowrie/ip_clusters.json"
-    "${SRC_DIR}/systemd/dshield_enrich-ingest.service"
-    "${SRC_DIR}/systemd/dshield_enrich-ingest.timer"
-    "${SRC_DIR}/systemd/dshield_enrich-analytics.service"
-    "${SRC_DIR}/systemd/dshield_enrich-analytics.timer"
+    "${SRC_DIR}/systemd/dshield_prism-ingest.service"
+    "${SRC_DIR}/systemd/dshield_prism-ingest.timer"
+    "${SRC_DIR}/systemd/dshield_prism-analytics.service"
+    "${SRC_DIR}/systemd/dshield_prism-analytics.timer"
 )
 for required in "${REQUIRED_FILES[@]}"; do
     [[ -f "${required}" ]] || die "Missing source file: ${required}"
@@ -207,7 +207,7 @@ sudo -u "${SERVICE_USER}" "${VENV}/bin/pip" install --quiet --upgrade pip
 sudo -u "${SERVICE_USER}" "${VENV}/bin/pip" install --quiet -e "${INSTALL_DIR}[cluster]"
 
 if ! sudo -u "${SERVICE_USER}" "${VENV}/bin/python" -c \
-    'import dshield_enrich' >/dev/null 2>&1
+    'import enrich' >/dev/null 2>&1
 then
     die "Post-install import failed. Check pip output above."
 fi
@@ -217,7 +217,7 @@ then
     die "Cluster deps import failed (sklearn.cluster.HDBSCAN not found)."
 fi
 if ! sudo -u "${SERVICE_USER}" "${VENV}/bin/python" -c \
-    'from dshield_enrich.sources.cowrie import commands, sessions, ips' >/dev/null 2>&1
+    'from enrich.sources.cowrie import commands, sessions, ips' >/dev/null 2>&1
 then
     die "Cowrie source modules failed to import. Check pip output above."
 fi
@@ -225,8 +225,8 @@ fi
 # Helper: run the CLI as the service user with the right env + cwd.
 run_cli() {
     sudo -u "${SERVICE_USER}" env \
-        DSHIELD_ENRICH_ENV="${INSTALL_DIR}/.env" \
-        "${VENV}/bin/python" -m dshield_enrich.cli \
+        PRISM_ENV="${INSTALL_DIR}/.env" \
+        "${VENV}/bin/python" -m enrich.cli \
         --config "${INSTALL_DIR}/config/default.yaml" "$@"
 }
 
@@ -261,10 +261,10 @@ if (( INSTALL_SYSTEMD )); then
 
     UNITS_CHANGED=0
     for unit in \
-        dshield_enrich-ingest.service \
-        dshield_enrich-ingest.timer \
-        dshield_enrich-analytics.service \
-        dshield_enrich-analytics.timer
+        dshield_prism-ingest.service \
+        dshield_prism-ingest.timer \
+        dshield_prism-analytics.service \
+        dshield_prism-analytics.timer
     do
         src="${INSTALL_DIR}/systemd/${unit}"
         dst="${SYSTEMD_DIR}/${unit}"
@@ -286,17 +286,17 @@ if (( INSTALL_SYSTEMD )); then
         systemctl daemon-reload
     fi
 
-    systemctl enable --now dshield_enrich-ingest.timer
-    systemctl enable --now dshield_enrich-analytics.timer
+    systemctl enable --now dshield_prism-ingest.timer
+    systemctl enable --now dshield_prism-analytics.timer
     if (( UNITS_CHANGED )); then
-        systemctl restart dshield_enrich-ingest.timer
-        systemctl restart dshield_enrich-analytics.timer
+        systemctl restart dshield_prism-ingest.timer
+        systemctl restart dshield_prism-analytics.timer
     fi
 
     log "Timer status:"
     systemctl --no-pager list-timers \
-        dshield_enrich-ingest.timer \
-        dshield_enrich-analytics.timer || true
+        dshield_prism-ingest.timer \
+        dshield_prism-analytics.timer || true
 else
     warn "Skipping systemd install (--no-systemd)"
 fi
@@ -309,11 +309,11 @@ ${GREEN}Setup complete.${RESET}
 
 Scheduled services installed:
 
-  dshield_enrich-ingest.timer            (hourly)
+  dshield_prism-ingest.timer            (hourly)
     → enrich              (command enrichment + cloud escalation)
     → rollup sessions     (session aggregation)
 
-  dshield_enrich-analytics.timer         (every 6h at 00,06,12,18 UTC)
+  dshield_prism-analytics.timer         (every 6h at 00,06,12,18 UTC)
     → cluster commands           (command HDBSCAN)
     → escalate                   (cloud rescue for novel commands)
     → cluster sessions           (session HDBSCAN)
@@ -324,17 +324,17 @@ Scheduled services installed:
 
 The first hourly pass will fire within the hour. To kick off a run now:
 
-  sudo systemctl start dshield_enrich-ingest.service
-  sudo systemctl start dshield_enrich-analytics.service
+  sudo systemctl start dshield_prism-ingest.service
+  sudo systemctl start dshield_prism-analytics.service
 
 Tail live logs:
 
-  journalctl -fu dshield_enrich-ingest.service
-  journalctl -fu dshield_enrich-analytics.service
+  journalctl -fu dshield_prism-ingest.service
+  journalctl -fu dshield_prism-analytics.service
 
 Useful CLI commands (run as the service user):
 
-  CLI="sudo -u ${SERVICE_USER} ${VENV}/bin/python -m dshield_enrich.cli"
+  CLI="sudo -u ${SERVICE_USER} ${VENV}/bin/python -m enrich.cli"
   \$CLI healthcheck                  # ES + LLM + SQLite + cloud
   \$CLI enrich --dry-run             # show what would be enriched
   \$CLI budget                       # today's cloud-LLM spend

@@ -610,7 +610,7 @@ def run_enrich(cfg: AppConfig, secrets: Secrets, dry_run: bool = False, no_cloud
 
     # Reset the MITRE-validation drop counter so the value reported at the end
     # of this run reflects only this run's hallucinations.
-    from dshield_enrich.llm.schemas import reset_mitre_drop_counts
+    from enrich.llm.schemas import reset_mitre_drop_counts
     reset_mitre_drop_counts()
 
     for hit in iter_command_events(es, events_idx, since, cfg.worker.page_size):
@@ -862,7 +862,7 @@ def run_enrich(cfg: AppConfig, secrets: Secrets, dry_run: bool = False, no_cloud
     if "cloud_cost_usd_x10000" in out:
         out["cloud_cost_usd"] = out.pop("cloud_cost_usd_x10000") / 10000.0
     # Surface MITRE ID hallucination rate from this run.
-    from dshield_enrich.llm.schemas import mitre_drop_counts
+    from enrich.llm.schemas import mitre_drop_counts
     mitre_drops = mitre_drop_counts()
     if mitre_drops["tactics"] or mitre_drops["techniques"]:
         log.info(

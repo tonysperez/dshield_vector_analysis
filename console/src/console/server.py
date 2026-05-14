@@ -109,7 +109,7 @@ def build_app(config_path: str | None = None) -> FastAPI:
     # Compare clusters (interactive: "why didn't these two playbooks merge?")
     # ------------------------------------------------------------------
     #
-    # These endpoints reach into the parent `dshield_enrich` package — the
+    # These endpoints reach into the parent `enrich` package — the
     # only place in this console where we cross-package import. The pipeline
     # owns the analysis primitives (`analyze_cluster_pair`) and the LLM
     # client; duplicating either here would mean keeping two implementations
@@ -120,7 +120,7 @@ def build_app(config_path: str | None = None) -> FastAPI:
 
     def _get_pipeline_cfg():
         if _pipeline_cfg["value"] is None:
-            from dshield_enrich.config import load_config as _load_pipeline_cfg
+            from enrich.config import load_config as _load_pipeline_cfg
             _pipeline_cfg["value"] = _load_pipeline_cfg(config_path)
         return _pipeline_cfg["value"]
 
@@ -155,7 +155,7 @@ def build_app(config_path: str | None = None) -> FastAPI:
         Fast (ES-only); no LLM call."""
         if a == b:
             raise HTTPException(400, "a and b must be different cluster_ids")
-        from dshield_enrich.sources.cowrie.explain import analyze_cluster_pair
+        from enrich.sources.cowrie.explain import analyze_cluster_pair
         try:
             data = analyze_cluster_pair(es, _get_pipeline_cfg(), a, b)
         except RuntimeError as exc:
@@ -170,7 +170,7 @@ def build_app(config_path: str | None = None) -> FastAPI:
         """Take a previously-computed analysis dict and ask the local LLM
         for a verdict + evidence + recommendation. Slow (10-30s); fires only
         when the user clicks 'Explain' on the compare page."""
-        from dshield_enrich.sources.cowrie.explain import explain_cluster_pair_with_llm
+        from enrich.sources.cowrie.explain import explain_cluster_pair_with_llm
         analysis = payload.get("analysis") if isinstance(payload, dict) else None
         if not analysis or not isinstance(analysis, dict):
             raise HTTPException(400, "request body must include {'analysis': <dict>}")
@@ -305,7 +305,7 @@ def build_app(config_path: str | None = None) -> FastAPI:
             )
         if ioc_type == "campaign":
             # Multi-session campaign — mined into its own index by
-            # `dshield-enrich mine campaigns`. Distinct from playbook (which
+            # `dshield_prism mine campaigns`. Distinct from playbook (which
             # is a named session cluster).
             doc = queries.lookup_campaign(es, cfg, ident)
             if not doc:

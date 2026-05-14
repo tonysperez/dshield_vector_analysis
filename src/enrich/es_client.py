@@ -83,7 +83,7 @@ def make_client(cfg: ESConfig, secrets: Secrets) -> Elasticsearch:
         raise RuntimeError(
             "No ES credentials. Set ES_USERNAME/ES_PASSWORD or ES_API_KEY in .env "
             "(or export them in the environment). The .env file is searched in this order: "
-            "$DSHIELD_ENRICH_ENV, alongside-config-file's parent, alongside-config-file, CWD."
+            "$PRISM_ENV, alongside-config-file's parent, alongside-config-file, CWD."
         )
     return Elasticsearch(**kwargs)
 

@@ -45,7 +45,7 @@ llm:
   embed_version: "v3"
 
 worker:
-  state_db: "/var/lib/dshield_enrich/state.sqlite"
+  state_db: "/var/lib/dshield_prism/state.sqlite"
   page_size: 1000
   command_max_chars: 4000
   # Bump after editing either prompt to force re-enrichment.

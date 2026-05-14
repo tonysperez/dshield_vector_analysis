@@ -96,7 +96,7 @@
   // ---------------------------------------------------------------------
   // Threat-hunter defaults: only sessions that successfully logged in AND
   // ran a command. Users can flip either off via the settings modal.
-  const SETTINGS_KEY = "dshield-console.settings.v1";
+  const SETTINGS_KEY = "dshield_prism_console.settings.v1";
   const SETTINGS_DEFAULTS = { requireLogin: true, requireCommands: true };
   function loadSettings() {
     try {

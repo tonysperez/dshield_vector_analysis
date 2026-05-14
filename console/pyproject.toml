@@ -1,5 +1,5 @@
 [project]
-name = "dshield_console"
+name = "dshield_prism_console"
 version = "0.1.0"
 requires-python = ">=3.10"
 dependencies = [
@@ -13,7 +13,7 @@ dependencies = [
 ]
 
 [project.scripts]
-dshield-console = "dshield_console.cli:main"
+dshield_prism_console = "console.cli:main"
 
 [build-system]
 requires = ["setuptools>=68"]
@@ -23,4 +23,4 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 
 [tool.setuptools.package-data]
-dshield_console = ["web/**/*"]
+console = ["web/**/*"]

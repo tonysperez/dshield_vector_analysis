@@ -1,14 +1,14 @@
 """Self-contained config loader for the console.
 
 Reads the same `config/default.yaml` (+ `local.yaml` override) and `.env` files
-that the parent `dshield_enrich` pipeline uses, but only requires the
+that the parent `enrich` pipeline uses, but only requires the
 `elasticsearch.*` block. All other top-level keys (llm, worker, cloud, …) are
 ignored, so the console can be installed and run independently of the
 pipeline.
 
 DUPLICATION NOTICE
 ==================
-The following are deliberately duplicated from `src/dshield_enrich/config.py`
+The following are deliberately duplicated from `src/enrich/config.py`
 to keep this package free of cross-package imports:
 
     - CowrieIndexes, SourceIndexes, ESConfig pydantic models
@@ -31,6 +31,8 @@ import yaml
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from .__about__ import ENV_PREFIX
+
 
 class CowrieIndexes(BaseModel):
     sessions_raw: str
@@ -40,7 +42,7 @@ class CowrieIndexes(BaseModel):
     session_clusters: str       # playbook centroids (named session clusters)
     ips_rollup: str
     ip_clusters: str
-    # Multi-session campaigns mined by `dshield-enrich mine campaigns`.
+    # Multi-session campaigns mined by `dshield_prism mine campaigns`.
     # Default value here means the console will fall back to a sensible
     # name if the user's local.yaml hasn't been re-merged from default.yaml.
     campaigns: str = "campaigns-dshield.cowrie-default"
@@ -93,13 +95,12 @@ def _deep_merge(base: dict, over: dict) -> dict:
 
 def _default_config_path() -> str:
     """Default search:
-      $DSHIELD_CONSOLE_CONFIG, $DSHIELD_ENRICH_CONFIG, ./config/default.yaml,
+      $<ENV_PREFIX>CONFIG, ./config/default.yaml,
       ../config/default.yaml (when the console is run from inside console/).
     """
-    for env in ("DSHIELD_CONSOLE_CONFIG", "DSHIELD_ENRICH_CONFIG"):
-        v = os.environ.get(env)
-        if v:
-            return v
+    v = os.environ.get(f"{ENV_PREFIX}CONFIG")
+    if v:
+        return v
     for cand in ("config/default.yaml", "../config/default.yaml"):
         if Path(cand).exists():
             return cand
@@ -113,8 +114,7 @@ def load_config(path: Optional[str] = None) -> AppConfig:
         raise FileNotFoundError(f"Config not found: {cfg_path}")
     data = yaml.safe_load(p.read_text()) or {}
 
-    local_env = os.environ.get("DSHIELD_CONSOLE_LOCAL_CONFIG") or \
-                os.environ.get("DSHIELD_ENRICH_LOCAL_CONFIG")
+    local_env = os.environ.get(f"{ENV_PREFIX}LOCAL_CONFIG")
     if local_env:
         candidates = [Path(local_env)]
     else:
@@ -133,7 +133,7 @@ def load_config(path: Optional[str] = None) -> AppConfig:
 
 
 def _resolve_env_file(config_path: Optional[str]) -> Optional[Path]:
-    explicit = os.environ.get("DSHIELD_CONSOLE_ENV") or os.environ.get("DSHIELD_ENRICH_ENV")
+    explicit = os.environ.get(f"{ENV_PREFIX}ENV")
     if explicit:
         p = Path(explicit)
         return p if p.exists() else None

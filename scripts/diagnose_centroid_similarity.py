@@ -22,8 +22,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import numpy as np
 
-from dshield_enrich.config import load_config, load_secrets
-from dshield_enrich.es_client import make_client
+from enrich.config import load_config, load_secrets
+from enrich.es_client import make_client
 
 
 def main() -> int:

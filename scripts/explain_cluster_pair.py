@@ -1,13 +1,8 @@
 """Explain why two HDBSCAN session clusters didn't merge.
 
-Thin CLI wrapper around `dshield_enrich.sources.cowrie.explain.analyze_cluster_pair`
+Thin CLI wrapper around `enrich.sources.cowrie.explain.analyze_cluster_pair`
 (structured analysis) and `explain_cluster_pair_with_llm` (optional plain-
 language LLM narrative). Pretty-prints the analysis to stdout.
-
-Run from repo root:
-    PYTHONPATH=/home/styx/git/dshield_vector_analysis/src \\
-      /home/styx/git/dshield_vector_analysis/console/.venv/bin/python \\
-      scripts/explain_cluster_pair.py --pair cluster_9 cluster_12
 
 Add --explain to also call the local LLM for a verdict + recommendation.
 """
@@ -19,9 +14,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from dshield_enrich.config import load_config, load_secrets
-from dshield_enrich.es_client import make_client
-from dshield_enrich.sources.cowrie.explain import (
+from enrich.config import load_config, load_secrets
+from enrich.es_client import make_client
+from enrich.sources.cowrie.explain import (
     analyze_cluster_pair, explain_cluster_pair_with_llm,
 )
 

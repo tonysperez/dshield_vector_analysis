@@ -1,5 +1,5 @@
 {
-  "_comment": "Multi-session campaigns mined from session and event data. NOT the same as session-cluster names (those are now called 'playbooks' — see docs/PLAYBOOKS_AND_CAMPAIGNS.md). One doc per discovered campaign, written by `dshield-enrich mine campaigns`. `kind` distinguishes the mining strategy: behaviour (frequent itemset of playbook ids across IPs) vs infrastructure (connected component of sessions sharing artifacts).",
+  "_comment": "Multi-session campaigns mined from session and event data. NOT the same as session-cluster names (those are now called 'playbooks' — see docs/PLAYBOOKS_AND_CAMPAIGNS.md). One doc per discovered campaign, written by `dshield_prism mine campaigns`. `kind` distinguishes the mining strategy: behaviour (frequent itemset of playbook ids across IPs) vs infrastructure (connected component of sessions sharing artifacts).",
   "settings": {
     "number_of_shards": 1,
     "number_of_replicas": 0,

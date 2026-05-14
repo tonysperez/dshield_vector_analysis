@@ -7,7 +7,7 @@ few KB. Run this script whenever the upstream bundle is refreshed:
 
     python scripts/vendor_mitre_attack.py
 
-Output: src/dshield_enrich/data/mitre_attack_ids.json
+Output: src/enrich/data/mitre_attack_ids.json
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ SOURCE_URL = (
     "https://raw.githubusercontent.com/mitre/cti/master/"
     "enterprise-attack/enterprise-attack.json"
 )
-OUTPUT = Path(__file__).resolve().parents[1] / "src" / "dshield_enrich" / "data" / "mitre_attack_ids.json"
+OUTPUT = Path(__file__).resolve().parents[1] / "src" / "enrich" / "data" / "mitre_attack_ids.json"
 
 
 def main() -> int:

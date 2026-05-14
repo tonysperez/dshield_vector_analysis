@@ -40,7 +40,7 @@ llm:
   # embed_version: "v2"   # bump when embed_context changes; run `reembed` after
 
 worker:
-  state_db: "/var/lib/dshield_enrich/state.sqlite"
+  state_db: "/var/lib/dshield_prism/state.sqlite"
   initial_lookback_days: null
   # prompt_version: "v3"   # bump after editing the prompt to force re-enrichment + re-embedding
 

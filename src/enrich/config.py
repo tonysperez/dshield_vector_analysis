@@ -9,6 +9,12 @@ import yaml
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from .__about__ import ENV_PREFIX
+
+_CONFIG_ENV = f"{ENV_PREFIX}CONFIG"
+_LOCAL_CONFIG_ENV = f"{ENV_PREFIX}LOCAL_CONFIG"
+_ENV_FILE_ENV = f"{ENV_PREFIX}ENV"
+
 
 class CowrieIndexes(BaseModel):
     """All index names for the cowrie source. One layer per field."""
@@ -201,18 +207,19 @@ def load_config(path: Optional[str] = None) -> AppConfig:
     """Load default.yaml, then deep-merge local.yaml override if it exists.
 
     Path resolution:
-      1. --config / DSHIELD_ENRICH_CONFIG -> base file
+      1. --config / <ENV_PREFIX>CONFIG -> base file
       2. else: config/default.yaml
       3. local override: sibling file 'local.yaml' next to base
-      4. or DSHIELD_ENRICH_LOCAL_CONFIG (absolute override path)
+      4. or <ENV_PREFIX>LOCAL_CONFIG (absolute override path)
+      (ENV_PREFIX is defined in __about__.py; currently "PRISM_")
     """
-    cfg_path = path or os.environ.get("DSHIELD_ENRICH_CONFIG", "config/default.yaml")
+    cfg_path = path or os.environ.get(_CONFIG_ENV, "config/default.yaml")
     p = Path(cfg_path)
     if not p.exists():
         raise FileNotFoundError(f"Config not found: {cfg_path}")
     data = yaml.safe_load(p.read_text()) or {}
 
-    local_env = os.environ.get("DSHIELD_ENRICH_LOCAL_CONFIG")
+    local_env = os.environ.get(_LOCAL_CONFIG_ENV)
     if local_env:
         candidates = [Path(local_env)]
     else:
@@ -228,12 +235,12 @@ def load_config(path: Optional[str] = None) -> AppConfig:
 
 def _resolve_env_file(config_path: Optional[str]) -> Optional[Path]:
     """Find the .env file. Search order:
-      1. DSHIELD_ENRICH_ENV (explicit absolute path)
+      1. <ENV_PREFIX>ENV (explicit absolute path)
       2. Sibling of the resolved config file
       3. Parent of the config file
       4. Current working directory
     """
-    explicit = os.environ.get("DSHIELD_ENRICH_ENV")
+    explicit = os.environ.get(_ENV_FILE_ENV)
     if explicit:
         p = Path(explicit)
         return p if p.exists() else None

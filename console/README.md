@@ -1,7 +1,7 @@
-# dshield-console
+# dshield_prism_console
 
 Browser-based, read-only investigation console for the enriched DShield/Cowrie
-indices produced by the `dshield_enrich` pipeline in the parent repository.
+indices produced by the `enrich` pipeline in the parent repository.
 
 Search any IOC — IP, session id, command sha256, raw command text, campaign
 name, cluster id, MITRE id, ASN, country code — and see it plus its first-
@@ -12,7 +12,7 @@ IOC.
 
 ## Install
 
-Self-contained — no dependency on the parent `dshield_enrich` package.
+Self-contained — no dependency on the parent `enrich` package.
 
 ```bash
 cd console
@@ -23,9 +23,9 @@ pip install -e .
 
 By default the console reads the parent repo's `config/default.yaml` (+
 `local.yaml` override) and `.env` so it Just Works in-repo. To point it at
-configs elsewhere, set `DSHIELD_CONSOLE_CONFIG=/path/to/default.yaml` (or pass
-`--config`) and optionally `DSHIELD_CONSOLE_ENV=/path/to/.env`. The
-`DSHIELD_ENRICH_*` env vars are honored as fallbacks.
+configs elsewhere, set `PRISM_CONFIG=/path/to/default.yaml` (or pass
+`--config`) and optionally `PRISM_ENV=/path/to/.env`. The
+`PRISM_*` env vars are honored as fallbacks.
 
 Only the `elasticsearch.*` block of the YAML is required; all other keys
 (llm, worker, cloud, …) are ignored. ES credentials come from `.env`
@@ -34,7 +34,7 @@ Only the `elasticsearch.*` block of the YAML is required; all other keys
 ## Run
 
 ```bash
-dshield-console serve --open
+dshield_prism_console serve --open
 ```
 
 Defaults to `127.0.0.1:8765`. Pass `--config config/local.yaml` if you want a
@@ -42,7 +42,7 @@ non-default config path. `--open` launches the system browser.
 
 Healthcheck (no server needed):
 ```bash
-dshield-console healthcheck
+dshield_prism_console healthcheck
 ```
 
 ## What you can search
@@ -64,7 +64,7 @@ The single search box accepts any of:
 
 * **Backend**: FastAPI + the `elasticsearch` Python client. Self-contained
   YAML + .env loader (reads the parent repo's `config/default.yaml` by
-  default, but has no Python dependency on `dshield_enrich`). Strips 768-dim
+  default, but has no Python dependency on `enrich`). Strips 768-dim
   embeddings server-side; they never reach the browser.
 * **Frontend**: vanilla JS + Cytoscape.js (vendored) with the fcose layout. No
   build step, no framework. Loads from `web/`.
@@ -107,8 +107,8 @@ The `require_login` / `require_commands` filters on the neighbors and sessions t
 ```
 console/
   pyproject.toml
-  src/dshield_console/
-    cli.py                  -- `dshield-console serve|healthcheck`
+  src/console/
+    cli.py                  -- `dshield_prism_console serve|healthcheck`
     server.py               -- FastAPI app, routes, detail builders
     ioc.py                  -- IOC type detection from query string
     queries.py              -- ES query functions
@@ -127,17 +127,17 @@ console/
 ## Duplicated code
 
 To keep this package free of cross-package imports, two small pieces are
-deliberately duplicated from the parent `dshield_enrich` package:
+deliberately duplicated from the parent `enrich` package:
 
 | Console file | Duplicates |
 |---|---|
-| [`_config.py`](src/dshield_console/_config.py) | `CowrieIndexes` / `SourceIndexes` / `ESConfig` / `Secrets` models + YAML+`.env` loader from `src/dshield_enrich/config.py` |
-| [`_es.py`](src/dshield_console/_es.py) | `make_client` from `src/dshield_enrich/es_client.py` |
+| [`_config.py`](src/console/_config.py) | `CowrieIndexes` / `SourceIndexes` / `ESConfig` / `Secrets` models + YAML+`.env` loader from `src/enrich/config.py` |
+| [`_es.py`](src/console/_es.py) | `make_client` from `src/enrich/es_client.py` |
 
 **Drift risk**: the two copies must agree on the
 `elasticsearch.indexes.cowrie.*` field shape. If a new cowrie index is added
 (or one is renamed) on the parent side, mirror the change in
-`console/src/dshield_console/_config.py`. Everything else (LLM config, worker
+`console/src/console/_config.py`. Everything else (LLM config, worker
 config, cloud config, …) is intentionally absent from the console copy and
 can drift safely.
 

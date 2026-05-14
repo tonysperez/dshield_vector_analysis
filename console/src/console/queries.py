@@ -24,7 +24,7 @@ from ._config import AppConfig
 log = logging.getLogger(__name__)
 
 
-# Mirror of `dshield_enrich.sources.cowrie.commands.normalize` + `hash_command_full`.
+# Mirror of `enrich.sources.cowrie.commands.normalize` + `hash_command_full`.
 # Duplicated so the console package stays standalone. If the worker's
 # normalization ever changes, mirror the edit here — otherwise we'd silently
 # fail to join raw command-input events to their enrichment docs.
@@ -332,7 +332,7 @@ def bulk_ip_enrichment(
 
 def lookup_campaign(es: Elasticsearch, cfg: AppConfig, campaign_id: str) -> dict | None:
     """Read one campaign doc from the campaigns index (the multi-session
-    concept mined by `dshield-enrich mine campaigns`). Returns None if no
+    concept mined by `dshield_prism mine campaigns`). Returns None if no
     matching doc exists.
 
     Distinct from `lookup_playbook`, which operates on the session-cluster
