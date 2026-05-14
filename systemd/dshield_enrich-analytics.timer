@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Cowrie analytics (clustering + escalate + IP rollup + naming) every 6 hours
+Requires=dshield_enrich-analytics.service
+
+[Timer]
+OnCalendar=*-*-* 00,06,12,18:00:00
+RandomizedDelaySec=300
+Persistent=true
+Unit=dshield_enrich-analytics.service
+
+[Install]
+WantedBy=timers.target

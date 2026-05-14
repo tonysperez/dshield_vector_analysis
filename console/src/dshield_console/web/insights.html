@@ -1,0 +1,343 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>DShield Insights</title>
+  <link rel="stylesheet" href="/static/css/app.css" />
+  <style>
+    /* Insights-specific layout — not shared with the graph page */
+
+    #insights-main {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 16px 20px 60px;
+      display: flex;
+      flex-direction: column;
+      gap: 36px;
+    }
+
+    .ins-section-title {
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      color: #6b7494;
+      margin: 0 0 14px;
+      display: flex;
+      align-items: baseline;
+      gap: 10px;
+    }
+    .ins-hint {
+      font-size: 10px;
+      text-transform: none;
+      letter-spacing: 0;
+      color: #414b62;
+      font-weight: 400;
+    }
+
+    /* Stat bar */
+    .stat-bar {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+    .stat-card {
+      background: #111827;
+      border: 1px solid #1e2540;
+      border-radius: 7px;
+      padding: 13px 15px;
+    }
+    .stat-card .s-label {
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: #5a6278;
+      margin-bottom: 5px;
+    }
+    .stat-card .s-value {
+      font-size: 24px;
+      font-weight: 600;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      color: #c8d0e7;
+    }
+
+    /* Run chips */
+    .run-stats { display: flex; gap: 10px; flex-wrap: wrap; }
+    .run-chip {
+      background: #111827;
+      border: 1px solid #1e2540;
+      border-radius: 6px;
+      padding: 8px 14px;
+      font-size: 11px;
+      color: #5a6278;
+      display: flex;
+      gap: 10px;
+    }
+    .run-chip .rc-kind { font-weight: 600; color: #c8d0e7; text-transform: capitalize; }
+    .run-chip .rc-num  { color: #4cc1ff; font-family: ui-monospace, SFMono-Regular, monospace; }
+    .run-chip .rc-sep  { opacity: 0.3; }
+
+    /* Tables */
+    .ins-table-wrap { overflow-x: auto; }
+    .ins-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+    }
+    .ins-table th {
+      text-align: left;
+      padding: 5px 10px;
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: #5a6278;
+      border-bottom: 1px solid #1a2035;
+      white-space: nowrap;
+    }
+    .ins-table td {
+      padding: 7px 10px;
+      border-bottom: 1px solid #161c2e;
+      vertical-align: middle;
+      color: #9aa3b8;
+    }
+    .ins-table tr.clickable { cursor: pointer; }
+    .ins-table tr.clickable:hover td { background: #151c2e; }
+
+    /* IOC link */
+    .ioc-link {
+      color: #4cc1ff;
+      cursor: pointer;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 11px;
+      text-decoration: none;
+    }
+    .ioc-link:hover { text-decoration: underline; }
+
+    /* Pivot button */
+    .pivot-btn {
+      background: #1a2540;
+      border: 1px solid #2a3558;
+      border-radius: 4px;
+      color: #4cc1ff;
+      padding: 3px 9px;
+      font-size: 11px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .pivot-btn:hover { background: #1f2d4e; }
+
+    /* Intent badge */
+    .badge-intent {
+      display: inline-block;
+      padding: 2px 7px;
+      border-radius: 3px;
+      font-size: 10px;
+      font-weight: 600;
+      background: #0e1e35;
+      color: #4cc1ff;
+      border: 1px solid #4cc1ff28;
+    }
+    .badge-intent.execution   { background: #1a0e0e; color: #f87171; border-color: #f8717128; }
+    .badge-intent.persistence { background: #1a110e; color: #fb923c; border-color: #fb923c28; }
+    .badge-intent.recon,
+    .badge-intent.reconnaissance { background: #0e1a0e; color: #4ade80; border-color: #4ade8028; }
+    .badge-intent.exfiltration  { background: #1a1a0e; color: #facc15; border-color: #facc1528; }
+    .badge-intent.benign        { background: #131313; color: #666; border-color: #33333338; }
+
+    /* Novelty bar */
+    .novelty-bar {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .novelty-track {
+      width: 60px;
+      height: 5px;
+      background: #1a2035;
+      border-radius: 3px;
+      flex-shrink: 0;
+      overflow: hidden;
+    }
+    .novelty-fill {
+      height: 100%;
+      border-radius: 3px;
+      background: linear-gradient(90deg, #4cc1ff 0%, #f87171 100%);
+    }
+    .novelty-val {
+      font-family: ui-monospace, SFMono-Regular, monospace;
+      font-size: 11px;
+      color: #6b7494;
+      width: 30px;
+    }
+
+    /* Sample tags */
+    .sample-list { display: flex; flex-wrap: wrap; gap: 3px; }
+    .sample-tag {
+      background: #0e1525;
+      border: 1px solid #1e2540;
+      border-radius: 3px;
+      padding: 2px 6px;
+      font-size: 10px;
+      font-family: ui-monospace, SFMono-Regular, monospace;
+      color: #6b7494;
+      max-width: 200px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .sample-tag.ip { color: #9aa3b8; cursor: pointer; }
+    .sample-tag.ip:hover { color: #4cc1ff; border-color: #4cc1ff44; }
+
+    /* Country chips */
+    .cc-chips { display: flex; flex-wrap: wrap; gap: 3px; }
+    .cc-chip {
+      font-size: 10px;
+      background: #0e1525;
+      border: 1px solid #1e2540;
+      border-radius: 2px;
+      padding: 1px 5px;
+      color: #6b7494;
+    }
+
+    /* MITRE tags */
+    .mitre-tag {
+      display: inline-block;
+      padding: 1px 5px;
+      border-radius: 3px;
+      font-size: 10px;
+      background: #0a1f1f;
+      border: 1px solid #2dd4bf28;
+      color: #2dd4bf;
+      font-family: ui-monospace, SFMono-Regular, monospace;
+    }
+
+    /* Size badge */
+    .size-badge {
+      font-family: ui-monospace, SFMono-Regular, monospace;
+      font-size: 12px;
+      font-weight: 600;
+      color: #c8d0e7;
+    }
+
+    /* Command cell */
+    .cmd-cell {
+      font-family: ui-monospace, SFMono-Regular, monospace;
+      font-size: 11px;
+      color: #9aa3b8;
+      max-width: 380px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    /* Error / empty states */
+    .ins-error {
+      color: #f87171;
+      font-size: 12px;
+      padding: 14px 16px;
+      background: #1a0e0e;
+      border: 1px solid #f8717128;
+      border-radius: 6px;
+    }
+    .ins-empty {
+      font-size: 12px;
+      color: #414b62;
+      padding: 12px;
+    }
+
+    /* Section separator */
+    .ins-section { }
+
+    /* Nav-link style */
+    .topbar .nav-link {
+      font-size: 11px;
+      color: #4cc1ff;
+      font-weight: 600;
+      background: #0e1e35;
+      border: 1px solid #4cc1ff28;
+      border-radius: 4px;
+      padding: 3px 10px;
+      text-decoration: none;
+      white-space: nowrap;
+    }
+    .topbar .nav-link:hover { background: #1a2d4e; }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <a href="/" class="brand" style="text-decoration:none;color:inherit;">DShield Console</a>
+    <a href="/" class="nav-link">← Graph</a>
+    <a href="/compare" class="nav-link">Compare</a>
+    <div style="flex:1"></div>
+    <div id="loading" class="loading hidden" aria-live="polite"></div>
+    <div id="health" class="health">…</div>
+  </header>
+
+  <main id="insights-main">
+
+    <section class="ins-section" id="sec-overview">
+      <p class="ins-section-title">Overview</p>
+      <div id="overview-stats" class="stat-bar"></div>
+      <div id="cluster-runs" class="run-stats"></div>
+    </section>
+
+    <section class="ins-section" id="sec-playbooks">
+      <p class="ins-section-title">Playbooks
+        <span class="ins-hint">LLM-named session clusters — click to explore</span>
+      </p>
+      <div id="playbooks-body" class="ins-table-wrap">
+        <em class="ins-empty">loading…</em>
+      </div>
+    </section>
+
+    <section class="ins-section" id="sec-campaigns">
+      <p class="ins-section-title">Campaigns (multi-session)
+        <span class="ins-hint">mined by `dshield-enrich mine campaigns` — behavioural and infrastructure groupings spanning multiple sessions</span>
+      </p>
+      <div id="campaigns-body" class="ins-table-wrap">
+        <em class="ins-empty">loading…</em>
+      </div>
+    </section>
+
+    <section class="ins-section" id="sec-cmd-clusters">
+      <p class="ins-section-title">Tight Command Clusters
+        <span class="ins-hint">all members share the same behavior pattern — click to pivot graph</span>
+      </p>
+      <div id="cmd-clusters-body" class="ins-table-wrap">
+        <em class="ins-empty">loading…</em>
+      </div>
+    </section>
+
+    <section class="ins-section" id="sec-sess-clusters">
+      <p class="ins-section-title">Session Behavior Groups
+        <span class="ins-hint">sessions clustered by the commands they ran</span>
+      </p>
+      <div id="sess-clusters-body" class="ins-table-wrap">
+        <em class="ins-empty">loading…</em>
+      </div>
+    </section>
+
+    <section class="ins-section" id="sec-ip-clusters">
+      <p class="ins-section-title">IP Actor Groups
+        <span class="ins-hint">IPs clustered by session + command behavior</span>
+      </p>
+      <div id="ip-clusters-body" class="ins-table-wrap">
+        <em class="ins-empty">loading…</em>
+      </div>
+    </section>
+
+    <section class="ins-section" id="sec-novel">
+      <p class="ins-section-title">Novel-but-Recurring Commands
+        <span class="ins-hint">high novelty + seen in ≥ 3 sessions — sorted by novelty × spread</span>
+      </p>
+      <div id="novel-body" class="ins-table-wrap">
+        <em class="ins-empty">loading…</em>
+      </div>
+    </section>
+
+  </main>
+
+  <script src="/static/js/insights.js"></script>
+</body>
+</html>

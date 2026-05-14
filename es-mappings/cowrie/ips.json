@@ -1,0 +1,78 @@
+{
+  "_comment": "IP-level rollup. One doc per source.ip. Doc _id = source.ip (idempotent upserts). Built by 'rollup-ips'; cluster fields written by 'cluster-ips'. IPs do not carry a playbook or campaign field — those are derived from the IP's sessions at query time.",
+  "settings": {
+    "number_of_shards": 1,
+    "number_of_replicas": 0,
+    "refresh_interval": "30s"
+  },
+  "mappings": {
+    "properties": {
+      "@timestamp": { "type": "date" },
+
+      "source": {
+        "properties": {
+          "ip":   { "type": "ip" },
+          "geo": {
+            "properties": {
+              "city_name":        { "type": "keyword" },
+              "country_iso_code": { "type": "keyword" },
+              "region_name":      { "type": "keyword" },
+              "location":         { "type": "geo_point" }
+            }
+          },
+          "as": {
+            "properties": {
+              "number": { "type": "long" },
+              "organization": {
+                "properties": { "name": { "type": "keyword" } }
+              }
+            }
+          }
+        }
+      },
+
+      "dshield": {
+        "properties": {
+          "cowrie": {
+            "properties": {
+              "enrichment": {
+                "properties": {
+                  "ip": {
+                    "properties": {
+                      "total_sessions":          { "type": "long" },
+                      "successful_sessions":     { "type": "long" },
+                      "command_sessions":        { "type": "long" },
+                      "total_commands":          { "type": "long" },
+                      "file_download_count":     { "type": "long" },
+                      "dominant_intent":         { "type": "keyword" },
+                      "mean_novelty_score":      { "type": "float" },
+                      "max_novelty_score":       { "type": "float" },
+                      "mean_session_duration_s": { "type": "float" },
+                      "first_seen":              { "type": "date" },
+                      "last_seen":               { "type": "date" },
+                      "ip_embed_version":        { "type": "keyword" },
+                      "embedding": {
+                        "type": "dense_vector",
+                        "dims": 768,
+                        "index": true,
+                        "similarity": "cosine"
+                      },
+                      "cluster": {
+                        "properties": {
+                          "id":            { "type": "keyword" },
+                          "novelty_score": { "type": "float" },
+                          "is_outlier":    { "type": "boolean" },
+                          "scored_at":     { "type": "date" }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

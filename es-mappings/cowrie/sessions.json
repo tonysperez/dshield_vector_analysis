@@ -1,0 +1,122 @@
+{
+  "_comment": "Session-level rollup. One doc per cowrie session_id. Doc _id = session_id (idempotent upserts). Built by 'rollup-sessions'; cluster fields populated by 'cluster-sessions'.",
+  "settings": {
+    "number_of_shards": 1,
+    "number_of_replicas": 0,
+    "refresh_interval": "30s"
+  },
+  "mappings": {
+    "properties": {
+      "@timestamp": { "type": "date" },
+
+      "event": {
+        "properties": {
+          "kind":     { "type": "keyword" },
+          "category": { "type": "keyword" },
+          "dataset":  { "type": "keyword" },
+          "start":    { "type": "date" },
+          "end":      { "type": "date" },
+          "duration": { "type": "long" }
+        }
+      },
+
+      "source": {
+        "properties": {
+          "ip":   { "type": "ip" },
+          "port": { "type": "integer" },
+          "geo": {
+            "properties": {
+              "city_name":        { "type": "keyword" },
+              "country_iso_code": { "type": "keyword" },
+              "region_name":      { "type": "keyword" },
+              "location":         { "type": "geo_point" }
+            }
+          },
+          "as": {
+            "properties": {
+              "number": { "type": "long" },
+              "organization": {
+                "properties": { "name": { "type": "keyword" } }
+              }
+            }
+          }
+        }
+      },
+
+      "destination": {
+        "properties": {
+          "ip":   { "type": "ip" },
+          "port": { "type": "integer" }
+        }
+      },
+
+      "network": {
+        "properties": {
+          "protocol": { "type": "keyword" },
+          "type":     { "type": "keyword" }
+        }
+      },
+
+      "user": {
+        "properties": { "name": { "type": "keyword" } }
+      },
+
+      "user_agent": {
+        "properties": { "original": { "type": "keyword" } }
+      },
+
+      "cowrie": {
+        "properties": {
+          "session_id":       { "type": "keyword" },
+          "password":         { "type": "keyword" },
+          "hassh_algorithms": { "type": "keyword" }
+        }
+      },
+
+      "dshield": {
+        "properties": {
+          "cowrie": {
+            "properties": {
+              "enrichment": {
+                "properties": {
+                  "session": {
+                    "properties": {
+                      "command_count":         { "type": "long" },
+                      "unique_commands":       { "type": "long" },
+                      "login_success_count":   { "type": "long" },
+                      "login_fail_count":      { "type": "long" },
+                      "file_download_count":   { "type": "long" },
+                      "file_upload_count":     { "type": "long" },
+                      "dominant_intent":       { "type": "keyword" },
+                      "mean_novelty_score":    { "type": "float" },
+                      "max_novelty_score":     { "type": "float" },
+                      "mean_confidence":       { "type": "float" },
+                      "command_entropy":       { "type": "float" },
+                      "session_embed_version": { "type": "keyword" },
+                      "playbook_id":           { "type": "keyword" },
+                      "playbook_name":         { "type": "keyword" },
+                      "embedding": {
+                        "type": "dense_vector",
+                        "dims": 768,
+                        "index": true,
+                        "similarity": "cosine"
+                      },
+                      "cluster": {
+                        "properties": {
+                          "id":            { "type": "keyword" },
+                          "novelty_score": { "type": "float" },
+                          "is_outlier":    { "type": "boolean" },
+                          "scored_at":     { "type": "date" }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

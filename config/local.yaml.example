@@ -5,43 +5,48 @@ elasticsearch:
   hosts: ["https://localhost:9200"]
   verify_certs: false
   ca_certs: null    # e.g. "/etc/pki/ca-trust/source/anchors/so-ca.pem"
-  # If your SO instance uses a different cowrie index pattern:
-  # events_index: "logs-dshield.cowrie.session-*"
-  # Index that enriched docs are written to. Change to namespace per-sensor or per-env.
-  # `apply-template` CLI uses this name for both the template and initial index.
-  # enrichment_index: "enriched-dshield_cowrie_sessions-default"
+  # Override any index name per-deploy. Names are nested under <source>.
+  # indexes:
+  #   cowrie:
+  #     sessions_raw:      "logs-dshield.cowrie.session-myhost"
+  #     commands:          "enriched-dshield.cowrie.command-myhost"
+  #     command_clusters:  "clusters-dshield.cowrie.command-myhost"
+  #     sessions_rollup:   "rollup-dshield.cowrie.session-myhost"
+  #     session_clusters:  "clusters-dshield.cowrie.session-myhost"
+  #     ips_rollup:        "rollup-dshield.cowrie.source_ip-myhost"
+  #     ip_clusters:       "clusters-dshield.cowrie.source_ip-myhost"
 
 llm:
   # "ollama" or "openai_compat" (LM Studio / vLLM / llama.cpp server)
   provider: "openai_compat"
   # REQUIRED: server URL. Examples:
-  #   Ollama:     http://192.0.2.10:11434
-  #   LM Studio:  http://192.0.2.10:1234   (or whatever port you set)
+  #   Ollama:     http://192.168.2.10:11434
+  #   LM Studio:  http://192.168.2.10:1234   (or whatever port you set)
   base_url: "http://192.168.2.10:11434"
   # Model identifiers — must match what's loaded on the server.
   # Ollama uses name:tag (e.g. "qwen2.5:7b-instruct-q4_K_M").
   # LM Studio uses the model name as shown in its UI.
-  generation_model: "lmstudio-community/qwen2.5-7b-instruct"
+  generation_model: "qwen/qwen3-8b"
   embedding_model: "text-embedding-nomic-embed-text-v1.5@q8_0"
   # api_key: "lm-studio"   # uncomment if your server requires auth
 
-  # Fields prepended to the raw command before embedding (Phase 3+).
-  # Changing this requires bumping embed_version and running `re-embed`.
+  # Fields prepended to the raw command before embedding.
+  # Changing this requires bumping embed_version and running `reembed`.
   # embed_context:
   #   - intent
   #   - tactics
   #   - techniques
   #   - description
-  # embed_version: "v2"   # bump when embed_context changes; run `re-embed` after
+  # embed_version: "v2"   # bump when embed_context changes; run `reembed` after
 
 worker:
-  state_db: "/var/lib/dshield_vector_analysis/state.sqlite"
+  state_db: "/var/lib/dshield_enrich/state.sqlite"
   initial_lookback_days: null
   # prompt_version: "v3"   # bump after editing the prompt to force re-enrichment + re-embedding
 
-# Phase 2 — cloud (Claude) escalation for hard / novel / low-confidence commands.
+# Cloud (Claude) escalation for hard / novel / low-confidence commands.
 # Off by default. To enable: flip enabled, set ANTHROPIC_API_KEY in .env, then
-# re-run `init-index --update-mapping` once so the new triage_reasons / notes /
+# re-run `init-indexes --update-mapping` once so the new triage_reasons / notes /
 # local_fallback fields exist on the index.
 cloud:
   enabled: false
@@ -57,7 +62,14 @@ cloud:
   #   input_per_mtok: 3.0
   #   output_per_mtok: 15.0
 
-# Phase 3+ — clustering quality tuning. Defaults are conservative; tune after baseline run.
-# cluster:
+# Command-level clustering tuning. Defaults are conservative; tune after baseline run.
+# command_cluster:
 #   scalar_weight: 0.05   # weight of behavioral scalar block vs 768-dim embedding (0.0 = disable)
 #                         # scalars: occurrence_count, unique_source_ips, confidence, session_reuse_rate
+
+# Session-level tuning. Most users won't touch these.
+# session:
+#   playbook_merge_threshold: 0.96   # cosine-sim cutoff for collapsing HDBSCAN
+#                                    # clusters into one playbook. 1.0 = disable
+#                                    # (legacy 1-cluster-per-playbook behaviour).
+#                                    # See default.yaml for details.

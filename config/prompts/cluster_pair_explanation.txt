@@ -1,0 +1,48 @@
+You are a threat-hunter explaining to an analyst why two HDBSCAN session clusters from a Cowrie SSH/Telnet honeypot were NOT merged into the same playbook.
+
+Background:
+- Sessions are embedded into a 768-dim vector (mean-pool of per-command embeddings, where each command's embedding includes LLM-generated intent/tactics/description prepended to the raw text).
+- HDBSCAN clusters on [embedding | 4 behavioural scalars × <<<SCALAR_WEIGHT>>>] — the scalars are command_count, unique_commands, login_success_rate, mean_novelty_score.
+- After clustering, the merge layer collapses cluster pairs whose centroids are pairwise cosine-similar at or above <<<MERGE_THRESHOLD>>>.
+- These two clusters have centroid cosine sim <<<CENTROID_SIMILARITY>>>, which leaves a gap of <<<GAP_TO_MERGE>>> to the threshold. Would-have-merged: <<<WOULD_MERGE>>>.
+
+Cluster A (id=<<<A_ID>>>, size=<<<A_SIZE>>>, current playbook name='<<<A_NAME>>>'):
+  Scalars:
+<<<A_SCALARS>>>
+  Top commands:
+<<<A_TOP_COMMANDS>>>
+
+Cluster B (id=<<<B_ID>>>, size=<<<B_SIZE>>>, current playbook name='<<<B_NAME>>>'):
+  Scalars:
+<<<B_SCALARS>>>
+  Top commands:
+<<<B_TOP_COMMANDS>>>
+
+Command-set diff (top commands only):
+  Jaccard:        <<<JACCARD>>>
+  Shared:         <<<SHARED_COUNT>>>
+  Only in A:      <<<ONLY_A_COMMANDS>>>
+  Only in B:      <<<ONLY_B_COMMANDS>>>
+
+Your job: judge the cause of the split and recommend an action.
+
+Verdicts (pick exactly one):
+- "semantic_split"     The commands differ enough that the embeddings genuinely diverge. The unique command sets are the cause; the scalars are not.
+- "behavioural_split"  The commands are mostly the same but scalar values (command_count, login_success_rate, etc.) differ substantially. HDBSCAN's scalar block forced the split.
+- "both"               Both semantic AND behavioural differences contribute. Neither alone would have caused the split.
+- "marginal_split"     Centroid sim is just below threshold and many small things differ. A small threshold tweak (or noise in scalars) would have flipped this.
+- "near_duplicate"     Centroid sim is at or above the threshold. The clusters SHOULD have merged. Likely a config or pipeline issue, not a real split.
+
+Recommendations (pick exactly one):
+- "lower_threshold"           These are essentially the same operation. The merge threshold is too strict; lowering it would correctly collapse them.
+- "accept_split"              These are genuinely different operations (or different enough that an analyst would want them tracked separately). The split is correct.
+- "investigate_embedding"     The commands look similar to a human but the embedding rates them dissimilar. Worth checking the command-enrichment pipeline (intent/description text driving the embed input) to see why synonyms aren't embedded closer.
+- "investigate_scalars"       The scalar block is over-separating clusters that share commands. Consider lowering cluster_scalar_weight or removing one of the scalars.
+
+Output rules:
+- "evidence" must be 2-3 sentences, plain English, citing specific commands and numbers from the data above. No hedging like "it appears that". Be direct.
+- "rationale" must be one short sentence explaining why you chose that recommendation.
+- Do not invent commands or numbers that aren't in the data above.
+- If A and B have the same playbook_name but the verdict is "semantic_split", briefly note in evidence that the LLM-assigned names are the same despite the embedding gap.
+
+Respond with a single JSON object matching the provided schema.

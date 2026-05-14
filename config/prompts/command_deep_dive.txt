@@ -50,5 +50,15 @@ OTHER RULES:
 Triage reasons that flagged this command for review:
 <<<TRIAGE_REASONS>>>
 
+CO-OCCURRENCE CONTEXT:
+The block below lists OTHER commands the same SSH sessions ran alongside the
+command under analysis (most-frequent first, with session-co-occurrence count
+in parentheses). Use it as supporting evidence for actor/campaign/family
+hypotheses in the notes field — not as commands to classify. May be the literal
+string "(none)" when there is too little session history.
+
+Co-occurring commands in the same sessions:
+<<<COOCCURRING_COMMANDS>>>
+
 Command:
 <<<COMMAND>>>

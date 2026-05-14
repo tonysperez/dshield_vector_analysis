@@ -39,5 +39,17 @@ OTHER RULES:
 - Only use real MITRE ATT&CK IDs you are confident about. If unsure, leave the array empty rather than guessing.
 - "intent" must be exactly one value from the enum. Use "unknown" if you cannot tell.
 
+CO-OCCURRENCE CONTEXT:
+The block below lists OTHER commands the same SSH sessions ran alongside the
+command under analysis (most-frequent first, with session-co-occurrence count
+in parentheses). Treat it as supporting evidence about the attacker's broader
+activity in those sessions — not as commands to classify. Use it to disambiguate
+intent and tooling. The block may be the literal string "(none)" when the
+command has too little session history to summarize, or when co-occurrence
+context is disabled.
+
+Co-occurring commands in the same sessions:
+<<<COOCCURRING_COMMANDS>>>
+
 Command:
 <<<COMMAND>>>

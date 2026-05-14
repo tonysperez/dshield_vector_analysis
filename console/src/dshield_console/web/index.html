@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>DShield Console</title>
+  <link rel="stylesheet" href="/static/css/app.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">DShield Console</div>
+    <a href="/insights" class="nav-link" title="Insights dashboard">Insights</a>
+    <a href="/compare" class="nav-link" title="Compare two session clusters">Compare</a>
+    <form id="search-form" class="search">
+      <input id="search-input" type="text" autocomplete="off" spellcheck="false"
+             placeholder="search IOC: IP, session id, sha256, playbook, campaign, cluster #, T1059.003, AS12345, US, or free text" />
+      <button type="submit">Search</button>
+      <button type="button" id="fit-btn" title="Recenter / fit graph">Fit</button>
+      <button type="button" id="reset-btn" title="Reset graph">Reset</button>
+      <button type="button" id="settings-btn" title="Filter / display settings" aria-label="settings">⚙</button>
+      <button type="button" id="ask-ai-btn" title="Ask the local LLM a question about what's in view">Ask AI</button>
+    </form>
+    <label class="siblings" title="How many cluster sibling layers to pull in. 0 = just the anchor's pipeline trace; 1 = also other IPs/sessions/commands in the same clusters; 2+ = siblings of siblings.">
+      <span class="siblings-label">siblings</span>
+      <input id="siblings-slider" type="range" min="0" max="3" step="1" value="0" />
+      <span id="siblings-value" class="siblings-value">0</span>
+    </label>
+    <div class="lanes" title="Toggle which IOC swimlanes are shown. Hiding a lane removes those nodes from the graph; re-enabling backfills via pipeline auto-trace.">
+      <span class="lanes-label">lanes</span>
+      <label class="lane-chk"><input type="checkbox" data-lane="geo" checked /><span>geo</span></label>
+      <label class="lane-chk"><input type="checkbox" data-lane="ip" checked /><span>ip</span></label>
+      <label class="lane-chk"><input type="checkbox" data-lane="session" checked /><span>session</span></label>
+      <label class="lane-chk"><input type="checkbox" data-lane="command" checked /><span>command</span></label>
+      <label class="lane-chk"><input type="checkbox" data-lane="mitre" checked /><span>mitre</span></label>
+    </div>
+    <div id="loading" class="loading hidden" aria-live="polite"></div>
+    <div id="health" class="health">…</div>
+    <!-- Breadcrumb lives in the topbar as a second wrapping row -->
+    <div id="breadcrumb" class="breadcrumb-bar"></div>
+  </header>
+
+  <main>
+    <section id="graph-pane" class="mode-prism">
+      <!-- Frosted-glass mode toggle — top center of the graph pane -->
+      <div id="mode-toggle" class="mode-toggle" role="group" aria-label="View mode">
+        <button class="mode-btn active" data-mode="prism"  title="Graph view — explore IOC relationships">Prism</button>
+        <button class="mode-btn"        data-mode="timeline" title="Timeline — see when sessions happened">Timeline</button>
+      </div>
+
+      <!-- Prism canvas -->
+      <div id="cy"></div>
+
+      <!-- Timeline pane (hidden until Timeline mode) -->
+      <div id="tl" class="hidden">
+        <!-- Floating groupBy control — top-left above label column -->
+        <div id="tl-groupby" class="tl-groupby">
+          <span class="tl-gb-title">GROUP BY</span>
+          <label class="tl-gb-row"><input type="checkbox" id="tl-grp-playbook" />Playbook</label>
+          <label class="tl-gb-row"><input type="checkbox" id="tl-grp-cluster" checked />Cluster</label>
+          <label class="tl-gb-row"><input type="checkbox" id="tl-grp-ip" />IP</label>
+        </div>
+        <!-- Status strip -->
+        <div id="tl-status" class="tl-status"></div>
+        <!-- Main canvas — takes all remaining height -->
+        <canvas id="tl-canvas"></canvas>
+        <!-- Minimap strip at bottom -->
+        <canvas id="tl-minimap" class="tl-minimap"></canvas>
+      </div>
+
+      <div id="legend">
+        <span class="lg lg-ip">IP</span>
+        <span class="lg lg-session">Session</span>
+        <span class="lg lg-command">Command</span>
+        <span class="lg lg-cmdcl">cmd cl</span>
+        <span class="lg lg-sescl">sess cl</span>
+        <span class="lg lg-ipcl">ip cl</span>
+        <span class="lg lg-pb">playbook</span>
+        <span class="lg lg-camp">campaign</span>
+        <span class="lg lg-asn">ASN</span>
+        <span class="lg lg-cc">CC</span>
+        <span class="lg lg-mitre">MITRE</span>
+      </div>
+    </section>
+
+    <aside id="sets-pane">
+      <header class="sets-header">
+        <span class="sets-title">Sets in view</span>
+        <button type="button" id="sets-clear" class="sets-clear" title="Clear all filters">clear</button>
+      </header>
+      <div id="sets-help">
+        Click a row to keep only its members. Shift-click a second row to keep
+        the intersection. Click <em>clear</em> to reset.
+      </div>
+      <div id="sets-body">
+        <em class="sets-empty">Sets appear here as nodes are loaded.</em>
+      </div>
+    </aside>
+
+    <aside id="detail-pane">
+      <div id="detail-header"><em>Search an IOC to begin.</em></div>
+      <nav id="detail-tabs">
+        <button data-tab="overview" class="active">Overview</button>
+        <button data-tab="related">Related</button>
+        <button data-tab="raw">Raw JSON</button>
+      </nav>
+      <div id="detail-body">
+        <div id="tab-overview" class="tab active"></div>
+        <div id="tab-related" class="tab"></div>
+        <div id="tab-raw" class="tab"><pre id="raw-json"></pre></div>
+      </div>
+    </aside>
+  </main>
+
+  <div id="search-suggestions" class="suggestions hidden"></div>
+
+  <div id="settings-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+    <div class="modal-card" role="document">
+      <header class="modal-header">
+        <h2 id="settings-title">Settings</h2>
+        <button type="button" class="modal-close" aria-label="close">×</button>
+      </header>
+      <section class="modal-body">
+        <fieldset class="setting-group">
+          <legend>Session quality filter</legend>
+          <p class="setting-hint">
+            By default only "interesting" sessions are shown — those that
+            successfully logged in <em>and</em> ran at least one command.
+            Turning a filter off pulls in scanners and disconnects too.
+          </p>
+          <label class="setting-row">
+            <input type="checkbox" id="cfg-require-login" checked />
+            <span>Require a successful login</span>
+          </label>
+          <label class="setting-row">
+            <input type="checkbox" id="cfg-require-commands" checked />
+            <span>Require at least one command run</span>
+          </label>
+        </fieldset>
+      </section>
+      <footer class="modal-footer">
+        <button type="button" class="modal-cancel">Cancel</button>
+        <button type="button" class="modal-save">Apply</button>
+      </footer>
+    </div>
+  </div>
+
+  <!-- Ask AI modal -->
+  <div id="ask-ai-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="ask-ai-title">
+    <div class="modal-card ask-ai-card" role="document">
+      <header class="modal-header">
+        <h2 id="ask-ai-title">Ask AI</h2>
+        <button type="button" class="modal-close" id="ask-ai-close" aria-label="close">×</button>
+      </header>
+
+      <!-- Input panel -->
+      <div id="ask-ai-input-panel" class="modal-body ask-ai-body">
+        <div class="ask-ai-presets-label">Quick questions</div>
+        <div id="ask-ai-presets" class="ask-ai-presets"></div>
+        <textarea id="ask-ai-question" class="ask-ai-textarea"
+          rows="3" placeholder="Or ask your own question…"></textarea>
+      </div>
+
+      <!-- Loading panel -->
+      <div id="ask-ai-loading-panel" class="modal-body ask-ai-body hidden">
+        <div class="ask-ai-spinner-row">
+          <span class="ask-ai-spinner"></span>
+          <span class="ask-ai-loading-text">Querying model…</span>
+        </div>
+      </div>
+
+      <!-- Result panel -->
+      <div id="ask-ai-result-panel" class="modal-body ask-ai-body hidden">
+        <div class="ask-ai-result-q"></div>
+        <div class="ask-ai-result-answer"></div>
+        <div class="ask-ai-result-meta"></div>
+      </div>
+
+      <footer class="modal-footer" id="ask-ai-footer">
+        <button type="button" id="ask-ai-cancel" class="modal-cancel">Cancel</button>
+        <button type="button" id="ask-ai-submit" class="modal-save">Ask</button>
+      </footer>
+    </div>
+  </div>
+
+  <script src="/static/js/graph.js"></script>
+  <script src="/static/js/timeline.js"></script>
+  <script src="/static/js/app.js"></script>
+</body>
+</html>

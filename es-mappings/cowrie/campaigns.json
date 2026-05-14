@@ -1,0 +1,42 @@
+{
+  "_comment": "Multi-session campaigns mined from session and event data. NOT the same as session-cluster names (those are now called 'playbooks' — see docs/PLAYBOOKS_AND_CAMPAIGNS.md). One doc per discovered campaign, written by `dshield-enrich mine campaigns`. `kind` distinguishes the mining strategy: behaviour (frequent itemset of playbook ids across IPs) vs infrastructure (connected component of sessions sharing artifacts).",
+  "settings": {
+    "number_of_shards": 1,
+    "number_of_replicas": 0,
+    "refresh_interval": "30s"
+  },
+  "mappings": {
+    "properties": {
+      "@timestamp":   { "type": "date" },
+      "run_id":       { "type": "keyword" },
+      "doc_type":     { "type": "keyword" },
+
+      "campaign_id":  { "type": "keyword" },
+      "kind":         { "type": "keyword" },
+      "name":         { "type": "keyword" },
+      "rationale":    { "type": "text" },
+
+      "ip_count":         { "type": "long" },
+      "session_count":    { "type": "long" },
+      "first_seen":       { "type": "date" },
+      "last_seen":        { "type": "date" },
+      "support":          { "type": "long" },
+
+      "member_playbook_ids":  { "type": "keyword" },
+      "member_session_ids":   { "type": "keyword" },
+      "member_source_ips":    { "type": "keyword" },
+
+      "shared_artifacts": {
+        "type": "nested",
+        "properties": {
+          "kind":    { "type": "keyword" },
+          "value":   { "type": "keyword" },
+          "count":   { "type": "long" }
+        }
+      },
+
+      "total_campaigns_found": { "type": "long" },
+      "runtime_seconds":       { "type": "float" }
+    }
+  }
+}

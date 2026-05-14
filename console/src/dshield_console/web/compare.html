@@ -1,0 +1,349 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>DShield · Compare Clusters</title>
+  <link rel="stylesheet" href="/static/css/app.css" />
+  <style>
+    #compare-main {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 16px 20px 60px;
+      display: flex;
+      flex-direction: column;
+      gap: 22px;
+    }
+    .cmp-section-title {
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      color: #6b7494;
+      margin: 0 0 10px;
+    }
+    .cmp-hint {
+      font-size: 10px;
+      text-transform: none;
+      letter-spacing: 0;
+      color: #414b62;
+      font-weight: 400;
+      margin-left: 6px;
+    }
+
+    /* Picker row */
+    .cmp-pickers {
+      display: flex;
+      gap: 14px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .cmp-pickers select {
+      flex: 1;
+      min-width: 260px;
+      padding: 8px 10px;
+      background: #111827;
+      color: #e6e6e6;
+      border: 1px solid #1e2540;
+      border-radius: 6px;
+      font-size: 12px;
+      font-family: ui-monospace, SFMono-Regular, monospace;
+    }
+    .cmp-pickers .versus {
+      color: #6b7494;
+      font-size: 11px;
+      text-transform: uppercase;
+      font-weight: 600;
+      letter-spacing: 1px;
+    }
+    .cmp-btn {
+      padding: 8px 16px;
+      background: #0e1e35;
+      color: #4cc1ff;
+      border: 1px solid #4cc1ff28;
+      border-radius: 6px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      font-family: inherit;
+    }
+    .cmp-btn:hover:not(:disabled) { background: #1a2d4e; }
+    .cmp-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    /* Verdict bar */
+    .cmp-verdict-bar {
+      background: #111827;
+      border: 1px solid #1e2540;
+      border-radius: 7px;
+      padding: 14px 18px;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 18px;
+    }
+    .cmp-vb-side h3 {
+      margin: 0 0 4px;
+      font-size: 13px;
+      color: #c8d0e7;
+      font-family: ui-monospace, SFMono-Regular, monospace;
+    }
+    .cmp-vb-side .meta {
+      font-size: 11px;
+      color: #8a93a6;
+    }
+    .cmp-vb-side .pb {
+      color: var(--c-pb);
+      font-weight: 600;
+    }
+    .cmp-sim-row {
+      grid-column: 1 / span 2;
+      display: flex;
+      gap: 24px;
+      flex-wrap: wrap;
+      padding-top: 8px;
+      border-top: 1px solid #262b38;
+      font-size: 12px;
+    }
+    .cmp-sim-row span { color: #8a93a6; }
+    .cmp-sim-row b { color: #c8d0e7; font-family: ui-monospace, SFMono-Regular, monospace; }
+    .cmp-sim-row .merged-yes { color: var(--ok); }
+    .cmp-sim-row .merged-no  { color: var(--warn); }
+
+    /* Tabs */
+    .cmp-tabs {
+      display: flex;
+      gap: 2px;
+      border-bottom: 1px solid #262b38;
+      margin-bottom: 12px;
+    }
+    .cmp-tab {
+      padding: 8px 18px;
+      background: transparent;
+      color: #8a93a6;
+      border: 1px solid transparent;
+      border-bottom: none;
+      border-radius: 6px 6px 0 0;
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 600;
+      font-family: inherit;
+    }
+    .cmp-tab.active {
+      background: #161a22;
+      color: #4cc1ff;
+      border-color: #262b38;
+    }
+    .cmp-tabpane { display: none; }
+    .cmp-tabpane.active { display: block; }
+
+    /* Plain-language tab */
+    .cmp-llm-empty {
+      padding: 26px;
+      background: #111827;
+      border: 1px dashed #1e2540;
+      border-radius: 7px;
+      text-align: center;
+    }
+    .cmp-llm-empty p {
+      color: #8a93a6;
+      font-size: 12px;
+      margin: 0 0 14px;
+    }
+    .cmp-llm-card {
+      background: #111827;
+      border: 1px solid #1e2540;
+      border-radius: 7px;
+      padding: 18px 20px;
+    }
+    .cmp-llm-card .row {
+      margin-bottom: 12px;
+      font-size: 12px;
+      line-height: 1.5;
+    }
+    .cmp-llm-card .label {
+      display: inline-block;
+      min-width: 110px;
+      color: #6b7494;
+      text-transform: uppercase;
+      font-size: 10px;
+      letter-spacing: 0.8px;
+      font-weight: 600;
+      vertical-align: top;
+    }
+    .cmp-llm-card .value { color: #e6e6e6; }
+    .cmp-llm-card .verdict-tag,
+    .cmp-llm-card .rec-tag {
+      display: inline-block;
+      padding: 2px 7px;
+      border-radius: 4px;
+      font-size: 11px;
+      font-weight: 600;
+      font-family: ui-monospace, SFMono-Regular, monospace;
+    }
+    .verdict-tag.semantic_split   { background: #2e1a3c; color: #c084fc; border: 1px solid #c084fc28; }
+    .verdict-tag.behavioural_split{ background: #1b2c3a; color: #38bdf8; border: 1px solid #38bdf828; }
+    .verdict-tag.both             { background: #3a2c1b; color: #fbbf24; border: 1px solid #fbbf2428; }
+    .verdict-tag.marginal_split   { background: #1d2330; color: #94a3b8; border: 1px solid #94a3b828; }
+    .verdict-tag.near_duplicate   { background: #1a3022; color: #4ade80; border: 1px solid #4ade8028; }
+
+    .rec-tag.lower_threshold       { background: #1a3022; color: #4ade80; border: 1px solid #4ade8028; }
+    .rec-tag.accept_split          { background: #1d2330; color: #94a3b8; border: 1px solid #94a3b828; }
+    .rec-tag.investigate_embedding { background: #2a1f3c; color: #c084fc; border: 1px solid #c084fc28; }
+    .rec-tag.investigate_scalars   { background: #1b2c3a; color: #38bdf8; border: 1px solid #38bdf828; }
+
+    /* Technical tab */
+    .cmp-block {
+      background: #111827;
+      border: 1px solid #1e2540;
+      border-radius: 7px;
+      padding: 14px 16px;
+      margin-bottom: 14px;
+    }
+    .cmp-block h4 {
+      margin: 0 0 8px;
+      font-size: 11px;
+      color: #6b7494;
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      font-weight: 600;
+    }
+    .cmp-twocol {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+    }
+    .cmp-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 11px;
+      font-family: ui-monospace, SFMono-Regular, monospace;
+    }
+    .cmp-table th, .cmp-table td {
+      text-align: left;
+      padding: 4px 6px;
+      border-bottom: 1px solid #1e2540;
+      color: #c8d0e7;
+    }
+    .cmp-table th {
+      color: #6b7494;
+      font-weight: 600;
+      font-size: 10px;
+      text-transform: uppercase;
+    }
+    .cmp-table td.right { text-align: right; }
+    .cmp-table td.cmd { color: #9aa3b8; }
+
+    .cmp-spinner {
+      display: inline-block;
+      width: 12px;
+      height: 12px;
+      border: 2px solid #1e2540;
+      border-top-color: #4cc1ff;
+      border-radius: 50%;
+      animation: cmp-spin 0.8s linear infinite;
+      vertical-align: middle;
+      margin-right: 6px;
+    }
+    @keyframes cmp-spin { to { transform: rotate(360deg); } }
+    .cmp-error {
+      color: #f87171;
+      font-size: 12px;
+      padding: 14px 16px;
+      background: #1a0e0e;
+      border: 1px solid #f8717128;
+      border-radius: 6px;
+    }
+
+    /* Footnote */
+    .cmp-foot {
+      font-size: 10px;
+      color: #414b62;
+      padding: 8px 0;
+    }
+    .cmp-foot code {
+      background: #0e1320;
+      padding: 1px 5px;
+      border-radius: 3px;
+      color: #94a3b8;
+    }
+
+    /* Sample sequences */
+    .cmp-seq {
+      font-family: ui-monospace, SFMono-Regular, monospace;
+      font-size: 11px;
+      color: #9aa3b8;
+      padding: 6px 8px;
+      background: #0a0f1a;
+      border-left: 2px solid #1e2540;
+      margin: 4px 0;
+      white-space: pre-wrap;
+    }
+    .cmp-seq .sid {
+      color: #4cc1ff;
+      font-weight: 600;
+    }
+    .cmp-seq .meta {
+      color: #6b7494;
+      font-size: 10px;
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <a href="/" class="brand" style="text-decoration:none;color:inherit;">DShield Console</a>
+    <a href="/" class="nav-link">← Graph</a>
+    <a href="/insights" class="nav-link">Insights</a>
+    <div style="flex:1"></div>
+    <div id="loading" class="loading hidden" aria-live="polite"></div>
+    <div id="health" class="health">…</div>
+  </header>
+
+  <main id="compare-main">
+
+    <section>
+      <p class="cmp-section-title">Compare two session clusters
+        <span class="cmp-hint">explains why HDBSCAN kept them in separate playbooks</span>
+      </p>
+      <div class="cmp-pickers">
+        <select id="picker-a"><option value="">— pick cluster A —</option></select>
+        <span class="versus">vs</span>
+        <select id="picker-b"><option value="">— pick cluster B —</option></select>
+        <button id="cmp-go" class="cmp-btn" disabled>Compare</button>
+      </div>
+      <div class="cmp-foot">
+        Same-name pairs in the dropdown are the usual suspects.
+        Use <code>?a=cluster_X&b=cluster_Y</code> to deep-link this page.
+      </div>
+    </section>
+
+    <section id="cmp-result" class="hidden">
+      <div id="cmp-verdict-bar" class="cmp-verdict-bar"></div>
+
+      <div class="cmp-tabs">
+        <button class="cmp-tab active" data-tab="plain">Plain language</button>
+        <button class="cmp-tab"        data-tab="tech">Technical detail</button>
+      </div>
+
+      <div id="tab-plain" class="cmp-tabpane active">
+        <div id="llm-area">
+          <div class="cmp-llm-empty">
+            <p>Click Explain to ask the local LLM to summarise the gap between these clusters
+              in plain language. Takes 10-30 seconds. The Technical detail tab is ready now
+              with the raw analysis.</p>
+            <button id="cmp-explain" class="cmp-btn">Explain</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="tab-tech" class="cmp-tabpane">
+        <div id="tech-area"></div>
+      </div>
+    </section>
+
+    <section id="cmp-error-section" class="hidden">
+      <div id="cmp-error" class="cmp-error"></div>
+    </section>
+
+  </main>
+
+  <script src="/static/js/compare.js"></script>
+</body>
+</html>

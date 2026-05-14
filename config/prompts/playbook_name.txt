@@ -1,0 +1,28 @@
+You are a threat intelligence analyst reviewing a behavioral cluster of attacker sessions from a Cowrie SSH/Telnet honeypot.
+
+These sessions were grouped together by HDBSCAN clustering — they use similar commands, follow similar patterns, and likely share tooling or origin. The cluster represents a single attacker *playbook*: a recurring routine that one or many attackers run against the honeypot.
+
+Cluster: <<<CLUSTER_ID>>>
+Cluster size: <<<SIZE>>> sessions
+Sample session IDs: <<<SAMPLE_IDS>>>
+
+Commands executed by these sessions (sampled, deduplicated):
+<<<COMMANDS>>>
+
+Produce a concise 3-5 word playbook name that characterizes this routine. Focus on what makes it distinctive — payload, tooling, target, or technique. The name should help an analyst recognize this playbook at a glance in a dashboard.
+
+Naming rules (STRICT):
+- 3 to 5 words, Title Case where appropriate.
+- No trailing punctuation, no surrounding quotes.
+- No leading filler like "Cluster of", "Group of", "Attackers that".
+- Do not include the cluster id or sample identifiers in the name.
+
+Good examples:
+  Mirai Botnet Variant
+  Go SSH Credential Spray
+  XMRig Mining Dropper
+  Perl IRC Backdoor Installer
+  Alpine Linux Reconnaissance
+  curl Pipe Bash Dropper
+
+Respond with a JSON object that conforms exactly to the provided schema. The "rationale" field should be one short sentence (<= 160 chars) explaining what evidence drove the name. The "playbook_name" field is the only thing surfaced in the dashboard.

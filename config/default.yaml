@@ -5,39 +5,55 @@ elasticsearch:
   hosts: ["https://localhost:9200"]
   verify_certs: false
   ca_certs: null
-  events_index: "logs-dshield_cowrie_sessions-default"
-  enrichment_index: "enriched-dshield_cowrie_sessions-default"
   request_timeout: 60
+
+  # All index names are nested per source so adding a new sensor (webhoneypot,
+  # dshield, etc.) is a sibling block, not a flat rename. Layout:
+  #   <aspect>-dshield.<source>.<stream>-<namespace>
+  # aspects: logs (raw) / enriched / rollup / clusters
+  indexes:
+    cowrie:
+      sessions_raw:      "logs-dshield.cowrie.session-default"
+      commands:          "enriched-dshield.cowrie.command-default"
+      command_clusters:  "clusters-dshield.cowrie.command-default"
+      sessions_rollup:   "rollup-dshield.cowrie.session-default"
+      session_clusters:  "clusters-dshield.cowrie.session-default"
+      ips_rollup:        "rollup-dshield.cowrie.source_ip-default"
+      ip_clusters:       "clusters-dshield.cowrie.source_ip-default"
+      # Multi-session campaigns mined by `mine campaigns`. Distinct from
+      # session_clusters (each centroid there is a "playbook"). See
+      # docs/PLAYBOOKS_AND_CAMPAIGNS.md.
+      campaigns:         "campaigns-dshield.cowrie-default"
 
 llm:
   # provider: "ollama" (Ollama API) or "openai_compat" (LM Studio, vLLM, llama.cpp server)
   provider: "ollama"
   # base_url MUST be overridden in local.yaml.
-  generation_model: "lmstudio-community/qwen2.5:7b-instruct-q4_K_M"
-  embedding_model: "nomic-embed-text"
-  request_timeout: 120
+  generation_model: "qwen/qwen3.5-9b"
+  embedding_model: "text-embedding-nomic-embed-text-v1.5@q8_0"
+  request_timeout: 600
   max_retries: 2
   api_key: null   # only needed for openai_compat servers that require auth
-  # Fields prepended to the raw command before embedding (Phase 3+: enrich-then-embed).
-  # Empty list = embed raw command only (pre-Phase-3+ behavior).
+  # Fields prepended to the raw command before embedding (enrich-then-embed).
+  # Empty list = embed raw command only.
   # Bump embed_version whenever you change this list to force re-embedding.
   embed_context:
     - intent
     - tactics
     - techniques
     - description
-  embed_version: "v2"
+  embed_version: "v3"
 
 worker:
-  state_db: "/var/lib/dshield_vector_analysis/state.sqlite"
+  state_db: "/var/lib/dshield_enrich/state.sqlite"
   page_size: 1000
   command_max_chars: 4000
-  # Bump after editing either prompt to force re-enrichment. v3 = Phase 2 (cloud).
-  prompt_version: "v3"
+  # Bump after editing either prompt to force re-enrichment.
+  prompt_version: "v4"
   initial_lookback_days: null
   log_level: "INFO"
 
-# Phase 2 — cloud LLM escalation. Off by default; enable per-deploy in local.yaml.
+# Cloud LLM escalation. Off by default; enable per-deploy in local.yaml.
 cloud:
   enabled: false
   provider: "anthropic"
@@ -48,7 +64,7 @@ cloud:
   daily_budget_usd: 5.0
   rpm_limit: 10
   triage:
-    confidence_max: 6           # enrich: escalate when local confidence is <= this (1-10)
+    confidence_max: 6           # enrich: escalate when local confidence <= this (1-10)
     escalate_confidence_max: 8  # escalate cmd: only re-triage novel docs with confidence <= this
     sample_rate: 0.01           # 1% random sampling for quality monitoring
     base64_min_run: 200         # length threshold for "suspicious base64 blob"
@@ -79,19 +95,68 @@ cloud:
     input_per_mtok: 3.0
     output_per_mtok: 15.0
 
-prompts:
-  command_enrichment: "config/prompts/command_enrichment.txt"
-  command_deep_dive:  "config/prompts/command_deep_dive.txt"
+# Per-command session-co-occurrence context. For each cache-miss command we
+# query ES for the sessions that ran it, then pull the most-frequent OTHER
+# commands those sessions ran. Top-K are passed to the LLM (and optionally
+# appended to the embed input) so enrichment sees the command in context.
+cooccurrence:
+  enabled: true
+  session_sample_size: 50          # max sessions sampled per command
+  top_k: 8                         # co-occurring commands surfaced
+  min_sessions: 3                  # skip when command has fewer sampled sessions
+  max_corpus_session_ratio: 0.40   # drop boilerplate (e.g. `cd /tmp`)
+  embed_cooccurrence: true         # also append to embed text — bumps embed_version
 
-# Phase 3 — HDBSCAN clustering + novelty scoring. Run independently of enrich.
-cluster:
+prompts:
+  command_enrichment:        "config/prompts/command_enrichment.txt"
+  command_deep_dive:         "config/prompts/command_deep_dive.txt"
+  playbook_name:             "config/prompts/playbook_name.txt"
+  # Used by the console's /compare page (and the explain_cluster_pair CLI
+  # script's --explain flag). Local LLM only.
+  cluster_pair_explanation:  "config/prompts/cluster_pair_explanation.txt"
+
+# HDBSCAN over command embeddings.
+command_cluster:
   min_cluster_size: 5
   min_samples: 2
   page_size: 1000
   batch_size: 200
-  # null = derive from enrichment_index (replace trailing -default with -clusters-default)
-  clusters_index: null
-  # Phase 3+: weight of scalar feature block (occurrence_count, unique_source_ips, confidence)
-  # appended to the L2-normalized embedding matrix before HDBSCAN.
+  # Weight of scalar feature block (occurrence_count, unique_source_ips, confidence,
+  # session_reuse_rate) appended to the L2-normalized embedding matrix.
   # Semantic signal (1.0 norm) dominates; scalars break ties. Tune 0.0–0.15.
   scalar_weight: 0.05
+
+# Session-level rollup + clustering + playbook naming.
+session:
+  # Bump when mean-pool inputs change to force full re-rollup.
+  embed_version: "v1"
+  # HDBSCAN params — smaller defaults than commands because session counts are lower.
+  cluster_min_cluster_size: 3
+  cluster_min_samples: 1
+  # Weight of the scalar feature block in the session cluster matrix.
+  # Scalars: command_count, unique_commands, login_success_rate, mean_novelty_score.
+  cluster_scalar_weight: 0.05
+  page_size: 1000
+  batch_size: 200
+  # Max unique commands sampled per playbook (session cluster) for LLM name generation.
+  playbook_sample_commands: 15
+  # Cosine-similarity threshold for merging HDBSCAN clusters into a single
+  # playbook. Two clusters whose centroids are at least this similar (single-
+  # linkage union-find) collapse into one playbook before LLM naming. Fixes
+  # the failure mode where HDBSCAN splits a behaviourally-identical group
+  # across two clusters (verified by `scripts/diagnose_centroid_similarity.py`).
+  # 1.0 disables merging (1 cluster = 1 playbook). Lowering past ~0.93 risks
+  # transitive mega-merges through borderline edges; 0.96 is a safe default.
+  # Future tightening: a complete-linkage guard (require every pair in a
+  # merged group to clear `threshold - δ`) — not implemented yet, tracked in README.
+  playbook_merge_threshold: 0.96
+
+# IP-level rollup + clustering.
+ip:
+  embed_version: "v1"
+  cluster_min_cluster_size: 3
+  cluster_min_samples: 1
+  # Scalars: total_sessions, login_success_rate, mean_novelty_score, mean_session_duration_s.
+  cluster_scalar_weight: 0.05
+  page_size: 1000
+  batch_size: 200

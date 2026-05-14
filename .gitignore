@@ -3,6 +3,8 @@
 config/local.yaml
 
 # Python
+pyvenv.cfg
+bin/
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -14,3 +16,8 @@ dist/
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
+
+# Claude
+.claude
+
+docs

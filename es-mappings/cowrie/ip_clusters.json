@@ -1,0 +1,29 @@
+{
+  "_comment": "IP cluster centroids. One doc per cluster per run plus one run_summary per run. IP clusters are unnamed actor profiles; the playbook/campaign concepts live at the session-cluster and multi-session layers respectively.",
+  "settings": {
+    "number_of_shards": 1,
+    "number_of_replicas": 0,
+    "refresh_interval": "30s"
+  },
+  "mappings": {
+    "properties": {
+      "@timestamp":    { "type": "date" },
+      "run_id":        { "type": "keyword" },
+      "doc_type":      { "type": "keyword" },
+
+      "cluster_id":    { "type": "keyword" },
+      "size":          { "type": "long" },
+      "centroid": {
+        "type": "dense_vector",
+        "dims": 768,
+        "index": false
+      },
+      "sample_ips": { "type": "ip" },
+
+      "total_docs":      { "type": "long" },
+      "n_clusters":      { "type": "long" },
+      "n_outliers":      { "type": "long" },
+      "runtime_seconds": { "type": "float" }
+    }
+  }
+}
