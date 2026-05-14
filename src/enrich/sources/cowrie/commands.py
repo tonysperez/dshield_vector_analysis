@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import re
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -279,9 +280,9 @@ _ENRICHMENT_SCHEMA = CommandEnrichment.model_json_schema()
 def _fetch_total_session_count(es: Elasticsearch, events_index: str) -> int:
     """Total distinct cowrie.session_id over all command.input events.
 
-    Used as the denominator for the boilerplate filter — sibling commands
-    whose session frequency exceeds `max_corpus_session_ratio` of this total
-    are dropped.
+    Used as `N` in the TF-IDF salience weight for cooccurring siblings
+    (see `score_cooccurring_siblings`). Replaces the old boilerplate-cutoff
+    denominator; the change to continuous IDF weighting is ROADMAP #6.
     """
     try:
         resp = es.search(
@@ -296,6 +297,52 @@ def _fetch_total_session_count(es: Elasticsearch, events_index: str) -> int:
         return 0
 
 
+def score_cooccurring_siblings(
+    tf_by_sib: dict[str, int],
+    df_by_sib: dict[str, int],
+    total_sessions: int,
+    top_k: int,
+) -> list[tuple[str, int]]:
+    """Rank candidate siblings by TF-IDF salience; return top-k.
+
+    Pure function — no ES, easy to unit-test. ROADMAP issue #6.
+
+    `tf` = window session count (how many of the anchor's window sessions
+    ran the sibling). `df` = corpus session count (how many sessions
+    corpus-wide ran the sibling). `N` = total_sessions.
+
+    Salience = tf * ln((N + 1) / (df + 1)). Log-smoothed, parameter-free.
+    Corpus-common siblings (high df) get small idf and drop in ranking
+    without being categorically rejected; specifically-correlated siblings
+    (high tf, low df) rise.
+
+    Falls back to ranking by raw tf when `total_sessions <= 0` or when
+    `df_by_sib` is empty — the idf term is undefined in those cases and
+    raw-count order is the most we can do.
+
+    Returned tuples carry the *original window tf*, not the score, so
+    downstream prompt-display continues to show concrete session counts.
+    """
+    if not tf_by_sib:
+        return []
+
+    use_idf = total_sessions > 0 and bool(df_by_sib)
+    log_n = math.log(total_sessions + 1) if use_idf else 0.0
+
+    scored: list[tuple[float, int, str]] = []
+    for sib, tf in tf_by_sib.items():
+        if use_idf:
+            df = df_by_sib.get(sib, 1)
+            idf = log_n - math.log(df + 1)
+            score = tf * idf
+        else:
+            score = float(tf)
+        scored.append((score, tf, sib))
+
+    scored.sort(key=lambda x: (-x[0], -x[1], x[2]))
+    return [(sib, tf) for _, tf, sib in scored[:top_k]]
+
+
 def fetch_cooccurring_commands(
     es: Elasticsearch,
     events_index: str,
@@ -304,19 +351,26 @@ def fetch_cooccurring_commands(
     session_sample_size: int,
     top_k: int,
     min_sessions: int,
-    max_corpus_session_ratio: float,
     total_sessions: int,
 ) -> list[tuple[str, int]]:
-    """Return [(sibling_command, session_cooccurrence_count), ...] sorted desc.
+    """Return [(sibling_command, window_session_count), ...] ordered by
+    TF-IDF salience (most informative siblings first).
 
-    Strategy:
+    Strategy (see also `score_cooccurring_siblings`):
       1. Find up to `session_sample_size` sessions that ran this command.
       2. In those sessions, aggregate other command_line values, counting
-         distinct sessions per sibling (sessions, not raw events — a session
-         that runs `wget X` 5 times still counts once).
-      3. Drop the command itself; drop siblings whose corpus-wide session
-         frequency exceeds `max_corpus_session_ratio` (boilerplate filter).
-      4. Return the top-k surviving siblings.
+         distinct sessions per sibling (sessions, not raw events — a
+         session that runs `wget X` 5 times still counts once).
+      3. One corpus-wide query fetches `df` (session cardinality) for all
+         candidate siblings at once.
+      4. Rank each surviving sibling by `tf * ln((N+1)/(df+1))` — the
+         tf-idf weight inside the cooccurrence window — and return top-k.
+
+    Continuous IDF weighting replaces the prior binary
+    `max_corpus_session_ratio` boilerplate cutoff: corpus-common siblings
+    are *demoted*, not rejected. Net cost is lower than the old code,
+    which ran one cardinality query per candidate above the cutoff.
+    ROADMAP issue #6.
     """
     if not command:
         return []
@@ -338,8 +392,9 @@ def fetch_cooccurring_commands(
     if len(sids) < min_sessions:
         return []
 
-    # Pull a generous bucket — we'll filter and trim. 5x top_k absorbs the
-    # boilerplate that gets dropped in the next step.
+    # Pull a generous candidate bucket so corpus-common siblings still
+    # appear and can be ranked against specific ones — they'll demote
+    # themselves via the IDF weight in score_cooccurring_siblings.
     bucket_size = max(top_k * 5, 20)
     try:
         resp2 = es.search(
@@ -361,57 +416,45 @@ def fetch_cooccurring_commands(
         log.warning("co-occurrence: sibling agg failed for %r: %s", command[:80], e)
         return []
 
-    threshold = (
-        int(total_sessions * max_corpus_session_ratio)
-        if total_sessions > 0 and 0 < max_corpus_session_ratio < 1
-        else 0
-    )
-
-    out: list[tuple[str, int]] = []
+    tf_by_sib: dict[str, int] = {}
     for b in buckets:
         sib = b.get("key") or ""
         if not sib or sib == command:
             continue
-        sess_count = int(b.get("sessions", {}).get("value", 0))
-        if sess_count <= 0:
-            continue
-        # Boilerplate filter: skip siblings that appear in too large a slice
-        # of the entire corpus (universal commands carry no signal).
-        if threshold > 0:
-            try:
-                sib_total = es.count(
-                    index=events_index,
-                    query={"bool": {"must": [
-                        {"term": {"event.action": "cowrie.command.input"}},
-                        {"term": {"process.command_line": sib}},
-                    ]}},
-                )["count"]
-            except Exception:
-                sib_total = 0
-            # Note: count is event-level, not session-level. Cheap upper bound;
-            # if even the event count is below threshold, the session count
-            # certainly is, so we keep. If it's above threshold, run a precise
-            # session cardinality check before dropping.
-            if sib_total > threshold:
-                try:
-                    cresp = es.search(
-                        index=events_index,
-                        size=0,
-                        query={"bool": {"must": [
-                            {"term": {"event.action": "cowrie.command.input"}},
-                            {"term": {"process.command_line": sib}},
-                        ]}},
-                        aggs={"s": {"cardinality": {"field": "cowrie.session_id"}}},
-                    )
-                    sib_sessions = int(cresp["aggregations"]["s"]["value"])
-                except Exception:
-                    sib_sessions = 0
-                if sib_sessions > threshold:
-                    continue
-        out.append((sib, sess_count))
-        if len(out) >= top_k:
-            break
-    return out
+        tf = int(b.get("sessions", {}).get("value", 0))
+        if tf > 0:
+            tf_by_sib[sib] = tf
+    if not tf_by_sib:
+        return []
+
+    # One corpus-wide query for df (session cardinality) per candidate. When
+    # total_sessions is unknown the IDF term is undefined and we fall back
+    # to raw-tf ordering inside score_cooccurring_siblings.
+    df_by_sib: dict[str, int] = {}
+    if total_sessions > 0:
+        try:
+            resp3 = es.search(
+                index=events_index,
+                size=0,
+                query={"bool": {"must": [
+                    {"term": {"event.action": "cowrie.command.input"}},
+                    {"terms": {"process.command_line": list(tf_by_sib.keys())}},
+                ]}},
+                aggs={
+                    "by_cmd": {
+                        "terms": {"field": "process.command_line", "size": len(tf_by_sib)},
+                        "aggs": {"sessions": {"cardinality": {"field": "cowrie.session_id"}}},
+                    }
+                },
+            )
+            df_by_sib = {
+                b["key"]: int(b["sessions"]["value"])
+                for b in resp3["aggregations"]["by_cmd"]["buckets"]
+            }
+        except Exception as e:
+            log.warning("co-occurrence: corpus df agg failed for %r: %s", command[:80], e)
+
+    return score_cooccurring_siblings(tf_by_sib, df_by_sib, total_sessions, top_k)
 
 
 def _format_cooccurring_block(siblings: list[tuple[str, int]]) -> str:
@@ -586,15 +629,13 @@ def run_enrich(cfg: AppConfig, secrets: Secrets, dry_run: bool = False, no_cloud
 
     cooc_cfg = cfg.cooccurrence
     total_sessions = (
-        _fetch_total_session_count(es, events_idx)
-        if cooc_cfg.enabled and cooc_cfg.max_corpus_session_ratio > 0 else 0
+        _fetch_total_session_count(es, events_idx) if cooc_cfg.enabled else 0
     )
     if cooc_cfg.enabled:
         log.info(
             "co-occurrence enabled: top_k=%d sample=%d sessions, "
-            "boilerplate cutoff=%.0f%% of %d total sessions",
-            cooc_cfg.top_k, cooc_cfg.session_sample_size,
-            cooc_cfg.max_corpus_session_ratio * 100, total_sessions,
+            "tf-idf weighted against %d total corpus sessions",
+            cooc_cfg.top_k, cooc_cfg.session_sample_size, total_sessions,
         )
 
     since = db.get_watermark()
@@ -700,7 +741,6 @@ def run_enrich(cfg: AppConfig, secrets: Secrets, dry_run: bool = False, no_cloud
                     session_sample_size=cooc_cfg.session_sample_size,
                     top_k=cooc_cfg.top_k,
                     min_sessions=cooc_cfg.min_sessions,
-                    max_corpus_session_ratio=cooc_cfg.max_corpus_session_ratio,
                     total_sessions=total_sessions,
                 )
                 if cooccurring:
@@ -964,8 +1004,7 @@ def run_escalate(
 
     cooc_cfg = cfg.cooccurrence
     total_sessions = (
-        _fetch_total_session_count(es, events_idx)
-        if cooc_cfg.enabled and cooc_cfg.max_corpus_session_ratio > 0 else 0
+        _fetch_total_session_count(es, events_idx) if cooc_cfg.enabled else 0
     )
 
     from ...llm.anthropic import AnthropicClient, cost_usd as _cost_usd
@@ -1032,7 +1071,6 @@ def run_escalate(
                 session_sample_size=cooc_cfg.session_sample_size,
                 top_k=cooc_cfg.top_k,
                 min_sessions=cooc_cfg.min_sessions,
-                max_corpus_session_ratio=cooc_cfg.max_corpus_session_ratio,
                 total_sessions=total_sessions,
             )
         cloud_parsed, in_tok, out_tok = cloud_enrich_one(
@@ -1170,8 +1208,7 @@ def run_reembed(cfg: AppConfig, secrets: Secrets, dry_run: bool = False) -> dict
     cooc_cfg = cfg.cooccurrence
     use_cooc = cooc_cfg.enabled and cooc_cfg.embed_cooccurrence
     total_sessions = (
-        _fetch_total_session_count(es, events_idx)
-        if use_cooc and cooc_cfg.max_corpus_session_ratio > 0 else 0
+        _fetch_total_session_count(es, events_idx) if use_cooc else 0
     )
 
     log.info(
@@ -1203,7 +1240,6 @@ def run_reembed(cfg: AppConfig, secrets: Secrets, dry_run: bool = False) -> dict
                     session_sample_size=cooc_cfg.session_sample_size,
                     top_k=cooc_cfg.top_k,
                     min_sessions=cooc_cfg.min_sessions,
-                    max_corpus_session_ratio=cooc_cfg.max_corpus_session_ratio,
                     total_sessions=total_sessions,
                 )
             embed_text = _build_embed_text(

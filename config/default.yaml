@@ -113,7 +113,9 @@ cooccurrence:
   session_sample_size: 50          # max sessions sampled per command
   top_k: 8                         # co-occurring commands surfaced
   min_sessions: 3                  # skip when command has fewer sampled sessions
-  max_corpus_session_ratio: 0.40   # drop boilerplate (e.g. `cd /tmp`)
+  # The old binary `max_corpus_session_ratio: 0.40` boilerplate cutoff was
+  # replaced with continuous TF-IDF weighting (ROADMAP issue #6). Setting
+  # the field here is a benign no-op — kept out of the default for clarity.
   embed_cooccurrence: true         # also append to embed text — bumps embed_version
 
 prompts:

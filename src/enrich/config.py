@@ -78,10 +78,10 @@ class CooccurrenceConfig(BaseModel):
     # Skip co-occurrence when the command appears in fewer than this many
     # sessions — too little signal to be meaningful.
     min_sessions: int = 3
-    # Drop sibling commands whose corpus-wide session frequency exceeds this
-    # ratio (0.0-1.0). Filters boilerplate like `cd /tmp`, `whoami` that
-    # appear with everything.
-    max_corpus_session_ratio: float = 0.40
+    # NOTE: `max_corpus_session_ratio` (the old binary boilerplate cutoff)
+    # was removed in ROADMAP #6. The ranker now uses TF-IDF weighting —
+    # corpus-common siblings demote themselves continuously. Stray YAML
+    # entries are silently ignored by pydantic.
     # If true, append "co-occurs with: ..." to the embed text alongside
     # other enrichment context. Bumps embed_version when toggled.
     embed_cooccurrence: bool = True
