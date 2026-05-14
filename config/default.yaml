@@ -64,10 +64,17 @@ cloud:
   daily_budget_usd: 5.0
   rpm_limit: 10
   triage:
-    confidence_max: 6           # enrich: escalate when local confidence <= this (1-10)
+    # Was 6 (modal local-confidence value, escalated 70% of corpus and burnt
+    # daily_budget_usd before noon). Lowered to 4 so we escalate "actually
+    # low confidence" not "model's default floor." See ROADMAP issue #4.
+    confidence_max: 4           # enrich: escalate when local confidence <= this (1-10)
     escalate_confidence_max: 8  # escalate cmd: only re-triage novel docs with confidence <= this
     sample_rate: 0.01           # 1% random sampling for quality monitoring
     base64_min_run: 200         # length threshold for "suspicious base64 blob"
+    # File extensions removed (`zip`, `exe`): they are far more common as
+    # filename suffixes than as TLDs, and the host-context anchor on
+    # `_TLD_RE` (src/enrich/triage.py) reduces false positives further. See
+    # ROADMAP issue #4.
     suspicious_tlds:
       - xyz
       - top
@@ -87,8 +94,6 @@ cloud:
       - site
       - stream
       - cam
-      - zip
-      - exe
     novel_embedding_threshold: 0.5  # escalate when novelty_score >= this
     novel_confidence_min: 4         # but only when local confidence is at least
                                     # this — gates out the encoding-artifact tail
@@ -136,7 +141,10 @@ session:
   embed_version: "v1"
   # HDBSCAN params — smaller defaults than commands because session counts are lower.
   cluster_min_cluster_size: 3
-  cluster_min_samples: 1
+  # min_samples=1 collapses HDBSCAN's mutual-reachability distance to raw
+  # cosine distance (single-linkage), which on a heavy-duplicate corpus can
+  # let one mega-cluster swallow the bulk. ROADMAP issue #5.
+  cluster_min_samples: 2
   # Weight of the scalar feature block in the session cluster matrix.
   # Scalars: command_count, unique_commands, login_success_rate, mean_novelty_score.
   cluster_scalar_weight: 0.05
@@ -159,7 +167,8 @@ session:
 ip:
   embed_version: "v1"
   cluster_min_cluster_size: 3
-  cluster_min_samples: 1
+  # See session.cluster_min_samples for rationale. ROADMAP issue #5.
+  cluster_min_samples: 2
   # Scalars: total_sessions, login_success_rate, mean_novelty_score, mean_session_duration_s.
   cluster_scalar_weight: 0.05
   page_size: 1000

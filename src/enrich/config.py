@@ -88,10 +88,16 @@ class CooccurrenceConfig(BaseModel):
 
 
 class CloudTriageConfig(BaseModel):
-    confidence_max: int = 5
+    # Anchor of "actually low confidence" — model's modal/default rating
+    # was 6 on this corpus, escalating below that burnt budget on docs the
+    # model was sure about. ROADMAP issue #4.
+    confidence_max: int = 4
     escalate_confidence_max: int = 7
     sample_rate: float = 0.01
     base64_min_run: int = 200
+    # File extensions removed (`zip`, `exe`): more often filename suffixes
+    # than TLDs; the host-context anchor on _TLD_RE in triage.py rejects
+    # bare-filename matches anyway. ROADMAP issue #4.
     suspicious_tlds: list[str] = Field(default_factory=lambda: [
         "xyz", "top", "tk", "ml", "ga", "cf", "gq", "club", "icu", "buzz",
         "monster", "rest", "bar", "fit", "online", "site", "stream", "cam",
@@ -133,7 +139,10 @@ class CommandClusterConfig(BaseModel):
 class SessionConfig(BaseModel):
     embed_version: str = "v1"
     cluster_min_cluster_size: int = 3
-    cluster_min_samples: int = 1
+    # min_samples=2 avoids collapsing HDBSCAN's mutual-reachability distance
+    # to raw distance (single-linkage), which can let one mega-cluster
+    # swallow the bulk on a duplicate-heavy corpus. ROADMAP issue #5.
+    cluster_min_samples: int = 2
     cluster_scalar_weight: float = 0.05
     page_size: int = 1000
     batch_size: int = 200
@@ -151,7 +160,8 @@ class SessionConfig(BaseModel):
 class IPConfig(BaseModel):
     embed_version: str = "v1"
     cluster_min_cluster_size: int = 3
-    cluster_min_samples: int = 1
+    # See SessionConfig.cluster_min_samples for rationale. ROADMAP issue #5.
+    cluster_min_samples: int = 2
     cluster_scalar_weight: float = 0.05
     page_size: int = 1000
     batch_size: int = 200

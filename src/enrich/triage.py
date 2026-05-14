@@ -21,7 +21,28 @@ log = logging.getLogger(__name__)
 # A run of base64-ish chars. The threshold is configurable.
 _BASE64_RE = re.compile(r"[A-Za-z0-9+/=]{40,}")
 _IPV4_RE = re.compile(r"(?<!\d)(?:\d{1,3}\.){3}\d{1,3}(?!\d)")
-_TLD_RE = re.compile(r"\b[a-z0-9-]+\.([a-z]{2,24})\b", re.IGNORECASE)
+
+# Host-context anchor: only fire `rare_tld` when the hostname.tld pattern
+# appears in a network-fetch context — either after a URL scheme (`://`)
+# or after a known network-tool keyword. Bare-filename matches like
+# `update.exe` or `./script.run` were previously dragging in `.zip` /
+# `.exe` (now removed from suspicious_tlds) and any future entry that
+# happens to overlap a filename suffix would have re-introduced the same
+# bug. ROADMAP issue #4.
+_NETWORK_TOOLS = (
+    "wget|curl|nslookup|dig|host|ping|nc|ncat|ssh|scp|sftp|tftp|telnet|ftp"
+)
+# Two host-context anchors:
+#   - `://`            : URL scheme (catches any URL regardless of caller).
+#   - `<tool>...`      : a network-tool keyword followed by any non-shell-
+#                        separator chars up to the hostname. The `[^|;&\n]*?`
+#                        is lazy so it doesn't bleed past a pipe/semicolon
+#                        into an unrelated command in the same line.
+_TLD_RE = re.compile(
+    rf"(?:://|\b(?:{_NETWORK_TOOLS})\b[^|;&\n]*?\b)"
+    r"[a-z0-9-]+\.([a-z]{2,24})\b",
+    re.IGNORECASE,
+)
 
 
 def reasons_to_escalate(
