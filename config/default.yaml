@@ -90,6 +90,10 @@ cloud:
       - zip
       - exe
     novel_embedding_threshold: 0.5  # escalate when novelty_score >= this
+    novel_confidence_min: 4         # but only when local confidence is at least
+                                    # this — gates out the encoding-artifact tail
+                                    # (raw ELF bytes etc. that score novelty=1.0
+                                    # with confidence=1). See ROADMAP issue #3.
   pricing:
     # USD per 1M tokens. Update to match the model you point at.
     input_per_mtok: 3.0

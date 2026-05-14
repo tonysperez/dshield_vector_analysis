@@ -884,10 +884,16 @@ def iter_novel_local_docs(
     index: str,
     novelty_threshold: float,
     confidence_max: int,
+    confidence_min: int,
     page_size: int = 50,
 ) -> Iterator[dict]:
     """Yield enrichment docs with event.provider='local', novelty_score >= novelty_threshold,
-    and confidence <= confidence_max. Sorted novelty_score desc.
+    and confidence in [confidence_min, confidence_max]. Sorted novelty_score desc.
+
+    The lower bound on confidence is the novelty-noise floor — see
+    ROADMAP issue #3. Local-LLM confidence below this is almost always an
+    encoding artifact whose novelty score is meaningless; gating those out
+    here stops them from burning cloud budget.
     """
     body: dict = {
         "size": page_size,
@@ -908,7 +914,10 @@ def iter_novel_local_docs(
                         "dshield.cowrie.enrichment.cluster.novelty_score": {"gte": novelty_threshold}
                     }},
                     {"range": {
-                        "dshield.cowrie.enrichment.confidence": {"lte": confidence_max}
+                        "dshield.cowrie.enrichment.confidence": {
+                            "gte": confidence_min,
+                            "lte": confidence_max,
+                        }
                     }},
                 ]
             }
@@ -975,16 +984,19 @@ def run_escalate(
         raise RuntimeError(f"Cloud preflight failed: {exc}") from exc
 
     confidence_max = cfg.cloud.triage.escalate_confidence_max
+    confidence_min = cfg.cloud.triage.novel_confidence_min
     log.info(
-        "escalate: novelty_threshold=%.2f confidence_max=%d model=%s budget_remaining=$%.4f",
-        threshold, confidence_max, cfg.cloud.model,
+        "escalate: novelty_threshold=%.2f confidence=[%d,%d] model=%s budget_remaining=$%.4f",
+        threshold, confidence_min, confidence_max, cfg.cloud.model,
         triage_mod.budget_remaining_usd(db, cfg.cloud),
     )
 
     stats: dict = defaultdict(int)
     actions: list[dict] = []
 
-    for hit in iter_novel_local_docs(es, commands_idx, threshold, confidence_max):
+    for hit in iter_novel_local_docs(
+        es, commands_idx, threshold, confidence_max, confidence_min,
+    ):
         stats["candidates"] += 1
 
         if not dry_run and not triage_mod.can_spend(db, cfg.cloud):
@@ -1091,7 +1103,12 @@ def run_escalate(
     cloud_client.close()
     db.close()
 
-    out = dict(stats, dry_run=dry_run, novelty_threshold=threshold, confidence_max=confidence_max)
+    out = dict(
+        stats, dry_run=dry_run,
+        novelty_threshold=threshold,
+        confidence_min=confidence_min,
+        confidence_max=confidence_max,
+    )
     if "cloud_cost_usd_x10000" in out:
         out["cloud_cost_usd"] = out.pop("cloud_cost_usd_x10000") / 10000.0
     return out

@@ -97,6 +97,11 @@ class CloudTriageConfig(BaseModel):
         "monster", "rest", "bar", "fit", "online", "site", "stream", "cam",
     ])
     novel_embedding_threshold: float = 0.5
+    # Suppress novelty-based escalation/surfacing when the local model's
+    # self-rated confidence is below this floor. Confidence-1 enrichments
+    # are typically encoding artifacts (raw ELF bytes, mojibake) where
+    # novelty=1.0 is meaningless — see docs/ROADMAP.md issue #3.
+    novel_confidence_min: int = 4
 
 
 class CloudPricingConfig(BaseModel):

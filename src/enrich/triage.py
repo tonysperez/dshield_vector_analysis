@@ -67,7 +67,20 @@ def reasons_to_escalate(
             break
 
     # Phase 3 novel_embedding rule — requires cluster centroids loaded from ES.
-    if embedding is not None and centroids:
+    #
+    # Gate by confidence floor: novelty-as-signal only makes sense when the
+    # local model said something coherent about the command. A
+    # confidence-1 enrichment with novelty=1.0 is almost always raw bytes
+    # / encoding artifacts (see ROADMAP issue #3), and the `low_confidence`
+    # rule above already routes those to the cloud — no need to also fire
+    # `novel_embedding` and double-count them in escalate budget. When
+    # `parsed is None` (local LLM never produced a doc to rate), defer to
+    # `local_failed` for escalation instead.
+    if (
+        embedding is not None and centroids
+        and parsed is not None
+        and parsed.confidence >= cfg.triage.novel_confidence_min
+    ):
         from .clustering import novelty_score_from_lists
         score = novelty_score_from_lists(embedding, centroids)
         if score >= cfg.triage.novel_embedding_threshold:

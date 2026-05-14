@@ -30,6 +30,13 @@ log = logging.getLogger(__name__)
 # fail to join raw command-input events to their enrichment docs.
 _WS_RE = re.compile(r"\s+")
 
+# Floor for surfacing novelty in the insights panel. Mirrors the pipeline's
+# `cloud.triage.novel_confidence_min` (config/default.yaml) — confidence-1
+# enrichments are typically raw-byte / encoding artifacts whose novelty score
+# is noise. The console's AppConfig is intentionally slim and doesn't pull
+# triage config, so the value is duplicated here. See ROADMAP issue #3.
+_NOVEL_CONFIDENCE_MIN = 4
+
 
 def _hash_command(cmd: str, max_chars: int = 4000) -> str:
     s = _WS_RE.sub(" ", (cmd or "").strip())[:max_chars]
@@ -1458,6 +1465,10 @@ def insights_summary(
             ],
             query={"bool": {"filter": [
                 {"range": {"dshield.cowrie.enrichment.unique_sessions": {"gte": 3}}},
+                # Gate out the encoding-artifact tail — see _NOVEL_CONFIDENCE_MIN
+                # and ROADMAP issue #3. Without this, raw-byte commands score
+                # novelty=1.0 with confidence=1 and dominate the panel.
+                {"range": {"dshield.cowrie.enrichment.confidence": {"gte": _NOVEL_CONFIDENCE_MIN}}},
             ]}},
             sort=[{
                 "dshield.cowrie.enrichment.cluster.novelty_score": {"order": "desc"}
