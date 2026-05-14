@@ -6,11 +6,12 @@ name-playbooks:   local LLM names each session cluster (a "playbook").
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
-from typing import Iterator, Optional
+from typing import Iterable, Iterator, Optional
 
 from elasticsearch import Elasticsearch
 
@@ -57,17 +58,33 @@ _SESSION_PLAYBOOK_NAME_SCRIPT = (
 )
 
 
-def _make_playbook_id(run_id: str, group_id: str) -> str:
-    """The canonical playbook primary key. Format: `sescl-<run_id>-<group_id>`.
+_PLAYBOOK_ID_HASH_LEN = 16
 
-    `group_id` is `pg<N>` where N is the merge-group index assigned by
-    `merge_clusters_into_playbooks`. A playbook may map to one or more
-    HDBSCAN clusters depending on `session.playbook_merge_threshold`. The
-    id is the identity; the LLM `playbook_name` is a display label only and
-    may legitimately duplicate across playbooks. Outlier clusters do not
-    get a playbook_id — they're noise, not a behaviour group.
+
+def _make_playbook_id(member_session_ids: Iterable[str]) -> str:
+    """The canonical playbook primary key. Format: `sescl-<16-hex>`.
+
+    The hex is the first `_PLAYBOOK_ID_HASH_LEN` chars of the SHA-256 of
+    the playbook's member session ids, sorted and joined with newline.
+    Two `cluster sessions` runs that produce the same membership for a
+    playbook yield byte-identical ids — so downstream pivots (campaign
+    miner especially, since campaign ids hash a sorted playbook-id set)
+    don't churn across re-clusterings.
+
+    A playbook may map to one or more HDBSCAN clusters depending on
+    `session.playbook_merge_threshold`. Membership here is the *union of
+    session ids across every constituent cluster*, not a per-cluster value.
+    Empty membership raises — outlier clusters carry no playbook_id and
+    are filtered out by the caller before we reach this point.
+
+    The LLM `playbook_name` is a display label only and may legitimately
+    duplicate across playbooks.
     """
-    return f"sescl-{run_id}-{group_id}"
+    sids = sorted(set(s for s in member_session_ids if s))
+    if not sids:
+        raise ValueError("_make_playbook_id requires at least one session id")
+    digest = hashlib.sha256("\n".join(sids).encode("utf-8")).hexdigest()
+    return f"sescl-{digest[:_PLAYBOOK_ID_HASH_LEN]}"
 
 
 def merge_clusters_into_playbooks(
@@ -629,6 +646,54 @@ def run_cluster(
 # Name playbooks (each session cluster gets a short LLM-generated label).
 # ---------------------------------------------------------------------------
 
+def _fetch_member_session_ids(
+    es: Elasticsearch,
+    sessions_idx: str,
+    cluster_ids: list[str],
+    page_size: int = 1000,
+) -> dict[str, set[str]]:
+    """Pull `{cluster_id → set[session_id]}` for the named cluster ids.
+
+    Reads the session rollup index, scoped to docs whose
+    `dshield.cowrie.enrichment.session.cluster.id` matches one of the
+    requested cluster_ids (i.e. members of the current run — `cluster
+    sessions` overwrites this field for every session, so by the time
+    `name playbooks` calls us the field reflects the latest run only).
+
+    Returns an empty map if `cluster_ids` is empty. Missing cluster ids
+    return as keys with empty sets (caller chooses how to react).
+    """
+    out: dict[str, set[str]] = {cid: set() for cid in cluster_ids}
+    if not cluster_ids:
+        return out
+
+    cluster_field = "dshield.cowrie.enrichment.session.cluster.id"
+    body: dict = {
+        "size": page_size,
+        "_source": ["cowrie.session_id", cluster_field],
+        "query": {"terms": {cluster_field: cluster_ids}},
+        "sort": [{"@timestamp": "asc"}, {"_doc": "asc"}],
+    }
+    search_after = None
+    while True:
+        if search_after:
+            body["search_after"] = search_after
+        resp = es.search(index=sessions_idx, **body)
+        hits = resp["hits"]["hits"]
+        if not hits:
+            return out
+        for h in hits:
+            src = h["_source"]
+            sid = (src.get("cowrie") or {}).get("session_id") or h["_id"]
+            cid = (
+                ((src.get("dshield") or {}).get("cowrie") or {})
+                .get("enrichment", {}).get("session", {}).get("cluster", {}).get("id")
+            )
+            if cid and cid in out and sid:
+                out[cid].add(sid)
+        search_after = hits[-1]["sort"]
+
+
 def _fetch_session_sample_commands(
     es: Elasticsearch,
     events_index: str,
@@ -721,6 +786,14 @@ def run_name_playbooks(
         centroids_by_cid, cfg.session.playbook_merge_threshold,
     )
 
+    # Pull the *full* member session-id set per cluster from the rollup
+    # index — the centroid doc only carries 5 samples, but the playbook id
+    # is content-hashed over the entire membership so identical runs yield
+    # identical ids (see `_make_playbook_id`).
+    members_by_cid = _fetch_member_session_ids(
+        es, sessions_idx, list(centroids_by_cid.keys()), cfg.session.page_size,
+    )
+
     # Bucket cluster docs by their assigned playbook group.
     docs_by_group: dict[str, list[dict]] = defaultdict(list)
     for c in nameable:
@@ -795,7 +868,25 @@ def run_name_playbooks(
             # if it merged multiple HDBSCAN clusters we hand the LLM the
             # group's playbook_id plus the constituent cluster ids so any
             # explanation it produces matches reality.
-            playbook_id = _make_playbook_id(run_id, group_id)
+            #
+            # Playbook id = SHA-256 over the union of member session ids
+            # across every constituent cluster. Stable across cluster runs
+            # when membership doesn't change. Empty membership is
+            # impossible here: `nameable` filtered outliers, and clusters
+            # with zero member docs would have nothing to anchor the
+            # centroid on — but be defensive anyway.
+            member_sids_union: set[str] = set()
+            for cid in member_cids:
+                member_sids_union.update(members_by_cid.get(cid, set()))
+            if not member_sids_union:
+                stats["skipped_no_members"] += 1
+                log.warning(
+                    "Playbook group %s (clusters %s) has zero member sessions"
+                    " in the rollup index — skipping naming",
+                    group_id, member_cids,
+                )
+                continue
+            playbook_id = _make_playbook_id(member_sids_union)
             cluster_id_for_prompt = (
                 member_cids[0] if len(member_cids) == 1
                 else f"{playbook_id} (clusters: {', '.join(member_cids)})"

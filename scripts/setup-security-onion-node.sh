@@ -171,7 +171,7 @@ fi
 
 log "State directory: ${STATE_DIR}"
 mkdir -p "${STATE_DIR}"
-chown "${SERVICE_USER}:${SERVICE_USER}" "${STATE_DIR}"
+chown -R "${SERVICE_USER}:${SERVICE_USER}" "${STATE_DIR}"
 chmod 750 "${STATE_DIR}"
 
 # ---- C. deploy source ------------------------------------------------------

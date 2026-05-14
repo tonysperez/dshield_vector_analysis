@@ -90,11 +90,12 @@ def _emit_session_cluster_playbook(nodes: list, edges: list, sid: str, senr: dic
     """Attach the session's cluster pill and (if named) its playbook node.
 
     A playbook is the LLM-named group of 1+ HDBSCAN session clusters. The
-    playbook node id is the stable `playbook_id` value
-    (`sescl-<run_id>-pg<N>`). Sessions from a merged playbook still emit
-    their own per-cluster pill, so the graph shows the playbook node wired
-    to each constituent cluster. Two playbooks with the same display name
-    are distinct because they have different ids.
+    playbook node id is the stable `playbook_id` value (`sescl-<16hex>`,
+    content-hashed over the sorted member-session-id set). Sessions from a
+    merged playbook still emit their own per-cluster pill, so the graph
+    shows the playbook node wired to each constituent cluster. Two
+    playbooks with the same display name are distinct because they have
+    different ids.
     """
     nid_s = _nid("session", sid)
     scid = (senr.get("cluster") or {}).get("id")

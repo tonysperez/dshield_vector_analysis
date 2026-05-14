@@ -201,10 +201,14 @@ def _build_ip_to_playbooks(es: Elasticsearch, sessions_idx: str) -> dict[str, di
         ip  = (src.get("source") or {}).get("ip")
         sid = (src.get("cowrie") or {}).get("session_id")
         senr = (src.get("dshield", {}).get("cowrie", {}).get("enrichment", {}).get("session") or {})
-        # The canonical playbook id (`sescl-<run_id>-pg<N>`) — stable across
-        # the codebase. Multiple HDBSCAN clusters can map to one playbook
-        # (cluster merge at name time), and `cluster.id` alone is run-scoped,
-        # so anchoring on playbook_id is the only correct cross-IP identity.
+        # The canonical playbook id (`sescl-<16hex>`, a SHA-256 over the
+        # sorted member session ids — see _make_playbook_id). Multiple
+        # HDBSCAN clusters can map to one playbook (cluster merge at name
+        # time), and `cluster.id` alone is run-scoped, so anchoring on
+        # playbook_id is the only correct cross-IP identity. The
+        # content-hashed form means re-clustering preserves the id when
+        # membership is unchanged — so campaign ids (which fingerprint
+        # sorted playbook-id sets, below) survive across runs too.
         pid  = senr.get("playbook_id")
         if not ip or not pid:
             continue

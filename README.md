@@ -666,7 +666,7 @@ One doc per `source.ip`, built by aggregating across all of that IP's session do
 
 **Playbook layer** (`name playbooks`)
 
-`name playbooks` prompts the **local** LLM (never cloud) with sample commands from each non-outlier session cluster and writes a 3-5 word `playbook_name` — e.g. "XMRig Mining Dropper", "Mirai Botnet Variant", "Go SSH Credential Spray" — plus a stable `playbook_id` (`sescl-<run_id>-<cluster_id>`) to both the cluster centroid doc and every member session doc.
+`name playbooks` prompts the **local** LLM (never cloud) with sample commands from each non-outlier session cluster and writes a 3-5 word `playbook_name` — e.g. "XMRig Mining Dropper", "Mirai Botnet Variant", "Go SSH Credential Spray" — plus a stable `playbook_id` (`sescl-<16hex>`, a SHA-256 prefix over the sorted member-session-id set) to both the cluster centroid doc and every member session doc. The content-addressed form means a re-run with identical playbook membership produces the identical id, so downstream pivots (campaign ids especially, which fingerprint the sorted playbook-id set) don't churn across re-clusterings.
 
 **Campaign layer** (`mine campaigns`)
 
@@ -1067,7 +1067,7 @@ One doc per completed Cowrie session. Doc `_id` = `cowrie.session_id`. Written b
 | `dshield.cowrie.enrichment.session.cluster.novelty_score` | float | Session-level novelty: `1 - max_cosine_sim` to nearest session cluster centroid |
 | `dshield.cowrie.enrichment.session.cluster.is_outlier` | boolean | True when HDBSCAN assigned label `-1` |
 | `dshield.cowrie.enrichment.session.cluster.scored_at` | date | Timestamp of the `cluster sessions` run that wrote these fields |
-| `dshield.cowrie.enrichment.session.playbook_id` | keyword | Stable playbook primary key (`sescl-<run_id>-<cluster_id>`); written by `name playbooks` |
+| `dshield.cowrie.enrichment.session.playbook_id` | keyword | Stable playbook primary key (`sescl-<16hex>`, SHA-256 prefix over the sorted member-session-id set); written by `name playbooks`. Content-addressed: identical playbook membership across runs yields the identical id |
 | `dshield.cowrie.enrichment.session.playbook_name` | keyword | LLM-generated playbook label (written by `name playbooks`). Same value is on the cluster centroid doc in the session-clusters index |
 
 ### IP rollup index fields (Phase 4b)

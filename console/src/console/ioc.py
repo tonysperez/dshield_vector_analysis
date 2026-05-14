@@ -21,7 +21,8 @@ TYPES = (
     "command",          # by hash (canonical command identifier)
     "command_hash",     # alias for command, kept for clarity in URLs
     "playbook",         # named group of 1+ session clusters — anchored by
-                        # playbook_id (`sescl-<run_id>-pg<N>`).
+                        # playbook_id (`sescl-<16hex>`, content-hashed over
+                        # the sorted member-session-id set).
     "campaign",         # multi-session pattern mined by `mine campaigns`
                         # — anchored by campaign_id (`cmp-bhv-...` / `cmp-inf-...`).
     "command_cluster",

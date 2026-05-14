@@ -96,7 +96,7 @@ POST /api/ask                      # natural-language Q&A backed by the parent p
 Where `type` ∈ `ip session command command_hash playbook campaign
 command_cluster session_cluster ip_cluster asn country mitre_technique
 mitre_tactic`. `playbook` is the LLM-named session cluster (anchored by
-`playbook_id` = `sescl-<run>-<cluster>`); `campaign` is the multi-session
+`playbook_id` = `sescl-<16hex>`, content-hashed over the member-session-id set); `campaign` is the multi-session
 pattern mined by `mine campaigns` (anchored by `campaign_id` =
 `cmp-bhv-…` / `cmp-inf-…`).
 

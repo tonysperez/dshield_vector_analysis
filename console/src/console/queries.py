@@ -387,7 +387,8 @@ def list_campaigns(
 def lookup_playbook(
     es: Elasticsearch, cfg: AppConfig, playbook_id: str,
 ) -> dict:
-    """Look up a playbook by its stable id (`sescl-<run_id>-pg<N>`).
+    """Look up a playbook by its stable id (`sescl-<16hex>`, content-hashed
+    over the sorted member-session-id set; see `_make_playbook_id`).
 
     A playbook may be backed by one or more session-cluster centroid docs
     (HDBSCAN clusters merged by `session.playbook_merge_threshold` at name
