@@ -1,0 +1,47 @@
+[Unit]
+Description=DShield Prism forward pass — incremental enrichment and rollups (watermark-driven)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=dshield_prism
+Group=dshield_prism
+WorkingDirectory=/opt/dshield_prism
+EnvironmentFile=/opt/dshield_prism/.env
+
+# Mutex with the backward pass — they both touch the SQLite cache and the
+# enriched-commands index. flock blocks (no -n) so a 30-min firing waits
+# rather than skipping when the heavier backward pass is in flight.
+ExecStartPre=/usr/bin/flock /var/lib/dshield_prism/.lock /bin/true
+
+# Hard-fail on local LLM unreachable — the forward pass is dominated by
+# `enrich`, which calls the LLM on every cache-miss command. No `-` prefix
+# = unit fails fast and gets retried next cycle.
+ExecStartPre=/opt/dshield_prism/.venv/bin/python -m enrich.cli --config /opt/dshield_prism/config/default.yaml healthcheck --scope llm
+
+# Forward-looking steps only. Each reads from a watermark and only
+# touches new data. Idempotent — safe to repeat at any cadence.
+# enrich is required (every downstream step needs its output); rollups
+# use `-` so a transient failure logs but doesn't kill the unit.
+ExecStart=/usr/bin/flock /var/lib/dshield_prism/.lock /opt/dshield_prism/.venv/bin/python -m enrich.cli --config /opt/dshield_prism/config/default.yaml enrich
+ExecStart=-/usr/bin/flock /var/lib/dshield_prism/.lock /opt/dshield_prism/.venv/bin/python -m enrich.cli --config /opt/dshield_prism/config/default.yaml rollup sessions
+ExecStart=-/usr/bin/flock /var/lib/dshield_prism/.lock /opt/dshield_prism/.venv/bin/python -m enrich.cli --config /opt/dshield_prism/config/default.yaml rollup ips
+
+StandardOutput=journal
+StandardError=journal
+
+# 2h ceiling — a healthy forward pass takes seconds to minutes on this
+# corpus; 2h is just a circuit-breaker against a stuck process.
+TimeoutStartSec=2h
+Nice=10
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/dshield_prism
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

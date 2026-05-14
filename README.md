@@ -31,7 +31,7 @@ Output is structured, timestamped, and queryable the same way any other ECS data
 | **1 - Command enrichment (local LLM)** | implemented | Per-unique-command doc with description, intent, MITRE IDs, IOCs, embedding, confidence. SQLite cache + watermark for incremental runs |
 | **2 - Cloud escalation** | implemented | Selectively route hard / novel / low-confidence commands to Claude for better labels. Daily $$ budget cap. Triage reasons logged on each escalated doc |
 | **3 - Clustering + novelty** | implemented | HDBSCAN over command embeddings; populates `dshield.cowrie.enrichment.cluster.{id, novelty_score, is_outlier}`. "Show me everything weird this week" becomes one query. Also feeds the `novel_embedding` triage rule in Phase 2 |
-| **3+ - Smarter embeddings + scalar augmentation** | implemented | Embedding is now the final step (after all LLM calls). Embed text includes LLM-generated context (intent, tactic IDs, technique IDs, description) prepended to the raw command. Four behavioral scalars (occurrence count, unique source IPs, LLM confidence, session reuse rate) are appended to the HDBSCAN matrix as a weighted block. `embed_version` in cache key; `reembed` command to update vectors without re-running the LLM |
+| **3+ - Smarter embeddings + scalar augmentation** | implemented | Embedding is now the final step (after all LLM calls). Embed text includes LLM-generated context (intent, tactic IDs, technique IDs, description) prepended to the raw command. Four behavioral scalars (occurrence count, unique source IPs, LLM confidence, session reuse rate) are appended to the HDBSCAN matrix as a weighted block. Auto-derived `embed_config_hash` in the cache key (no manual version bumps); `reembed` command refreshes vectors without re-running the LLM. |
 | **4 - Session + IP rollup, clustering, playbook naming, campaign mining** | implemented | One doc per completed session (mean-pooled command embedding, behavioral stats, cluster ID, novelty score). One doc per source IP (aggregated across sessions, own embedding + clustering). The LLM names each session cluster — a **playbook** — with a short label ("XMRig mining dropper", "Mirai botnet variant", etc.). Frequent-itemset + shared-artifact miners then identify multi-session **campaigns** spanning multiple playbooks/IPs. See [`docs/PLAYBOOKS_AND_CAMPAIGNS.md`](docs/PLAYBOOKS_AND_CAMPAIGNS.md). |
 | **5 - Eval + monitoring** | planned | Hand-labeled regression set; weekly F1 against ground truth; structured worker logs to ES; alerts on budget / drift / failure rate |
 
@@ -114,8 +114,8 @@ The worker only **reads** from the SO-managed Cowrie events index. All enrichmen
 | `console/` | Standalone, read-only investigation GUI (FastAPI + Cytoscape.js) — see [`console/README.md`](console/README.md) |
 | `docs/pipeline.md` | Mermaid flowcharts of the full enrichment / rollup / clustering pipeline |
 | `docs/PLAYBOOKS_AND_CAMPAIGNS.md` | Reference doc for the two higher-level abstractions over the raw stream |
-| `systemd/dshield_prism-ingest.service` + `.timer` | Hourly oneshot: `enrich` + `rollup sessions` |
-| `systemd/dshield_prism-analytics.service` + `.timer` | 6-hourly oneshot: `cluster commands` + `escalate` + `cluster sessions` + `name playbooks` + `rollup ips` + `cluster ips` + `mine campaigns` |
+| `systemd/dshield_prism-forward.service` + `.timer` | **Every 30 min** oneshot, watermark-driven: `healthcheck --scope llm` (hard fail) → `enrich` → `rollup sessions` → `rollup ips`. The "forward pass" — only touches new data. |
+| `systemd/dshield_prism-backward.service` + `.timer` | **Every 6 h** oneshot, full-corpus refresh: `re-enrich-stale` → `reembed` → `reset --session-watermark --ip-watermark` → `rollup sessions` → `rollup ips` → `cluster commands` → `cluster sessions` → `cluster ips` → `escalate` → `name playbooks` → `mine campaigns`. The "backward pass" — catches config drift and refreshes downstream artifacts. Serialised with the forward pass via `flock /var/lib/dshield_prism/.lock`. |
 | `scripts/setup-security-onion-node.sh` | One-shot, idempotent SO-box installer |
 | `.env.example` | Secrets template (copy to `.env`) |
 | `.gitignore` | Excludes `.env`, `config/local.yaml`, `config/local.yml`, `*.sqlite`, `__pycache__` |
@@ -142,11 +142,14 @@ The CLI groups verbs by layer: `<verb> [<layer>] [--source <source>]`. Every lay
 | `enrich` | Phase 1: one enrichment pass — read new command events, dedup, LLM-classify, embed, bulk-write, advance command watermark. |
 | `enrich --dry-run` | Read + group events, print stats; skip LLM and writes. |
 | `enrich --no-cloud` | Force-disable Phase 2 cloud escalation for this run, even if `cloud.enabled=true` in config. |
+| `enrich --ignore-config-hash` | Per-run override of `worker.cache_auto_invalidate`. Treat the cache as fresh through a prompt/cooccurrence config edit. Useful when LLM budget is tight. Same flag on `reembed` and `pipeline`. |
+| `bless-cache` | Stamp every legacy cache row (rows missing `llm_config_hash` or `embed_config_hash`) with the current auto-derived hashes, so the next `enrich` treats them as fresh under the live config. One-shot admin op — use after deploying a hash-affecting change when the cached enrichments are known to still be correct. `--dry-run` reports what would be stamped. |
 | `cluster commands` | Phase 3: pull all command embeddings, run HDBSCAN, compute novelty scores, bulk-update cluster fields on every command doc, write centroid docs to the command-clusters index. |
 | `cluster sessions` | Phase 4: HDBSCAN over session embeddings (augmented with session-level scalars). Writes `dshield.cowrie.enrichment.session.cluster.*` to each session doc and centroid docs to the session-clusters index. Requires `.[cluster]` extras. |
 | `cluster ips` | Phase 4b: HDBSCAN over IP embeddings (augmented with IP-level scalars). Writes `dshield.cowrie.enrichment.ip.cluster.*` to each IP doc and centroid docs to the IP-clusters index. Requires `.[cluster]` extras. |
 | `cluster <layer> --dry-run` | Fetch + cluster without writing anything to ES. Prints stats (`n_clusters`, `n_outliers`, runtime). |
-| `reembed` | Re-embed all command docs using their stored enrichment fields (intent, tactics, techniques, description) — no LLM generation. Use after changing `llm.embed_context` or bumping `llm.embed_version`. Updates the SQLite cache to the new `embed_version` so the next `enrich` run skips the LLM for already-enriched commands. Follow with `cluster commands` to rebuild centroids from the new vectors. |
+| `reembed` | Re-embed all command docs using their stored enrichment fields (intent, tactics, techniques, description) — no LLM generation. Use after changing `llm.embed_context`, `llm.embedding_model`, or `cooccurrence.embed_cooccurrence` (anything that affects `embed_config_hash` but not the LLM side). Bulk-loads cached hashes up front and **skips docs whose stored `embed_config_hash` already matches live** — running `reembed` when nothing has changed is a near-no-op. Updates only `embed_config_hash` on each cache row — `llm_config_hash` is preserved, so a stale LLM prompt can't be silently blessed by an embed-only refresh. Follow with `cluster commands` to rebuild centroids from the new vectors. |
+| `re-enrich-stale` | LLM-side mirror of `reembed`. Walks the commands index, finds cache rows whose `llm_config_hash` is stale (e.g. after a prompt edit), re-calls the **local** LLM with the live prompt + sibling block, and patches the doc's intent / tactics / techniques / description / confidence / iocs / embedding. Skips rows whose hash already matches live — cheap no-op when nothing has changed. Burns LLM time per stale doc when prompts or LLM-side cooccurrence config have actually drifted. Doesn't run cloud escalation — `escalate` is the separate step that picks up novel / low-confidence docs after re-enrichment. |
 | `reembed --dry-run` | Count docs that would be re-embedded without calling the embedding model or writing to ES. |
 | `escalate` | Cloud-escalate locally-enriched docs where `novelty_score ≥ novel_embedding_threshold` AND `novel_confidence_min ≤ confidence ≤ escalate_confidence_max`. The lower confidence bound gates out encoding-artifact noise (raw bytes that score novelty=1.0 with confidence=1) — those are already routed by the `low_confidence` rule and don't need to be re-counted. Queries ES directly — no watermark, no cache — so it catches docs enriched in any previous run. Already cloud-enriched docs are never re-escalated. Run after each `cluster commands` pass. |
 | `escalate --dry-run` | Count candidates matching both filters without making cloud calls or writes. |
@@ -162,7 +165,7 @@ The CLI groups verbs by layer: `<verb> [<layer>] [--source <source>]`. Every lay
 | `pipeline --force --yes` | **Destructive.** Before running, deletes every processed ES index (commands, command_clusters, sessions_rollup, session_clusters, ips_rollup, ip_clusters, campaigns), recreates them from their mappings, and clears the SQLite cache + watermark. The raw `sessions_raw` index is left alone. `--yes` skips the confirmation prompt. |
 | `pipeline --dry-run` | Print the step plan and pass `--dry-run` to each step. With `--force` also prints what would be wiped without wiping. |
 | `budget` | Print today's cloud-LLM spend, daily cap, calls, token totals (Phase 2). |
-| `reset` | Clear local SQLite state. Default: cache + watermark. Flags: `--cache`, `--watermark`, `--all`, `--yes` (skip confirmation). **Clears the command watermark only** — session and IP watermarks are separate keys in the same table and are NOT cleared by `reset`. See [Phase 4 — operational notes](#phase-4--operational-notes) for how to reset them individually. Does NOT touch ES. |
+| `reset` | Clear local SQLite state. Default (no flag): cache + all watermarks. Combinable flags: `--cache`, `--watermark` (all watermarks), `--all` (synonym for default), `--session-watermark` (just the session-rollup key), `--ip-watermark` (just the IP-rollup key), `--yes` (skip confirmation). The specific watermark flags are what the backward systemd pass uses to force a full re-rollup after `reembed` changes upstream command embeddings — they're idempotent and don't touch ES. |
 
 **Playbook naming uses the local LLM only.** `name playbooks` calls `generate_json(prompt, ...)` against the local LLM and never escalates to cloud, regardless of `cloud.enabled`. Reason: the output is 3-5 words and naming consistency across runs matters more than per-call quality. Prompt template: `config/prompts/playbook_name.txt`. The multi-session `mine campaigns` step is purely algorithmic — no LLM involvement.
 
@@ -386,18 +389,25 @@ The first run can take hours depending on history size and unique-command count.
 
 Subsequent runs only see new events past the watermark and hit the cache for repeats.
 
-### 9. Install + enable systemd timer
+### 9. Install + enable systemd timers
+
+Two timers ship in the repo. Both copy + enable identically:
 
 ```bash
-sudo cp /opt/dshield_prism/systemd/dshield_prism-ingest.service /etc/systemd/system/
-sudo cp /opt/dshield_prism/systemd/dshield_prism-ingest.timer   /etc/systemd/system/
+sudo cp /opt/dshield_prism/systemd/dshield_prism-forward.service  /etc/systemd/system/
+sudo cp /opt/dshield_prism/systemd/dshield_prism-forward.timer    /etc/systemd/system/
+sudo cp /opt/dshield_prism/systemd/dshield_prism-backward.service /etc/systemd/system/
+sudo cp /opt/dshield_prism/systemd/dshield_prism-backward.timer   /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now dshield_prism-ingest.timer
+sudo systemctl enable --now dshield_prism-forward.timer dshield_prism-backward.timer
 
 # Verify
-systemctl list-timers dshield_prism-ingest.timer
-journalctl -u dshield_prism-ingest.service -n 200 --no-pager
+systemctl list-timers 'dshield_prism-*.timer'
+journalctl -u dshield_prism-forward.service -n 200 --no-pager
+journalctl -u dshield_prism-backward.service -n 200 --no-pager
 ```
+
+The two units serialise on `flock /var/lib/dshield_prism/.lock` — whichever fires second blocks on the lock until the first finishes, so they never trample each other.
 
 ### 10. Quick Kibana sanity
 
@@ -432,7 +442,7 @@ Off by default. Phase 1 must already be running and producing docs. To turn it o
    ```bash
    sudo -u dshield_prism .venv/bin/python -m enrich.cli init-indexes --update-mapping --layer commands
    ```
-4. **Bump `worker.prompt_version`** (default `v4`) and `reset --cache --yes` if you want previously-cached commands re-evaluated through the new triage path.
+4. If you want previously-cached commands re-evaluated through the new triage path: either run `reset --cache --yes` to wipe the cache, or edit a prompt file (the auto-derived `llm_config_hash` will invalidate every cached row on the next `enrich`).
 5. **Healthcheck** — confirms Anthropic reachability + budget:
    ```bash
    sudo -u dshield_prism .venv/bin/python -m enrich.cli healthcheck
@@ -458,7 +468,7 @@ Off by default. Phase 1 must already be running and producing docs. To turn it o
 
 **Cost control:** every cloud call's input + output tokens are converted to USD via `cloud.pricing.{input,output}_per_mtok` and tallied per UTC day in SQLite. Once the day's spend ≥ `cloud.daily_budget_usd`, further escalations are skipped (the doc still gets the local-only enrichment, with `triage_reasons: ["…", "budget_exhausted"]`). Update `pricing` if you change models — the defaults track Claude Sonnet 4.6 and may not match your model.
 
-**Cache semantics:** a successful local-only enrichment is cached with key `(short_hash, generation_model, prompt_version, embed_version)`. A cloud rewrite of that same hash is also cached under the same key. `local_failed` results without a cloud rescue stay uncached so they retry next run. Bump `worker.prompt_version` when either LLM prompt changes; bump `llm.embed_version` when `llm.embed_context` changes (see Phase 3+).
+**Cache semantics:** a successful local-only enrichment is cached with key `(short_hash, generation_model, llm_config_hash, embed_config_hash)`. A cloud rewrite of that same hash is also cached under the same key. `local_failed` results without a cloud rescue stay uncached so they retry next run. Both hashes are auto-derived from config — see Phase 3+ for what's in each, and ROADMAP issue #7 for the design rationale.
 
 ---
 
@@ -512,15 +522,15 @@ Stats include `docs_updated`, `cluster_docs_written`, and `runtime_seconds`. Aft
 
 ### 5. Schedule it
 
-The setup script installs `dshield_prism-analytics.timer`, which runs the full analytics chain (`cluster commands` → `escalate` → `cluster sessions` → `name playbooks` → `rollup ips` → `cluster ips` → `mine campaigns`) every 6 hours at 00:00, 06:00, 12:00, and 18:00 UTC (with up to 5 minutes of random jitter). No cron entry needed.
+The setup script installs `dshield_prism-backward.timer`, which runs the full backward chain (`re-enrich-stale` → `reembed` → reset rollup watermarks → re-rollup → `cluster commands` → `cluster sessions` → `cluster ips` → `escalate` → `name playbooks` → `mine campaigns`) every 6 hours at 00:00, 06:00, 12:00, and 18:00 UTC (with up to 10 minutes of random jitter). No cron entry needed.
 
 To monitor it:
 ```bash
-journalctl -fu dshield_prism-analytics.service
-systemctl list-timers dshield_prism-analytics.timer
+journalctl -fu dshield_prism-backward.service
+systemctl list-timers dshield_prism-backward.timer
 ```
 
-Every step except `cluster commands` is declared with a `-` prefix in the service unit so its failure (e.g. `cloud.enabled=false` for `escalate`, or `[cluster]` extras missing) does not fail the unit — `cluster commands` is required because every downstream step depends on its novelty scores.
+Every step except `cluster commands` is declared with a `-` prefix in the service unit so its failure (e.g. `cloud.enabled=false` for `escalate`, or `[cluster]` extras missing) does not fail the unit — `cluster commands` is required because every downstream step depends on its novelty scores. `re-enrich-stale` and `reembed` are no-ops in steady state (they skip rows whose hashes are already current), so their presence in the chain is essentially free unless config has drifted since the last run.
 
 `escalate` is also safe to re-run at any time: it only touches `event.provider: "local"` docs, so already cloud-escalated docs are never re-processed. If the daily budget is exhausted mid-run, it stops cleanly and picks up from the most novel remaining candidates next run.
 
@@ -591,18 +601,18 @@ llm:
     - tactics
     - techniques
     - description
-  embed_version: "v3"  # bump whenever embed_context changes
 ```
 
-Set `embed_context: []` to revert to pre-Phase-3+ behavior (raw command only). Any change to `embed_context` must be accompanied by a bump to `embed_version` so cached docs are re-embedded. The co-occurrence siblings (see `cooccurrence:` block in `config/default.yaml`) are also appended to the embed input when `cooccurrence.embed_cooccurrence` is true — toggling that flag is another reason to bump `embed_version`.
+Set `embed_context: []` to revert to pre-Phase-3+ behavior (raw command only). Changes to `embed_context`, `embedding_model`, or `cooccurrence.embed_cooccurrence` flow into `embed_config_hash` automatically — no manual version bump.
 
-**`embed_version` and the cache key:** `embed_version` is part of the enrichment cache key alongside `generation_model` and `prompt_version`. Existing cache rows created against an older version will be treated as cache misses on the first run with the new version.
+**`embed_config_hash` and the cache key:** the auto-derived `embed_config_hash` is part of the cache key alongside `generation_model` and `llm_config_hash`. Existing cache rows created under a different hash are treated as cache misses on the first run. Use `bless-cache` to stamp legacy rows if the cached enrichments are known still-correct under the current config.
 
 **Migration** (run once when upgrading an existing deployment):
 
 ```bash
 # Re-embed all docs using stored enrichment fields — no LLM calls.
-# Updates SQLite cache entries to the new embed_version so next enrich skips the LLM.
+# Updates the cache row's embed_config_hash so next enrich skips the LLM
+# (llm_config_hash is preserved so a stale LLM prompt can't be silently blessed).
 sudo -u dshield_prism .venv/bin/python -m enrich.cli reembed
 
 # Rebuild cluster centroids from the new vectors.
@@ -856,22 +866,31 @@ If your index names differ from the defaults, edit the imported data views after
 
 **Step 13 — Add to the recurring schedule**
 
-The two systemd units shipped in `systemd/` already cover the full cadence — no manual edits required if you used `scripts/setup-security-onion-node.sh`. For reference, the chain is:
+The two systemd units shipped in `systemd/` already cover the full cadence — no manual edits required if you used `scripts/setup-security-onion-node.sh`. The split mirrors the conceptual divide: **forward-looking** verbs (watermark-driven, only touch new data) run frequently; **backward-looking** verbs (full-corpus recompute) run periodically. For reference, the chains are:
 
 ```
-# Hourly (dshield_prism-ingest.service)
+# Every 30 min (dshield_prism-forward.service) — forward-looking, watermark-driven
+healthcheck --scope llm        (hard fail = whole pass skipped)
 enrich
 rollup sessions
-
-# 6-hourly (dshield_prism-analytics.service)
-cluster commands
-escalate                       (skipped if cloud disabled or budget exhausted)
-cluster sessions               (requires .[cluster] extras)
-name playbooks
 rollup ips
+
+# Every 6 h (dshield_prism-backward.service) — backward-looking, full-corpus
+healthcheck --scope llm        (soft check; most steps don't need the LLM)
+re-enrich-stale                (LLM-side cache-hash drift; near-no-op when fresh)
+reembed                        (embed-side cache-hash drift; near-no-op when fresh)
+reset --session-watermark --ip-watermark --yes  (force full re-rollup)
+rollup sessions                (re-pool with fresh command embeddings)
+rollup ips
+cluster commands               (required; downstream depends on its novelty)
+cluster sessions               (requires .[cluster] extras)
 cluster ips                    (requires .[cluster] extras)
+escalate                       (skipped if cloud disabled or budget exhausted)
+name playbooks
 mine campaigns
 ```
+
+The two units serialise on `flock /var/lib/dshield_prism/.lock` — whichever fires second blocks on the lock until the first finishes.
 
 If you maintain custom unit files instead, add each step as an additional `ExecStart=` line — systemd runs them sequentially inside a oneshot service. Every step except the first `cluster commands` is declared with the `-` prefix so a transient failure (cloud disabled, LLM unreachable, etc.) doesn't fail the whole unit.
 
@@ -893,7 +912,7 @@ sudo systemctl daemon-reload
 
 Run `sqlite3 /var/lib/dshield_prism/state.sqlite` to open the SQLite shell.
 
-**Re-rollup after enrichment changes** — if you bump `prompt_version` and re-enrich (changing intent, novelty, or confidence in the enrichment docs), session and IP docs become stale. Full refresh:
+**Re-rollup after enrichment changes** — if you edit a prompt or LLM-side cooccurrence config and re-enrich (changing intent, novelty, or confidence in the enrichment docs), session and IP docs become stale. Full refresh:
 
 ```bash
 # sqlite3 /var/lib/dshield_prism/state.sqlite
@@ -1013,7 +1032,9 @@ The doc shape is ECS-compliant: standard fields under `event.*`, `process.*`, `o
 | `dshield.cowrie.enrichment.intent` | keyword | Custom enum (no ECS equivalent) |
 | `dshield.cowrie.enrichment.confidence` | byte | Integer 1-10, LLM self-rated; see prompt for anchors |
 | `dshield.cowrie.enrichment.model` | keyword | LLM model identifier |
-| `dshield.cowrie.enrichment.prompt_version` | keyword | Bump to invalidate cache |
+| `dshield.cowrie.enrichment.llm_config_hash` | keyword | Auto-derived: SHA-256 prefix over prompt-file content + LLM-side cooccurrence params. Changes invalidate the LLM side of the cache (forces re-enrichment). |
+| `dshield.cowrie.enrichment.embed_config_hash` | keyword | Auto-derived: SHA-256 prefix over `llm.embed_context`, `llm.embedding_model`, and `cooccurrence.embed_cooccurrence`. Changes invalidate only the embed side — `reembed` can refresh without an LLM call. |
+| `dshield.cowrie.enrichment.prompt_version` | keyword | Legacy (pre-ROADMAP-#7 docs only). New writes use `llm_config_hash` / `embed_config_hash` instead. |
 | `dshield.cowrie.enrichment.occurrence_count` | long | Total events for this command |
 | `dshield.cowrie.enrichment.unique_sessions` | long | Distinct cowrie session IDs |
 | `dshield.cowrie.enrichment.unique_source_ips` | long | Distinct attacker IPs |
@@ -1116,7 +1137,7 @@ Note: Kibana's `_score` field is the ES query relevance score — not a severity
 
 ## Operational notes
 
-- **Cache key** = `(short_command_hash, generation_model, prompt_version, embed_version)`. Bump `worker.prompt_version` after prompt edits (forces LLM re-enrichment + re-embedding). Bump `llm.embed_version` after changing `llm.embed_context`, then run `reembed` to update vectors without re-running the LLM.
+- **Cache key** = `(short_command_hash, generation_model, llm_config_hash, embed_config_hash)`. Both hashes are auto-derived from config — no manual bumps. Prompt-file or LLM-side cooccurrence edits flip `llm_config_hash` → next `enrich` re-runs the LLM. `embed_context` / `embedding_model` / `embed_cooccurrence` edits flip only `embed_config_hash` → `reembed` refreshes vectors without an LLM call. Toggle off with `worker.cache_auto_invalidate: false` or per-run `--ignore-config-hash`. See ROADMAP #7.
 - **Watermarks** — there are three, all in SQLite (`/var/lib/dshield_prism/state.sqlite`):
   - `last_processed_at` — command watermark, advanced by `enrich`. Cleared by `reset --watermark`.
   - `session_last_processed_at` — session watermark, advanced by `rollup sessions`. **Not** cleared by `reset`. To reset: `DELETE FROM watermark WHERE key = 'session_last_processed_at';` via `sqlite3`.
@@ -1130,7 +1151,7 @@ Note: Kibana's `_score` field is the ES query relevance score — not a severity
   sudo -u dshield_prism .venv/bin/python -m enrich.cli reset --yes
   ```
 - **Index management**: SO 2.x manages its own indices but does NOT touch the enrichment or sessions indices. Add an ILM policy if you want rollover/retention; not required for Phase 1-4 volumes (likely <1GB/year combined).
-- **Provider switch**: changing `llm.provider` mid-stream is fine — but bump `prompt_version` so cached results from the old provider get re-run if you want consistency.
+- **Provider switch**: changing `llm.provider` or `llm.generation_model` mid-stream is fine — the `model` column in the cache key already differentiates, so cached results from the old generation model are treated as cache misses.
 
 ## Troubleshooting
 
@@ -1144,7 +1165,7 @@ Note: Kibana's `_score` field is the ES query relevance score — not a severity
 | `enriched_failed` high | LLM returning malformed JSON. Check raw output in journal logs; tune the prompt or move to a stronger model |
 | `chat 400: 'response_format.type' must be 'json_schema' or 'text'` | LM Studio rejects `json_object`. Already handled by passing the Pydantic schema as `json_schema` — make sure you are on the latest code |
 | `dense_vector` mapping conflict on first write | Index was auto-created by a write before `init-indexes` ran. Delete the index and re-run `init-indexes --layer commands` (or whichever layer is affected) |
-| Worker hangs on first run | Generation slow on cold model. Check `journalctl -fu dshield_prism-ingest.service`; service has `TimeoutStartSec=2h` |
+| Worker hangs on first run | Generation slow on cold model. Check `journalctl -fu dshield_prism-forward.service`; service has `TimeoutStartSec=2h` |
 | `rollup sessions` → `closed_sessions_found: 0` | No `cowrie.session.closed` events in the events index, or wrong index pattern. Verify: `GET <events_index>/_count {"query":{"term":{"event.action":"cowrie.session.closed"}}}` |
 | `sessions_with_embedding` much lower than `sessions_built` | Most sessions are pure credential spray with no commands — this is expected. For sessions that did have commands, run `enrich` first, then re-run `rollup sessions`. Session docs overwrite idempotently. |
 | `cluster sessions` → `skipped_too_few` | Fewer session docs with embeddings than `session.cluster_min_cluster_size` (default 3). Either run more `rollup sessions` passes after `enrich`, or lower `cluster_min_cluster_size` in `local.yaml`. |

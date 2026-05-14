@@ -20,7 +20,10 @@ from pydantic import ValidationError
 from elasticsearch import Elasticsearch
 
 from ...cache import StateDB
-from ...config import AppConfig, Secrets, load_prompt, CommandClusterConfig
+from ...config import (
+    AppConfig, Secrets, CommandClusterConfig,
+    compute_embed_config_hash, compute_llm_config_hash, load_prompt,
+)
 from ...es_client import bulk_write, init_index, make_client
 from ...llm import make_llm_client
 from ...llm.schemas import CommandEnrichment, CloudCommandEnrichment
@@ -37,6 +40,33 @@ _REEMBED_SCRIPT = (
     "if (ctx._source.dshield.cowrie == null) { ctx._source.dshield.cowrie = [:]; }"
     "if (ctx._source.dshield.cowrie.enrichment == null) { ctx._source.dshield.cowrie.enrichment = [:]; }"
     "ctx._source.dshield.cowrie.enrichment.embedding = params.embedding;"
+    "ctx._source.dshield.cowrie.enrichment.embed_config_hash = params.embed_config_hash;"
+)
+
+# Painless: re-enrich stale rows. Overwrites the LLM-derived fields
+# (intent/tactics/techniques/description/confidence/embedding/iocs/model)
+# and the two auto-hashes; leaves event-derived fields (occurrence_count,
+# unique_sessions, etc.) and the cluster.* block untouched. ROADMAP #7.5.
+_REENRICH_SCRIPT = (
+    "if (ctx._source.event == null) { ctx._source.event = [:]; }"
+    "ctx._source.event.provider = params.provider;"
+    "ctx._source.event.reason = params.description;"
+    "if (ctx._source.dshield == null) { ctx._source.dshield = [:]; }"
+    "if (ctx._source.dshield.cowrie == null) { ctx._source.dshield.cowrie = [:]; }"
+    "if (ctx._source.dshield.cowrie.enrichment == null) { ctx._source.dshield.cowrie.enrichment = [:]; }"
+    "def en = ctx._source.dshield.cowrie.enrichment;"
+    "en.intent = params.intent;"
+    "en.confidence = params.confidence;"
+    "en.model = params.model;"
+    "en.llm_config_hash = params.llm_config_hash;"
+    "en.embed_config_hash = params.embed_config_hash;"
+    "en.embedding = params.embedding;"
+    "if (ctx._source.threat == null) { ctx._source.threat = [:]; }"
+    "if (ctx._source.threat.tactic == null) { ctx._source.threat.tactic = [:]; }"
+    "if (ctx._source.threat.technique == null) { ctx._source.threat.technique = [:]; }"
+    "ctx._source.threat.tactic.id = params.tactics;"
+    "ctx._source.threat.technique.id = params.techniques;"
+    "ctx._source.threat.indicator = params.indicators;"
 )
 
 _WS_RE = re.compile(r"\s+")
@@ -201,7 +231,8 @@ def _build_ecs_doc(
     description: str,
     provider: str,
     model: str,
-    prompt_version: str,
+    llm_config_hash: str,
+    embed_config_hash: str,
     intent: str,
     confidence: int,
     tactics: list[str],
@@ -216,7 +247,8 @@ def _build_ecs_doc(
         "intent": intent,
         "confidence": confidence,
         "model": model,
-        "prompt_version": prompt_version,
+        "llm_config_hash": llm_config_hash,
+        "embed_config_hash": embed_config_hash,
         "occurrence_count": occurrence_count,
         "unique_sessions": unique_sessions,
         "unique_source_ips": unique_source_ips,
@@ -596,6 +628,25 @@ def run_enrich(cfg: AppConfig, secrets: Secrets, dry_run: bool = False, no_cloud
     commands_idx = cfg.elasticsearch.indexes.cowrie.commands
     events_idx = cfg.elasticsearch.indexes.cowrie.sessions_raw
 
+    # Auto-invalidating cache key components. Empty strings when the
+    # toggle is off — the cache then behaves like the pre-#7 key for
+    # this run. ROADMAP issue #7.
+    if cfg.worker.cache_auto_invalidate:
+        llm_config_hash = compute_llm_config_hash(cfg)
+        embed_config_hash = compute_embed_config_hash(cfg)
+        legacy = db.legacy_cache_row_count()
+        if legacy > 0:
+            log.info(
+                "cache: %d row(s) missing one or both auto-derived hashes "
+                "will be treated as miss and re-enriched. Run "
+                "`dshield_prism bless-cache` to stamp them with current "
+                "hashes instead if they're known good.",
+                legacy,
+            )
+    else:
+        llm_config_hash = ""
+        embed_config_hash = ""
+
     cloud_enabled = bool(cfg.cloud.enabled and not no_cloud and secrets.anthropic_api_key)
     cloud_prompt: Optional[str] = None
     cloud_client = None
@@ -706,7 +757,9 @@ def run_enrich(cfg: AppConfig, secrets: Secrets, dry_run: bool = False, no_cloud
 
     with make_llm_client(cfg.llm) as llm:
         for h, g in groups.items():
-            cached = db.is_cached(h, cfg.llm.generation_model, cfg.worker.prompt_version, cfg.llm.embed_version)
+            cached = db.is_cached(
+                h, cfg.llm.generation_model, llm_config_hash, embed_config_hash,
+            )
             if cached:
                 stats["cache_hits"] += 1
                 actions.append({
@@ -852,7 +905,8 @@ def run_enrich(cfg: AppConfig, secrets: Secrets, dry_run: bool = False, no_cloud
                 description=description,
                 provider=doc_provider,
                 model=doc_model,
-                prompt_version=cfg.worker.prompt_version,
+                llm_config_hash=llm_config_hash,
+                embed_config_hash=embed_config_hash,
                 intent=intent,
                 confidence=confidence,
                 tactics=tactics,
@@ -865,7 +919,10 @@ def run_enrich(cfg: AppConfig, secrets: Secrets, dry_run: bool = False, no_cloud
             )
             actions.append({"_op_type": "index", "_id": h, "_source": doc})
             if doc_provider in ("local", "claude"):
-                db.mark_cached(h, cfg.llm.generation_model, cfg.worker.prompt_version, cfg.llm.embed_version, now)
+                db.mark_cached(
+                    h, cfg.llm.generation_model,
+                    llm_config_hash, embed_config_hash, now,
+                )
 
             if len(actions) >= 50:
                 ok, errs = bulk_write(es, commands_idx, actions)
@@ -1205,15 +1262,33 @@ def run_reembed(cfg: AppConfig, secrets: Secrets, dry_run: bool = False) -> dict
     commands_idx = cfg.elasticsearch.indexes.cowrie.commands
     events_idx = cfg.elasticsearch.indexes.cowrie.sessions_raw
 
+    # Reembed touches only the embed side. We stamp `embed_config_hash`
+    # on each cache row (via mark_embed_cached) but leave
+    # `llm_config_hash` untouched — that way, if the LLM prompt has also
+    # changed and the user runs reembed first, the next enrich still
+    # sees a stale llm_config_hash and correctly re-runs the LLM.
+    # ROADMAP issue #7.
+    embed_config_hash = compute_embed_config_hash(cfg) if cfg.worker.cache_auto_invalidate else ""
+
     cooc_cfg = cfg.cooccurrence
     use_cooc = cooc_cfg.enabled and cooc_cfg.embed_cooccurrence
     total_sessions = (
         _fetch_total_session_count(es, events_idx) if use_cooc else 0
     )
 
+    # Skip-if-fresh: pull every cache row's stored embed_config_hash up
+    # front. If a doc's cached hash already matches the live hash, the
+    # embedding is current under this config — no need to redo it.
+    # Honors `cache_auto_invalidate`: when off, treat all docs as "needs
+    # work" (the embed_config_hash variable is "" so nothing will match
+    # anyway, but be explicit).
+    cached_embed_hashes: dict[str, str] = (
+        db.get_cached_embed_hashes() if cfg.worker.cache_auto_invalidate else {}
+    )
+
     log.info(
-        "re-embed: embed_context=%s embed_version=%s embed_cooccurrence=%s index=%s dry_run=%s",
-        cfg.llm.embed_context, cfg.llm.embed_version, use_cooc, commands_idx, dry_run,
+        "re-embed: embed_context=%s embed_config_hash=%s embed_cooccurrence=%s index=%s dry_run=%s",
+        cfg.llm.embed_context, embed_config_hash, use_cooc, commands_idx, dry_run,
     )
 
     stats: dict = defaultdict(int)
@@ -1225,6 +1300,17 @@ def run_reembed(cfg: AppConfig, secrets: Secrets, dry_run: bool = False) -> dict
             stats["docs_seen"] += 1
             if not doc["command"]:
                 stats["skipped_no_command"] += 1
+                continue
+
+            # Skip-if-fresh: cached embed hash matches live → no work to do.
+            # Only honored when auto-invalidate is on (otherwise the user
+            # asked to bypass the hash check, run unconditionally).
+            if (
+                cfg.worker.cache_auto_invalidate
+                and embed_config_hash
+                and cached_embed_hashes.get(doc["doc_id"]) == embed_config_hash
+            ):
+                stats["skipped_fresh"] += 1
                 continue
 
             parsed_stub = SimpleNamespace(
@@ -1265,17 +1351,14 @@ def run_reembed(cfg: AppConfig, secrets: Secrets, dry_run: bool = False) -> dict
                 "_id": doc["doc_id"],
                 "script": {
                     "source": _REEMBED_SCRIPT,
-                    "params": {"embedding": embedding},
+                    "params": {
+                        "embedding": embedding,
+                        "embed_config_hash": embed_config_hash,
+                    },
                 },
             })
 
-            db.mark_cached(
-                doc["doc_id"],
-                cfg.llm.generation_model,
-                cfg.worker.prompt_version,
-                cfg.llm.embed_version,
-                now,
-            )
+            db.mark_embed_cached(doc["doc_id"], embed_config_hash, now)
 
             if len(actions) >= 50:
                 ok, errs = bulk_write(es, commands_idx, actions)
@@ -1293,7 +1376,199 @@ def run_reembed(cfg: AppConfig, secrets: Secrets, dry_run: bool = False) -> dict
             log.warning("re-embed bulk errors (%d): %s", len(errs), errs[:2])
 
     db.close()
-    return dict(stats, dry_run=dry_run, embed_version=cfg.llm.embed_version)
+    return dict(stats, dry_run=dry_run, embed_config_hash=embed_config_hash)
+
+
+# ---------------------------------------------------------------------------
+# Re-enrich stale rows (LLM-side mirror of reembed)
+# ---------------------------------------------------------------------------
+
+def iter_docs_for_reenrich(
+    es: Elasticsearch,
+    index: str,
+    page_size: int = 200,
+) -> Iterator[dict]:
+    """Yield {doc_id, command_line} for every enriched-commands doc."""
+    body: dict = {
+        "size": page_size,
+        "_source": ["process.command_line"],
+        "query": {"exists": {"field": "process.command_line"}},
+        "sort": [{"@timestamp": "asc"}, {"_doc": "asc"}],
+    }
+    search_after = None
+    while True:
+        if search_after:
+            body["search_after"] = search_after
+        resp = es.search(index=index, **body)
+        hits = resp["hits"]["hits"]
+        if not hits:
+            return
+        for h in hits:
+            cmd = ((h["_source"].get("process") or {}).get("command_line") or "")
+            if cmd:
+                yield {"doc_id": h["_id"], "command_line": cmd}
+        search_after = hits[-1]["sort"]
+
+
+def run_reenrich_stale(cfg: AppConfig, secrets: Secrets, dry_run: bool = False) -> dict:
+    """Re-run the local LLM on every doc whose cached llm_config_hash is stale.
+
+    Mirror of `reembed` for the LLM side: walks the commands ES index,
+    consults the SQLite cache to find rows whose `llm_config_hash` !=
+    the live value (i.e. produced under an older prompt or
+    LLM-side cooccurrence config), re-calls the local LLM with the
+    current prompt + sibling block, computes a fresh embedding, and
+    patches the doc + cache. Rows whose cached llm_config_hash matches
+    live are skipped without an LLM call. ROADMAP issue #7.5.
+
+    Cloud escalation is NOT involved here. The separate `escalate` verb
+    handles re-routing newly-stale-low-confidence docs to the cloud.
+
+    When `cache_auto_invalidate=false` or there's no live hash, this is
+    a no-op — there's no signal to identify staleness.
+    """
+    if not cfg.worker.cache_auto_invalidate:
+        log.info(
+            "re-enrich-stale: worker.cache_auto_invalidate=false → "
+            "no signal to identify stale rows. Skipping."
+        )
+        return {"skipped_reason": "auto_invalidate_off"}
+
+    es = make_client(cfg.elasticsearch, secrets)
+    db = StateDB(cfg.worker.state_db)
+    prompt = load_prompt(cfg, "command_enrichment")
+    commands_idx = cfg.elasticsearch.indexes.cowrie.commands
+    events_idx = cfg.elasticsearch.indexes.cowrie.sessions_raw
+
+    live_llm_hash = compute_llm_config_hash(cfg)
+    live_embed_hash = compute_embed_config_hash(cfg)
+    cached_llm_hashes: dict[str, str] = db.get_cached_llm_hashes()
+
+    cooc_cfg = cfg.cooccurrence
+    total_sessions = (
+        _fetch_total_session_count(es, events_idx) if cooc_cfg.enabled else 0
+    )
+
+    log.info(
+        "re-enrich-stale: live_llm_hash=%s cache_rows=%d index=%s dry_run=%s",
+        live_llm_hash, len(cached_llm_hashes), commands_idx, dry_run,
+    )
+
+    stats: dict = defaultdict(int)
+    actions: list[dict] = []
+    now = _now()
+
+    with make_llm_client(cfg.llm) as llm:
+        for doc in iter_docs_for_reenrich(es, commands_idx):
+            stats["docs_seen"] += 1
+            cached_hash = cached_llm_hashes.get(doc["doc_id"], "")
+            if cached_hash == live_llm_hash:
+                stats["skipped_fresh"] += 1
+                continue
+            if not cached_hash:
+                # No cache row, or row carries the legacy '' hash. Treat
+                # as stale — caller can `bless-cache` first if they want
+                # legacy rows assumed-current.
+                stats["stale_legacy"] += 1
+            else:
+                stats["stale_drifted"] += 1
+
+            if dry_run:
+                stats["would_reenrich"] += 1
+                continue
+
+            norm, truncated = normalize(doc["command_line"], cfg.worker.command_max_chars)
+            if not norm:
+                stats["skipped_empty_command"] += 1
+                continue
+
+            cooccurring: list[tuple[str, int]] = []
+            if cooc_cfg.enabled:
+                cooccurring = fetch_cooccurring_commands(
+                    es, events_idx, norm,
+                    session_sample_size=cooc_cfg.session_sample_size,
+                    top_k=cooc_cfg.top_k,
+                    min_sessions=cooc_cfg.min_sessions,
+                    total_sessions=total_sessions,
+                )
+            cooc_block = _format_cooccurring_block(cooccurring)
+
+            parsed, source, model = enrich_one(
+                llm, prompt, norm,
+                max_retries=cfg.llm.max_retries,
+                cooccurring_block=cooc_block,
+            )
+            if parsed is None:
+                stats["llm_no_parse"] += 1
+                continue
+
+            embed_text = _build_embed_text(
+                norm, parsed, cfg.llm.embed_context,
+                cooccurring=cooccurring,
+                embed_cooccurrence=cooc_cfg.enabled and cooc_cfg.embed_cooccurrence,
+            )
+            try:
+                embedding = llm.embed(embed_text)
+            except Exception as e:
+                log.error("re-enrich: embed failed on %s: %s", doc["doc_id"], e)
+                stats["embed_failed"] += 1
+                continue
+
+            indicators = _build_indicators(parsed.iocs.model_dump())
+            actions.append({
+                "_op_type": "update",
+                "_id": doc["doc_id"],
+                "script": {
+                    "source": _REENRICH_SCRIPT,
+                    "params": {
+                        "provider": source,
+                        "description": parsed.description,
+                        "intent": parsed.intent,
+                        "confidence": parsed.confidence,
+                        "model": model,
+                        "llm_config_hash": live_llm_hash,
+                        "embed_config_hash": live_embed_hash,
+                        "embedding": embedding,
+                        "tactics": parsed.tactics,
+                        "techniques": parsed.techniques,
+                        "indicators": indicators,
+                    },
+                },
+            })
+            # Update both hashes — re-enrich produces fresh LLM output AND
+            # a fresh embedding (since intent/etc. just changed).
+            db.mark_cached(
+                doc["doc_id"], cfg.llm.generation_model,
+                live_llm_hash, live_embed_hash, now,
+            )
+            stats["reenriched_ok"] += 1
+
+            if len(actions) >= 50:
+                ok, errs = bulk_write(es, commands_idx, actions)
+                stats["bulk_ok"] += ok
+                stats["bulk_errors"] += len(errs)
+                if errs:
+                    log.warning("re-enrich bulk errors (%d): %s", len(errs), errs[:2])
+                actions = []
+
+    if actions:
+        ok, errs = bulk_write(es, commands_idx, actions)
+        stats["bulk_ok"] += ok
+        stats["bulk_errors"] += len(errs)
+        if errs:
+            log.warning("re-enrich bulk errors (%d): %s", len(errs), errs[:2])
+
+    try:
+        es.indices.refresh(index=commands_idx)
+    except Exception as exc:
+        log.warning("re-enrich refresh failed (continuing): %s", exc)
+
+    db.close()
+    return dict(
+        stats, dry_run=dry_run,
+        live_llm_config_hash=live_llm_hash,
+        live_embed_config_hash=live_embed_hash,
+    )
 
 
 # ---------------------------------------------------------------------------

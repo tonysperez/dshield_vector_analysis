@@ -1,4 +1,25 @@
-"""SQLite-backed state: dedup cache + watermark."""
+"""SQLite-backed state: dedup cache + watermark.
+
+Cache key components (ROADMAP #7 — two auto-derived hashes):
+  - command_hash      identifier of the normalised command
+  - model             cfg.llm.generation_model (which LLM produced enrichment)
+  - llm_config_hash   compute_llm_config_hash(cfg) — prompt-file content +
+                      LLM-affecting cooccurrence params. A change here means
+                      the cached intent/tactics/etc are stale.
+  - embed_config_hash compute_embed_config_hash(cfg) — embed_context list,
+                      embedding_model, embed_cooccurrence toggle. A change
+                      here means only the embedding is stale; `reembed`
+                      refreshes it without an LLM call.
+
+`mark_cached` writes both hashes (full enrich).
+`mark_embed_cached` updates only `embed_config_hash` (embed-only refresh) —
+preserves the cached llm_config_hash so a stale LLM output can't be
+silently blessed by `reembed`.
+
+Legacy columns `prompt_version`, `embed_version`, `config_hash` are kept
+for backward-compat with older databases. They are filled with '' on every
+new write and ignored by the lookup logic.
+"""
 from __future__ import annotations
 
 import sqlite3
@@ -8,11 +29,14 @@ from typing import Optional
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS enrichment_cache (
-    command_hash    TEXT PRIMARY KEY,
-    model           TEXT NOT NULL,
-    prompt_version  TEXT NOT NULL,
-    embed_version   TEXT NOT NULL DEFAULT 'v0',
-    enriched_at     TEXT NOT NULL
+    command_hash       TEXT PRIMARY KEY,
+    model              TEXT NOT NULL,
+    prompt_version     TEXT NOT NULL DEFAULT '',
+    embed_version      TEXT NOT NULL DEFAULT '',
+    config_hash        TEXT NOT NULL DEFAULT '',
+    llm_config_hash    TEXT NOT NULL DEFAULT '',
+    embed_config_hash  TEXT NOT NULL DEFAULT '',
+    enriched_at        TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS watermark (
@@ -30,40 +54,146 @@ CREATE TABLE IF NOT EXISTS cloud_spend (
 """
 
 
+# Idempotent migrations applied in order. Each tuple is (column, alter SQL).
+# `ALTER TABLE ADD COLUMN` is idempotent in spirit only — SQLite errors if
+# the column already exists. We catch the error per-column.
+_MIGRATIONS: tuple[tuple[str, str], ...] = (
+    ("embed_version",
+     "ALTER TABLE enrichment_cache ADD COLUMN embed_version TEXT NOT NULL DEFAULT ''"),
+    ("config_hash",
+     "ALTER TABLE enrichment_cache ADD COLUMN config_hash TEXT NOT NULL DEFAULT ''"),
+    ("llm_config_hash",
+     "ALTER TABLE enrichment_cache ADD COLUMN llm_config_hash TEXT NOT NULL DEFAULT ''"),
+    ("embed_config_hash",
+     "ALTER TABLE enrichment_cache ADD COLUMN embed_config_hash TEXT NOT NULL DEFAULT ''"),
+)
+
+
 class StateDB:
     def __init__(self, path: str) -> None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(path, isolation_level=None)  # autocommit
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
-        # Migration: add embed_version column to pre-Phase-3+ databases.
-        try:
-            self.conn.execute(
-                "ALTER TABLE enrichment_cache ADD COLUMN embed_version TEXT NOT NULL DEFAULT 'v0'"
-            )
-        except sqlite3.OperationalError:
-            pass  # column already exists
+        for _name, ddl in _MIGRATIONS:
+            try:
+                self.conn.execute(ddl)
+            except sqlite3.OperationalError:
+                pass  # column already exists
 
     def close(self) -> None:
         self.conn.close()
 
     # --- cache --------------------------------------------------------------
 
-    def is_cached(self, command_hash: str, model: str, prompt_version: str, embed_version: str = "v0") -> bool:
+    def is_cached(
+        self,
+        command_hash: str,
+        model: str,
+        llm_config_hash: str,
+        embed_config_hash: str,
+    ) -> bool:
+        """Full cache hit — both LLM and embed sides are fresh."""
         cur = self.conn.execute(
             "SELECT 1 FROM enrichment_cache"
-            " WHERE command_hash=? AND model=? AND prompt_version=? AND embed_version=?",
-            (command_hash, model, prompt_version, embed_version),
+            " WHERE command_hash=? AND model=?"
+            "   AND llm_config_hash=? AND embed_config_hash=?",
+            (command_hash, model, llm_config_hash, embed_config_hash),
         )
         return cur.fetchone() is not None
 
-    def mark_cached(self, command_hash: str, model: str, prompt_version: str, embed_version: str, enriched_at: str) -> None:
+    def mark_cached(
+        self,
+        command_hash: str,
+        model: str,
+        llm_config_hash: str,
+        embed_config_hash: str,
+        enriched_at: str,
+    ) -> None:
+        """Stamp a full enrichment (LLM + embed). Used by `enrich`."""
         self.conn.execute(
             "INSERT OR REPLACE INTO enrichment_cache"
-            "(command_hash, model, prompt_version, embed_version, enriched_at)"
-            " VALUES (?,?,?,?,?)",
-            (command_hash, model, prompt_version, embed_version, enriched_at),
+            "(command_hash, model, prompt_version, embed_version, config_hash,"
+            " llm_config_hash, embed_config_hash, enriched_at)"
+            " VALUES (?,?, '', '', '', ?,?,?)",
+            (command_hash, model, llm_config_hash, embed_config_hash, enriched_at),
         )
+
+    def mark_embed_cached(
+        self,
+        command_hash: str,
+        embed_config_hash: str,
+        enriched_at: str,
+    ) -> None:
+        """Refresh only the embed side. Used by `reembed`.
+
+        Updates `embed_config_hash` and `enriched_at` in place; does NOT
+        touch `llm_config_hash` or `model`. If the row doesn't exist (a
+        doc in ES with no cache row, e.g. legacy state), this is a no-op
+        rather than an insert — we can't safely write a fresh
+        `llm_config_hash` without proof the LLM output is current.
+        """
+        self.conn.execute(
+            "UPDATE enrichment_cache"
+            " SET embed_config_hash=?, enriched_at=?"
+            " WHERE command_hash=?",
+            (embed_config_hash, enriched_at, command_hash),
+        )
+
+    def get_cached_embed_hashes(self) -> dict[str, str]:
+        """Bulk-load {command_hash: embed_config_hash} for every cache row.
+
+        Used by `reembed` to skip docs whose embed-side cache is already
+        current under the live config. Returns an empty dict for a fresh
+        DB. Empty strings (legacy rows) are included; callers should
+        treat them as 'not fresh' for any non-empty live hash.
+        """
+        cur = self.conn.execute(
+            "SELECT command_hash, embed_config_hash FROM enrichment_cache"
+        )
+        return {row[0]: row[1] for row in cur.fetchall()}
+
+    def get_cached_llm_hashes(self) -> dict[str, str]:
+        """Bulk-load {command_hash: llm_config_hash} for every cache row.
+
+        Mirror of `get_cached_embed_hashes` for the LLM side. Used by
+        `re-enrich-stale` to find rows whose LLM hash drifted.
+        """
+        cur = self.conn.execute(
+            "SELECT command_hash, llm_config_hash FROM enrichment_cache"
+        )
+        return {row[0]: row[1] for row in cur.fetchall()}
+
+    def legacy_cache_row_count(self) -> int:
+        """Rows missing one or both auto-hashes — i.e. pre-#7 or pre-split rows.
+
+        Used at startup to decide whether to log the bless-cache hint.
+        """
+        cur = self.conn.execute(
+            "SELECT COUNT(*) FROM enrichment_cache"
+            " WHERE llm_config_hash='' OR embed_config_hash=''"
+        )
+        row = cur.fetchone()
+        return int(row[0]) if row else 0
+
+    def bless_legacy_cache_rows(
+        self, llm_config_hash: str, embed_config_hash: str,
+    ) -> int:
+        """Stamp every row with empty llm/embed hash with the current values.
+
+        A one-time admin operation. Use after deploying a hash-affecting
+        change when existing cached enrichments are known to be
+        consistent with the current config — avoids a forced
+        re-enrichment cycle. Returns the number of rows updated.
+        """
+        cur = self.conn.execute(
+            "UPDATE enrichment_cache"
+            " SET llm_config_hash = CASE WHEN llm_config_hash='' THEN ? ELSE llm_config_hash END,"
+            "     embed_config_hash = CASE WHEN embed_config_hash='' THEN ? ELSE embed_config_hash END"
+            " WHERE llm_config_hash='' OR embed_config_hash=''",
+            (llm_config_hash, embed_config_hash),
+        )
+        return cur.rowcount or 0
 
     # --- watermark ----------------------------------------------------------
 
@@ -108,6 +238,10 @@ class StateDB:
         cur = self.conn.execute("DELETE FROM enrichment_cache")
         return cur.rowcount or 0
 
-    def clear_watermark(self) -> int:
-        cur = self.conn.execute("DELETE FROM watermark")
+    def clear_watermark(self, key: Optional[str] = None) -> int:
+        """Delete one watermark row by key, or all rows when key is None."""
+        if key is None:
+            cur = self.conn.execute("DELETE FROM watermark")
+        else:
+            cur = self.conn.execute("DELETE FROM watermark WHERE key=?", (key,))
         return cur.rowcount or 0

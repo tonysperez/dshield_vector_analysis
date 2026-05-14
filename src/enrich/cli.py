@@ -159,6 +159,8 @@ def _run_pipeline(cfg, secrets, args) -> int:
         return 1
 
     dry = args.dry_run
+    if getattr(args, "ignore_config_hash", False):
+        cfg.worker.cache_auto_invalidate = False
 
     steps: list[tuple[str, callable, bool]] = [
         # ingest half: raw events → enriched commands → session rollup
@@ -252,6 +254,15 @@ def _build_parser() -> argparse.ArgumentParser:
     p_enrich.add_argument("--source", default="cowrie", help="Source name (default: cowrie)")
     p_enrich.add_argument("--dry-run", action="store_true", help="Read events but skip LLM + writes")
     p_enrich.add_argument("--no-cloud", action="store_true", help="Force-disable cloud escalation for this run")
+    p_enrich.add_argument(
+        "--ignore-config-hash", action="store_true",
+        help=(
+            "Override worker.cache_auto_invalidate=true for this run only — "
+            "treat the cache as if prompt/cooccurrence config didn't change. "
+            "Use when LLM budget is tight and you'd rather keep current "
+            "enrichments through a config drift."
+        ),
+    )
 
     # budget
     sub.add_parser("budget", help="Show today's cloud-LLM spend vs daily cap")
@@ -259,12 +270,26 @@ def _build_parser() -> argparse.ArgumentParser:
     # reset
     p_reset = sub.add_parser(
         "reset",
-        help="Clear local SQLite state (cache and/or watermark). Does NOT touch ES.",
+        help="Clear local SQLite state (cache and/or watermarks). Does NOT touch ES.",
     )
-    g = p_reset.add_mutually_exclusive_group()
-    g.add_argument("--cache", action="store_true", help="Clear only the enrichment cache")
-    g.add_argument("--watermark", action="store_true", help="Clear only the watermark")
-    g.add_argument("--all", action="store_true", help="Clear both (default)")
+    p_reset.add_argument("--cache", action="store_true",
+                         help="Clear the enrichment cache")
+    p_reset.add_argument("--watermark", action="store_true",
+                         help="Clear ALL watermarks (command + session + IP)")
+    p_reset.add_argument("--all", action="store_true",
+                         help="Clear cache and all watermarks (default when no flag given)")
+    p_reset.add_argument("--session-watermark", action="store_true",
+                         help=(
+                             "Clear only the session-rollup watermark "
+                             "(forces a full re-rollup of sessions). "
+                             "Combinable with other flags."
+                         ))
+    p_reset.add_argument("--ip-watermark", action="store_true",
+                         help=(
+                             "Clear only the IP-rollup watermark "
+                             "(forces a full re-rollup of IPs). "
+                             "Combinable with other flags."
+                         ))
     p_reset.add_argument("--yes", action="store_true", help="Skip confirmation prompt")
 
     # init-indexes
@@ -304,6 +329,46 @@ def _build_parser() -> argparse.ArgumentParser:
     p_reembed.add_argument(
         "--dry-run", action="store_true",
         help="Count docs that would be re-embedded without calling the embed model or writing to ES",
+    )
+    p_reembed.add_argument(
+        "--ignore-config-hash", action="store_true",
+        help="See `enrich --ignore-config-hash`.",
+    )
+
+    # re-enrich-stale — LLM-side mirror of `reembed`. Walks the commands
+    # index, finds cache rows whose llm_config_hash is stale (e.g. after
+    # a prompt edit), re-calls the local LLM, and patches the doc.
+    p_reenrich = sub.add_parser(
+        "re-enrich-stale",
+        help=(
+            "Re-run the local LLM on every doc whose cached llm_config_hash "
+            "is stale. The LLM-side counterpart of `reembed`. Skips rows "
+            "whose hash already matches live (cheap no-op when nothing has "
+            "changed). Burns LLM time per stale doc when prompts or "
+            "LLM-side cooccurrence config have drifted. ROADMAP issue #7.5."
+        ),
+    )
+    p_reenrich.add_argument("--source", default="cowrie",
+                            help="Source name (default: cowrie)")
+    p_reenrich.add_argument("--dry-run", action="store_true",
+                            help="Count stale rows without calling LLM or writing.")
+
+    # bless-cache — stamp existing cache rows with the current config hash so
+    # they're treated as fresh after a #7-style auto-invalidating config change.
+    # The user opts into this when they know existing enrichments are
+    # consistent with the current cooccurrence config + prompts.
+    p_bless = sub.add_parser(
+        "bless-cache",
+        help=(
+            "Stamp all legacy cache rows (config_hash='') with the current "
+            "config hash so they're treated as fresh. Use after deploying a "
+            "config-affecting change when you know the cached enrichments are "
+            "still correct under the new config. ROADMAP issue #7."
+        ),
+    )
+    p_bless.add_argument(
+        "--dry-run", action="store_true",
+        help="Report how many rows would be stamped without writing to the cache.",
     )
 
     # cluster <layer>
@@ -386,6 +451,10 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_pipe.add_argument(
+        "--ignore-config-hash", action="store_true",
+        help="See `enrich --ignore-config-hash`. Applies to enrich/reembed steps.",
+    )
+    p_pipe.add_argument(
         "--no-cloud", action="store_true",
         help="Pass --no-cloud through to `enrich` (skip cloud escalation paths)",
     )
@@ -430,13 +499,22 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.verb == "reset":
         from .cache import StateDB
-        do_cache = args.cache or args.all or (not args.cache and not args.watermark)
-        do_watermark = args.watermark or args.all or (not args.cache and not args.watermark)
-        targets = []
-        if do_cache:
-            targets.append("cache")
-        if do_watermark:
-            targets.append("watermark")
+        # Explicit selectors. Specific-watermark flags don't imply --all.
+        explicit_specific = args.session_watermark or args.ip_watermark
+        explicit_broad    = args.cache or args.watermark or args.all
+        # No flag at all = clear everything (legacy default behaviour).
+        default_all = not (explicit_specific or explicit_broad)
+
+        do_cache       = args.cache or args.all or default_all
+        do_all_wm      = args.watermark or args.all or default_all
+        do_session_wm  = args.session_watermark and not do_all_wm
+        do_ip_wm       = args.ip_watermark and not do_all_wm
+
+        targets: list[str] = []
+        if do_cache:      targets.append("cache")
+        if do_all_wm:     targets.append("watermarks (all)")
+        if do_session_wm: targets.append("session watermark only")
+        if do_ip_wm:      targets.append("IP watermark only")
         msg = f"About to clear: {', '.join(targets)} from {cfg.worker.state_db}"
         print(msg)
         if not args.yes:
@@ -451,8 +529,20 @@ def main(argv: list[str] | None = None) -> int:
         result: dict = {}
         if do_cache:
             result["cache_rows_deleted"] = db.clear_cache()
-        if do_watermark:
+        if do_all_wm:
             result["watermark_rows_deleted"] = db.clear_watermark()
+        else:
+            if do_session_wm:
+                # Key matches sessions._SESSION_WATERMARK_KEY — duplicated
+                # rather than imported to avoid pulling in the LLM-dep
+                # sessions module just for a string constant.
+                result["session_watermark_deleted"] = db.clear_watermark(
+                    "session_last_processed_at"
+                )
+            if do_ip_wm:
+                result["ip_watermark_deleted"] = db.clear_watermark(
+                    "ip_rollup_last_processed_at"
+                )
         db.close()
         print(json.dumps(result, indent=2))
         return 0
@@ -486,6 +576,8 @@ def main(argv: list[str] | None = None) -> int:
         if mod is None:
             print(f"[ERROR] Source {args.source!r} has no commands layer", flush=True)
             return 1
+        if getattr(args, "ignore_config_hash", False):
+            cfg.worker.cache_auto_invalidate = False
         stats = mod.run_enrich(cfg, secrets, dry_run=args.dry_run, no_cloud=args.no_cloud)
         print(json.dumps(stats, indent=2, default=str))
         return 0
@@ -508,8 +600,45 @@ def main(argv: list[str] | None = None) -> int:
         if mod is None:
             print(f"[ERROR] Source {args.source!r} has no commands layer", flush=True)
             return 1
+        if getattr(args, "ignore_config_hash", False):
+            cfg.worker.cache_auto_invalidate = False
         stats = mod.run_reembed(cfg, secrets, dry_run=args.dry_run)
         print(json.dumps(stats, indent=2, default=str))
+        return 0
+
+    if args.verb == "re-enrich-stale":
+        mod = _commands_layer(args.source)
+        if mod is None:
+            print(f"[ERROR] Source {args.source!r} has no commands layer", flush=True)
+            return 1
+        stats = mod.run_reenrich_stale(cfg, secrets, dry_run=args.dry_run)
+        print(json.dumps(stats, indent=2, default=str))
+        return 0
+
+    if args.verb == "bless-cache":
+        from .cache import StateDB
+        from .config import compute_embed_config_hash, compute_llm_config_hash
+        db = StateDB(cfg.worker.state_db)
+        try:
+            legacy = db.legacy_cache_row_count()
+            llm_hash = compute_llm_config_hash(cfg)
+            embed_hash = compute_embed_config_hash(cfg)
+            if args.dry_run:
+                print(json.dumps({
+                    "dry_run": True,
+                    "legacy_rows": legacy,
+                    "would_stamp_llm_hash": llm_hash,
+                    "would_stamp_embed_hash": embed_hash,
+                }, indent=2))
+            else:
+                stamped = db.bless_legacy_cache_rows(llm_hash, embed_hash)
+                print(json.dumps({
+                    "stamped_rows": stamped,
+                    "llm_config_hash": llm_hash,
+                    "embed_config_hash": embed_hash,
+                }, indent=2))
+        finally:
+            db.close()
         return 0
 
     if args.verb == "cluster":

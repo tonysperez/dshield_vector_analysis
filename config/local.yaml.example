@@ -30,19 +30,23 @@ llm:
   embedding_model: "text-embedding-nomic-embed-text-v1.5@q8_0"
   # api_key: "lm-studio"   # uncomment if your server requires auth
 
-  # Fields prepended to the raw command before embedding.
-  # Changing this requires bumping embed_version and running `reembed`.
+  # Fields prepended to the raw command before embedding. Changes here
+  # flow into embed_config_hash automatically; run `reembed` after
+  # editing to refresh embeddings without re-running the LLM.
   # embed_context:
   #   - intent
   #   - tactics
   #   - techniques
   #   - description
-  # embed_version: "v2"   # bump when embed_context changes; run `reembed` after
 
 worker:
   state_db: "/var/lib/dshield_prism/state.sqlite"
   initial_lookback_days: null
-  # prompt_version: "v3"   # bump after editing the prompt to force re-enrichment + re-embedding
+  # cache_auto_invalidate: true  # (default) auto-invalidate cache on
+  #                              # prompt/cooccurrence/embed-config edits.
+  #                              # Set to false to hold the cache through
+  #                              # config drift; use bless-cache to stamp
+  #                              # legacy rows. ROADMAP #7.
 
 # Cloud (Claude) escalation for hard / novel / low-confidence commands.
 # Off by default. To enable: flip enabled, set ANTHROPIC_API_KEY in .env, then

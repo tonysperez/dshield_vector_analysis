@@ -1,0 +1,15 @@
+[Unit]
+Description=Run the DShield Prism backward pass 4x daily
+Requires=dshield_prism-backward.service
+
+[Timer]
+# Every 6 hours on the wall clock. Aligned with the forward pass at the
+# top of those hours, then flock serialises them.
+OnCalendar=*-*-* 00,06,12,18:00:00
+# Stagger across nodes to avoid every node hammering the LLM box at once.
+RandomizedDelaySec=600
+Persistent=true
+Unit=dshield_prism-backward.service
+
+[Install]
+WantedBy=timers.target

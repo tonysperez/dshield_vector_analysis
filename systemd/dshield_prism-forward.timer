@@ -1,0 +1,15 @@
+[Unit]
+Description=Run the DShield Prism forward pass every 30 minutes
+Requires=dshield_prism-forward.service
+
+[Timer]
+# Every 30 min on the wall clock (top of the hour and half-past).
+OnCalendar=*-*-* *:00,30:00
+# Spread the load if multiple Security Onion nodes are on the same schedule.
+RandomizedDelaySec=120
+# If the system was down across firings, run one catch-up at boot.
+Persistent=true
+Unit=dshield_prism-forward.service
+
+[Install]
+WantedBy=timers.target

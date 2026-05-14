@@ -35,23 +35,33 @@ llm:
   max_retries: 2
   api_key: null   # only needed for openai_compat servers that require auth
   # Fields prepended to the raw command before embedding (enrich-then-embed).
-  # Empty list = embed raw command only.
-  # Bump embed_version whenever you change this list to force re-embedding.
+  # Empty list = embed raw command only. Changes to this list (and to
+  # embedding_model above) flow into embed_config_hash automatically — no
+  # manual version bump required. Run `reembed` after editing to refresh
+  # the embeddings without re-running the LLM.
   embed_context:
     - intent
     - tactics
     - techniques
     - description
-  embed_version: "v3"
 
 worker:
   state_db: "/var/lib/dshield_prism/state.sqlite"
   page_size: 1000
   command_max_chars: 4000
-  # Bump after editing either prompt to force re-enrichment.
-  prompt_version: "v4"
   initial_lookback_days: null
   log_level: "INFO"
+  # When true, the cache key carries two auto-derived hashes:
+  #   - llm_config_hash:   prompt-file content + LLM-side cooccurrence params
+  #   - embed_config_hash: llm.embed_context + llm.embedding_model +
+  #                        cooccurrence.embed_cooccurrence toggle
+  # Editing any of those then invalidates the appropriate cache side on
+  # the next pipeline run. The embed-only side can be refreshed by
+  # `reembed` without an LLM call. Flip to `false` to bypass and treat
+  # all rows as fresh — useful when LLM budget is tight and a config
+  # edit landed; bless or wipe the cache manually as needed.
+  # ROADMAP issue #7.
+  cache_auto_invalidate: true
 
 # Cloud LLM escalation. Off by default; enable per-deploy in local.yaml.
 cloud:
@@ -116,7 +126,7 @@ cooccurrence:
   # The old binary `max_corpus_session_ratio: 0.40` boilerplate cutoff was
   # replaced with continuous TF-IDF weighting (ROADMAP issue #6). Setting
   # the field here is a benign no-op — kept out of the default for clarity.
-  embed_cooccurrence: true         # also append to embed text — bumps embed_version
+  embed_cooccurrence: true         # also append to embed text; folded into embed_config_hash automatically
 
 prompts:
   command_enrichment:        "config/prompts/command_enrichment.txt"

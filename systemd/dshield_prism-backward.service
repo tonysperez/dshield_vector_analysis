@@ -1,0 +1,81 @@
+[Unit]
+Description=DShield Prism backward pass — re-embed, re-enrich-stale, re-cluster, re-escalate, re-mine
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=dshield_prism
+Group=dshield_prism
+WorkingDirectory=/opt/dshield_prism
+EnvironmentFile=/opt/dshield_prism/.env
+
+# Mutex with the forward pass. flock blocks (no -n) so the backward task
+# waits for an in-flight forward run rather than colliding on the cache.
+ExecStartPre=/usr/bin/flock /var/lib/dshield_prism/.lock /bin/true
+
+# Soft-warn on local LLM unreachable — most backward steps don't need
+# the LLM (cluster / escalate / mine campaigns). `reembed`,
+# `re-enrich-stale`, and `name playbooks` do, and will fail individually
+# with `-` ExecStart prefixes if the LLM is down. `-` on the healthcheck
+# = unit continues even when LLM is unreachable.
+ExecStartPre=-/opt/dshield_prism/.venv/bin/python -m enrich.cli --config /opt/dshield_prism/config/default.yaml healthcheck --scope llm
+
+# --- Step 1: re-enrich rows whose LLM hash drifted (prompt edits etc.).
+# Smart-skip when nothing has changed — near-zero cost in steady state.
+# Optional: failures here shouldn't stop the chain.
+ExecStart=-/usr/bin/flock /var/lib/dshield_prism/.lock /opt/dshield_prism/.venv/bin/python -m enrich.cli --config /opt/dshield_prism/config/default.yaml re-enrich-stale
+
+# --- Step 2: re-embed rows whose embed hash drifted (embed_context /
+# embedding_model / embed_cooccurrence changes). Smart-skip when fresh.
+ExecStart=-/usr/bin/flock /var/lib/dshield_prism/.lock /opt/dshield_prism/.venv/bin/python -m enrich.cli --config /opt/dshield_prism/config/default.yaml reembed
+
+# --- Step 3: invalidate the session + IP rollup watermarks so the next
+# rollup pass re-pools all sessions / IPs from the (potentially) fresh
+# command embeddings. Cheap operation; only the SQLite watermark rows
+# are deleted, no ES touch. `--yes` skips the interactive confirmation.
+ExecStart=-/usr/bin/flock /var/lib/dshield_prism/.lock /opt/dshield_prism/.venv/bin/python -m enrich.cli --config /opt/dshield_prism/config/default.yaml reset --session-watermark --ip-watermark --yes
+
+# --- Step 4: re-roll sessions and IPs with the refreshed embeddings.
+ExecStart=-/usr/bin/flock /var/lib/dshield_prism/.lock /opt/dshield_prism/.venv/bin/python -m enrich.cli --config /opt/dshield_prism/config/default.yaml rollup sessions
+ExecStart=-/usr/bin/flock /var/lib/dshield_prism/.lock /opt/dshield_prism/.venv/bin/python -m enrich.cli --config /opt/dshield_prism/config/default.yaml rollup ips
+
+# --- Step 5: re-cluster every layer. Always recomputes from current
+# embeddings — that's what makes novelty scores reflect the current corpus.
+# cluster commands is required (every downstream step depends on its
+# novelty output); sessions/ips are `-` so a transient failure logs but
+# doesn't abort the chain.
+ExecStart=/usr/bin/flock /var/lib/dshield_prism/.lock /opt/dshield_prism/.venv/bin/python -m enrich.cli --config /opt/dshield_prism/config/default.yaml cluster commands
+ExecStart=-/usr/bin/flock /var/lib/dshield_prism/.lock /opt/dshield_prism/.venv/bin/python -m enrich.cli --config /opt/dshield_prism/config/default.yaml cluster sessions
+ExecStart=-/usr/bin/flock /var/lib/dshield_prism/.lock /opt/dshield_prism/.venv/bin/python -m enrich.cli --config /opt/dshield_prism/config/default.yaml cluster ips
+
+# --- Step 6: cloud escalation re-runs against the freshly-clustered
+# novelty scores. May skip everything if daily budget is exhausted —
+# `-` is fine because the local-only enrichments stay in place.
+ExecStart=-/usr/bin/flock /var/lib/dshield_prism/.lock /opt/dshield_prism/.venv/bin/python -m enrich.cli --config /opt/dshield_prism/config/default.yaml escalate
+
+# --- Step 7: name new session clusters. Skips already-named clusters
+# automatically (no --force) — only new clusters get an LLM call.
+ExecStart=-/usr/bin/flock /var/lib/dshield_prism/.lock /opt/dshield_prism/.venv/bin/python -m enrich.cli --config /opt/dshield_prism/config/default.yaml name playbooks
+
+# --- Step 8: mine multi-session campaigns over the refreshed playbook
+# set. Stable campaign IDs (content-hashed playbook set, ROADMAP #2).
+ExecStart=-/usr/bin/flock /var/lib/dshield_prism/.lock /opt/dshield_prism/.venv/bin/python -m enrich.cli --config /opt/dshield_prism/config/default.yaml mine campaigns --kind all
+
+StandardOutput=journal
+StandardError=journal
+
+# 6h ceiling — backward pass has up to 8 sequential steps, several with
+# bulk ES writes and LLM calls. Plenty of headroom for a growing corpus.
+TimeoutStartSec=6h
+Nice=10
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/dshield_prism
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

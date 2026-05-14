@@ -18,17 +18,20 @@
 #   E. Run healthcheck (ES + local LLM + SQLite + cloud connectivity)
 #   F. Init all six ES indexes for the cowrie source, additive-mapping safe.
 #   G. Install + enable systemd timers:
-#        dshield_prism-ingest.timer
-#          → enrich + rollup sessions          (hourly)
-#        dshield_prism-analytics.timer
-#          → cluster commands + escalate + cluster sessions + name playbooks
-#            + rollup ips + cluster ips + mine campaigns
-#            (every 6h)
+#        dshield_prism-forward.timer
+#          → healthcheck + enrich + rollup sessions + rollup ips
+#            (every 30 min; watermark-driven forward pass)
+#        dshield_prism-backward.timer
+#          → re-enrich-stale + reembed + reset rollup watermarks
+#            + re-rollup + cluster commands/sessions/ips
+#            + escalate + name playbooks + mine campaigns
+#            (every 6h; full-corpus backward pass)
+#        Both serialise on /var/lib/dshield_prism/.lock via flock.
 #
 # Skipped on purpose (first run can take hours on a backlog):
 #   - Initial enrichment + clustering pass. Trigger manually after setup:
-#       sudo systemctl start dshield_prism-ingest.service
-#       sudo systemctl start dshield_prism-analytics.service
+#       sudo systemctl start dshield_prism-forward.service
+#       sudo systemctl start dshield_prism-backward.service
 #     Or via the CLI:
 #       sudo -u "${SERVICE_USER}" "${INSTALL_DIR}/.venv/bin/python" \
 #         -m enrich.cli enrich
@@ -127,10 +130,10 @@ REQUIRED_FILES=(
     "${SRC_DIR}/es-mappings/cowrie/session_clusters.json"
     "${SRC_DIR}/es-mappings/cowrie/ips.json"
     "${SRC_DIR}/es-mappings/cowrie/ip_clusters.json"
-    "${SRC_DIR}/systemd/dshield_prism-ingest.service"
-    "${SRC_DIR}/systemd/dshield_prism-ingest.timer"
-    "${SRC_DIR}/systemd/dshield_prism-analytics.service"
-    "${SRC_DIR}/systemd/dshield_prism-analytics.timer"
+    "${SRC_DIR}/systemd/dshield_prism-forward.service"
+    "${SRC_DIR}/systemd/dshield_prism-forward.timer"
+    "${SRC_DIR}/systemd/dshield_prism-backward.service"
+    "${SRC_DIR}/systemd/dshield_prism-backward.timer"
 )
 for required in "${REQUIRED_FILES[@]}"; do
     [[ -f "${required}" ]] || die "Missing source file: ${required}"
@@ -259,12 +262,23 @@ fi
 if (( INSTALL_SYSTEMD )); then
     log "Syncing systemd units"
 
+    # Best-effort cleanup of the prior ingest+analytics units. Idempotent —
+    # silently ignores absence on a fresh box.
+    for legacy in dshield_prism-ingest dshield_prism-analytics; do
+        if [[ -f "${SYSTEMD_DIR}/${legacy}.timer" ]] \
+        || [[ -f "${SYSTEMD_DIR}/${legacy}.service" ]]; then
+            log "  ${legacy}.*: removing legacy units (replaced by forward/backward)"
+            systemctl disable --now "${legacy}.timer" 2>/dev/null || true
+            rm -f "${SYSTEMD_DIR}/${legacy}.timer" "${SYSTEMD_DIR}/${legacy}.service"
+        fi
+    done
+
     UNITS_CHANGED=0
     for unit in \
-        dshield_prism-ingest.service \
-        dshield_prism-ingest.timer \
-        dshield_prism-analytics.service \
-        dshield_prism-analytics.timer
+        dshield_prism-forward.service \
+        dshield_prism-forward.timer \
+        dshield_prism-backward.service \
+        dshield_prism-backward.timer
     do
         src="${INSTALL_DIR}/systemd/${unit}"
         dst="${SYSTEMD_DIR}/${unit}"
@@ -286,17 +300,17 @@ if (( INSTALL_SYSTEMD )); then
         systemctl daemon-reload
     fi
 
-    systemctl enable --now dshield_prism-ingest.timer
-    systemctl enable --now dshield_prism-analytics.timer
+    systemctl enable --now dshield_prism-forward.timer
+    systemctl enable --now dshield_prism-backward.timer
     if (( UNITS_CHANGED )); then
-        systemctl restart dshield_prism-ingest.timer
-        systemctl restart dshield_prism-analytics.timer
+        systemctl restart dshield_prism-forward.timer
+        systemctl restart dshield_prism-backward.timer
     fi
 
     log "Timer status:"
     systemctl --no-pager list-timers \
-        dshield_prism-ingest.timer \
-        dshield_prism-analytics.timer || true
+        dshield_prism-forward.timer \
+        dshield_prism-backward.timer || true
 else
     warn "Skipping systemd install (--no-systemd)"
 fi
@@ -309,28 +323,35 @@ ${GREEN}Setup complete.${RESET}
 
 Scheduled services installed:
 
-  dshield_prism-ingest.timer            (hourly)
-    → enrich              (command enrichment + cloud escalation)
-    → rollup sessions     (session aggregation)
+  dshield_prism-forward.timer           (every 30 min)
+    → healthcheck --scope llm   (hard fail = skip the pass)
+    → enrich                    (command enrichment + cloud escalation)
+    → rollup sessions           (session aggregation)
+    → rollup ips                (IP aggregation)
 
-  dshield_prism-analytics.timer         (every 6h at 00,06,12,18 UTC)
-    → cluster commands           (command HDBSCAN)
-    → escalate                   (cloud rescue for novel commands)
-    → cluster sessions           (session HDBSCAN)
-    → name playbooks             (local LLM names each session cluster)
-    → rollup ips                 (IP aggregation)
-    → cluster ips                (IP HDBSCAN)
-    → mine campaigns             (FP-growth + shared-artifact miners)
+  dshield_prism-backward.timer          (every 6h at 00,06,12,18 UTC)
+    → healthcheck --scope llm   (soft check; most steps don't need LLM)
+    → re-enrich-stale           (LLM-side cache drift; near-no-op when fresh)
+    → reembed                   (embed-side cache drift; near-no-op when fresh)
+    → reset --session-watermark --ip-watermark   (force full re-rollup)
+    → rollup sessions / ips     (re-pool with refreshed command embeddings)
+    → cluster commands          (HDBSCAN; refreshes novelty)
+    → cluster sessions / ips    (HDBSCAN)
+    → escalate                  (cloud rescue for novel commands)
+    → name playbooks            (local LLM names each session cluster)
+    → mine campaigns            (FP-growth + shared-artifact miners)
 
-The first hourly pass will fire within the hour. To kick off a run now:
+  Both serialise on /var/lib/dshield_prism/.lock via flock.
 
-  sudo systemctl start dshield_prism-ingest.service
-  sudo systemctl start dshield_prism-analytics.service
+The first forward pass will fire within 30 min. To kick off a run now:
+
+  sudo systemctl start dshield_prism-forward.service
+  sudo systemctl start dshield_prism-backward.service
 
 Tail live logs:
 
-  journalctl -fu dshield_prism-ingest.service
-  journalctl -fu dshield_prism-analytics.service
+  journalctl -fu dshield_prism-forward.service
+  journalctl -fu dshield_prism-backward.service
 
 Useful CLI commands (run as the service user):
 

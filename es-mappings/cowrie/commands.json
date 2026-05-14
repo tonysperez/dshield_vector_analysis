@@ -89,6 +89,8 @@
                   "confidence":         { "type": "byte" },
                   "model":              { "type": "keyword" },
                   "prompt_version":     { "type": "keyword" },
+                  "llm_config_hash":    { "type": "keyword" },
+                  "embed_config_hash":  { "type": "keyword" },
                   "occurrence_count":   { "type": "long" },
                   "unique_sessions":    { "type": "long" },
                   "unique_source_ips":  { "type": "long" },

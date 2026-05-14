@@ -1,6 +1,8 @@
 """Config loading. YAML file + .env overrides for secrets."""
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from pathlib import Path
 from typing import Optional
@@ -56,7 +58,6 @@ class LLMConfig(BaseModel):
     embed_context: list[str] = Field(
         default_factory=lambda: ["intent", "tactics", "description"]
     )
-    embed_version: str = "v1"  # bump when embed_context changes to force re-embed
 
 
 class CooccurrenceConfig(BaseModel):
@@ -83,7 +84,8 @@ class CooccurrenceConfig(BaseModel):
     # corpus-common siblings demote themselves continuously. Stray YAML
     # entries are silently ignored by pydantic.
     # If true, append "co-occurs with: ..." to the embed text alongside
-    # other enrichment context. Bumps embed_version when toggled.
+    # other enrichment context. Goes into embed_config_hash automatically;
+    # no manual version bump required.
     embed_cooccurrence: bool = True
 
 
@@ -171,9 +173,17 @@ class WorkerConfig(BaseModel):
     state_db: str
     page_size: int = 1000
     command_max_chars: int = 4000
-    prompt_version: str = "v1"
     initial_lookback_days: Optional[int] = None
     log_level: str = "INFO"
+    # When True (default), the cache key includes two SHA-256 hashes over
+    # the inputs that affect enrichment output (see
+    # `compute_llm_config_hash` and `compute_embed_config_hash`). Edits to
+    # prompts, cooccurrence config, embed_context, or embedding_model then
+    # auto-invalidate stale cache rows on the appropriate side. Set to
+    # False to bypass the auto-invalidation when LLM budget is tight and
+    # you'd rather keep current enrichments through a config drift — you
+    # can still wipe or bless the cache manually. ROADMAP issue #7.
+    cache_auto_invalidate: bool = True
 
 
 class PromptsConfig(BaseModel):
@@ -285,3 +295,83 @@ def load_secrets(config_path: Optional[str] = None) -> Secrets:
 def load_prompt(cfg: AppConfig, name: str = "command_enrichment") -> str:
     path = getattr(cfg.prompts, name)
     return Path(path).read_text()
+
+
+# CooccurrenceConfig fields that change the LLM prompt (affect the
+# sibling block injected into the prompt). Pinned so the hash doesn't
+# churn when unrelated fields are added later.
+_LLM_COOC_FIELDS = ("enabled", "top_k", "session_sample_size", "min_sessions")
+# CooccurrenceConfig fields that only affect the embed text, not the LLM
+# prompt. `embed_cooccurrence` toggles whether siblings appear in the
+# embedded representation; it doesn't change anything the LLM sees.
+_EMBED_COOC_FIELDS = ("embed_cooccurrence",)
+_CONFIG_HASH_LEN = 16
+
+
+def _hash_prompt_files(cfg: AppConfig) -> str:
+    """SHA-256 each configured prompt file's content; combine deterministically."""
+    parts: list[str] = []
+    prompts_dict = cfg.prompts.model_dump()
+    for name in sorted(prompts_dict):
+        path = prompts_dict[name]
+        if not path:
+            continue
+        try:
+            content = Path(path).read_bytes()
+        except OSError:
+            # Missing prompt file: fold the path into the digest so a typo
+            # doesn't silently produce the same hash as a correct config.
+            digest = hashlib.sha256(f"missing:{path}".encode("utf-8")).hexdigest()
+        else:
+            digest = hashlib.sha256(content).hexdigest()
+        parts.append(f"{name}={digest}")
+    return "\n".join(parts)
+
+
+def compute_llm_config_hash(cfg: AppConfig) -> str:
+    """Fingerprint of the inputs that affect *LLM* enrichment output.
+
+    Returns a 16-hex prefix of SHA-256 over:
+      - LLM-affecting cooccurrence fields (sibling-context inputs).
+      - SHA-256 of each configured prompt file's content.
+
+    Used as one half of the auto-invalidating cache key (ROADMAP #7). A
+    change here means the cached intent/tactics/techniques/description
+    are no longer trustworthy — the next `enrich` will re-run the LLM.
+    Embed-only changes (see `compute_embed_config_hash`) do NOT flip
+    this; they're handled separately so `reembed` doesn't waste an LLM
+    call.
+    """
+    cooc = cfg.cooccurrence.model_dump()
+    cooc_subset = {k: cooc[k] for k in _LLM_COOC_FIELDS if k in cooc}
+    cooc_payload = json.dumps(cooc_subset, sort_keys=True, separators=(",", ":"))
+    prompt_payload = _hash_prompt_files(cfg)
+    combined = f"cooc:{cooc_payload}\nprompts:{prompt_payload}"
+    return hashlib.sha256(combined.encode("utf-8")).hexdigest()[:_CONFIG_HASH_LEN]
+
+
+def compute_embed_config_hash(cfg: AppConfig) -> str:
+    """Fingerprint of the inputs that affect *embedding* output.
+
+    Returns a 16-hex prefix of SHA-256 over:
+      - `llm.embed_context` (which stored fields get prepended to the
+        embed text — sorted JSON so list ordering is stable).
+      - `llm.embedding_model` (changing models obviously changes vectors).
+      - `cooccurrence.embed_cooccurrence` (whether siblings get appended
+        to the embed text — independent of whether they were fetched for
+        the LLM prompt).
+
+    Used as the other half of the auto-invalidating cache key (ROADMAP
+    #7). A change here means only the embedding is stale — `reembed`
+    can refresh it without re-running the LLM. `mark_embed_cached`
+    updates only this hash, preserving `llm_config_hash`, so a stale
+    LLM output can't be silently blessed by an embed-only refresh.
+    """
+    cooc = cfg.cooccurrence.model_dump()
+    cooc_subset = {k: cooc[k] for k in _EMBED_COOC_FIELDS if k in cooc}
+    embed_payload = json.dumps({
+        "embed_context": sorted(cfg.llm.embed_context or []),
+        "embedding_model": cfg.llm.embedding_model,
+        "cooc": cooc_subset,
+    }, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(embed_payload.encode("utf-8")).hexdigest()[:_CONFIG_HASH_LEN]
