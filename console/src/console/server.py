@@ -21,6 +21,9 @@ from pydantic import BaseModel
 from ._config import load_config, load_secrets
 from ._es import make_client
 from . import graph, ioc, queries
+# Imported as a renamed local to avoid shadowing the `health()` function
+# below that's registered as the `/api/health` system-check route.
+from . import health as health_mod
 from .models import (
     GraphResponse, HealthResponse, IOCDetail, SearchCandidate,
     SearchResponse, TableResponse,
@@ -34,6 +37,12 @@ WEB_DIR = Path(__file__).parent / "web"
 class AskRequest(BaseModel):
     question: str
     context: dict = {}
+
+
+class DenylistAddRequest(BaseModel):
+    """POST body for /api/health/commands/denylist (ROADMAP #11.5)."""
+    token: str
+    rationale: str = ""
 
 
 def build_app(config_path: str | None = None) -> FastAPI:
@@ -71,6 +80,13 @@ def build_app(config_path: str | None = None) -> FastAPI:
             raise HTTPException(500, "web/compare.html missing")
         return FileResponse(page)
 
+    @app.get("/health")
+    def health_page() -> FileResponse:
+        page = WEB_DIR / "health.html"
+        if not page.exists():
+            raise HTTPException(500, "web/health.html missing")
+        return FileResponse(page)
+
     # ------------------------------------------------------------------
     # API
     # ------------------------------------------------------------------
@@ -104,6 +120,49 @@ def build_app(config_path: str | None = None) -> FastAPI:
         except Exception as e:
             log.exception("insights_summary failed")
             raise HTTPException(500, f"insights query failed: {e}")
+
+    # Health page — command-grounding coverage report (ROADMAP #11.5).
+    # Same 60s in-memory cache pattern as /api/insights; the underlying
+    # data changes only when curated YAMLs / the tldr bundle / the
+    # corpus drift, none of which happen sub-minute.
+    _health_cmds_cache: dict[str, Any] = {"ts": 0.0, "data": None}
+    _HEALTH_CMDS_TTL = 60.0
+
+    @app.get("/api/health/commands")
+    def health_commands_api() -> JSONResponse:
+        now = time.monotonic()
+        if _health_cmds_cache["data"] and now - _health_cmds_cache["ts"] < _HEALTH_CMDS_TTL:
+            return JSONResponse(_health_cmds_cache["data"])
+        try:
+            data = health_mod.health_commands(es, cfg)
+            _health_cmds_cache["ts"] = now
+            _health_cmds_cache["data"] = data
+            return JSONResponse(data)
+        except Exception as e:
+            log.exception("health_commands failed")
+            raise HTTPException(500, f"health_commands query failed: {e}")
+
+    def _invalidate_health_cache() -> None:
+        _health_cmds_cache["data"] = None
+        _health_cmds_cache["ts"] = 0.0
+
+    @app.post("/api/health/commands/denylist")
+    def denylist_add_api(body: DenylistAddRequest) -> JSONResponse:
+        ok, msg = health_mod.add_token_to_denylist(body.token, body.rationale)
+        if not ok:
+            raise HTTPException(400, msg)
+        _invalidate_health_cache()
+        return JSONResponse({"ok": True, "message": msg})
+
+    @app.delete("/api/health/commands/denylist/{token}")
+    def denylist_remove_api(token: str) -> JSONResponse:
+        ok, msg = health_mod.remove_token_from_denylist(token)
+        if not ok:
+            # "not present" is a benign no-op for idempotent UI clicks;
+            # truly malformed input would have been rejected earlier.
+            raise HTTPException(404, msg)
+        _invalidate_health_cache()
+        return JSONResponse({"ok": True, "message": msg})
 
     # ------------------------------------------------------------------
     # Compare clusters (interactive: "why didn't these two playbooks merge?")

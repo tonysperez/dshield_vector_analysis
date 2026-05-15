@@ -1,0 +1,20 @@
+# Tokens that the shell parser surfaces as "commands" but are actually
+# attacker-named payload binaries, prompt leakage, or other artifacts.
+# The Health page (ROADMAP #11.5) buckets these as `denied` rather
+# than `needs_def`, and the LLM grounding block omits them entirely
+# (they'd just be noise in the prompt).
+#
+# Format: `<token>: "<one-line rationale>"`.
+# Edited via the Health page's block/unblock buttons or by hand.
+# The cache-hash machinery picks the file up automatically; any
+# affected cached enrichments get re-LLM'd on the next backward firing.
+#
+# Token comparison is case-insensitive — the parser lowercases before
+# lookup, so entries are stored in lowercase.
+
+
+"clulr": "Mirai-family probe identifier passed to busybox. Not a command."
+"enter": "Leaks from the passwd interactive prompt 'Enter new UNIX password:'. Not a command."
+"hltez": "Mirai-family probe identifier passed to busybox. Not a command."
+"hwdyfhnn": "Attacker-generated random payload filename (8-char random ID pattern)."
+"satori": "Mirai-family variant identifier passed to busybox. Not a command."

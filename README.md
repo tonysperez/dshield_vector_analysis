@@ -862,7 +862,7 @@ Kibana → Stack Management → Saved Objects → Import → select file → con
 | `es-dashboards/command-enrichment-dashboard.ndjson` | `[DShield] Command Enrichment` | `enriched-dshield.cowrie.command-default` |
 | `es-dashboards/session-analysis.ndjson` | `[DShield] Session Behavior Analysis` | `rollup-dshield.cowrie.session-default` |
 
-If your index names differ from the defaults, edit the imported data views after import: Stack Management → Data Views → find the view → edit the index pattern title to match your actual index name. The console at `/insights` is the recommended way to browse playbooks and campaigns; Kibana coverage is intentionally lighter.
+If your index names differ from the defaults, edit the imported data views after import: Stack Management → Data Views → find the view → edit the index pattern title to match your actual index name. The console at `/insights` is the recommended way to browse playbooks and campaigns; `/health` shows curation gaps in the LLM-grounding data (commands seen in the corpus that lack a curated description, plus an analyst-managed denylist for known-not-a-command tokens) — see ROADMAP #11.5. Kibana coverage is intentionally lighter.
 
 **Step 13 — Add to the recurring schedule**
 
