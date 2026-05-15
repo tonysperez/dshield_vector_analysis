@@ -77,8 +77,33 @@ _URL_RE = re.compile(
 _SSH_KEY_RE = re.compile(
     r"ssh-(?:rsa|dss|ed25519|ecdsa-[A-Za-z0-9-]+)\s+[A-Za-z0-9+/=]{40,}",
 )
-# Stand-alone SHA-256 / SHA-1 / MD5 hex strings appearing in command text.
-_HASH_RE = re.compile(r"\b(?:[A-Fa-f0-9]{64}|[A-Fa-f0-9]{40}|[A-Fa-f0-9]{32})\b")
+# Hash extraction — context-anchored to avoid spurious matches against
+# UUIDs without dashes, request IDs, Cowrie fakefs identifiers, or any
+# other 32/40/64-hex tokens that aren't actually file hashes. ROADMAP
+# issue #9. Two complementary patterns:
+#
+#   1. `_HASH_PREFIX_RE`: `sha256:HEX`, `sha1:HEX`, `md5:HEX` — the
+#      conventional IOC-style prefix. Always safe.
+#   2. `_HASH_TOOL_RE`: a HEX token in a command_input event whose text
+#      *also* contains a known hash-producing tool name. The match is
+#      gated by `_HASH_TOOL_NAME_RE.search(text)` in `_extract_artifacts`
+#      so any standalone hex token gets folded in only when there's
+#      tool-context elsewhere in the same command line.
+#
+# Splitting the gate from the hex match keeps the regexes simple and
+# avoids pipe/semicolon traversal issues (real attack chains pipe
+# through `head`/`grep` constantly).
+_HEX_LEN = r"(?:[A-Fa-f0-9]{64}|[A-Fa-f0-9]{40}|[A-Fa-f0-9]{32})"
+_HASH_PREFIX_RE = re.compile(
+    rf"\b(?:sha256|sha1|md5)[:=]({_HEX_LEN})\b",
+    re.IGNORECASE,
+)
+_HASH_TOOL_NAME_RE = re.compile(
+    r"\b(?:sha256sum|sha512sum|sha384sum|sha224sum|sha1sum|md5sum|"
+    r"shasum|certutil|openssl\s+dgst|gpg\s+--print-md)\b",
+    re.IGNORECASE,
+)
+_HEX_RE = re.compile(rf"\b{_HEX_LEN}\b")
 
 
 # ===========================================================================
@@ -372,21 +397,47 @@ def _extract_artifacts(text: str) -> list[tuple[str, str]]:
     """Pull (kind, value) artifact tuples from a piece of command text.
 
     Kinds: `url`, `ssh_key`, `hash`. Conservative on purpose — every false
-    positive becomes a spurious cross-session edge.
+    positive becomes a spurious cross-session edge in the infrastructure
+    miner.
+
+    Hashes are context-anchored (ROADMAP #9): either the IOC-style
+    `sha256:HEX` / `md5:HEX` / `sha1:HEX` prefix is present, OR a known
+    hash-producing tool name (`sha256sum`, `md5sum`, `openssl dgst`,
+    `certutil`, etc.) appears anywhere in the same command line and a
+    bare hex token is also present. Standalone hex tokens with no
+    tool-context are ignored — they're typically UUIDs without dashes,
+    request ids, or fakefs paths, not real file hashes.
     """
     if not text:
         return []
     out: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def _add(kind: str, value: str) -> None:
+        key = (kind, value)
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(key)
+
     for m in _URL_RE.finditer(text):
-        out.append(("url", m.group(0)))
+        _add("url", m.group(0))
     for m in _SSH_KEY_RE.finditer(text):
         # Normalize: keep only the key-type and the first 32 chars of the
         # base64 body so trailing comments / labels don't fragment matches.
         key = m.group(0).split()
         if len(key) >= 2:
-            out.append(("ssh_key", f"{key[0]} {key[1][:32]}"))
-    for m in _HASH_RE.finditer(text):
-        out.append(("hash", m.group(0).lower()))
+            _add("ssh_key", f"{key[0]} {key[1][:32]}")
+
+    # Prefix-style hashes are always safe.
+    for m in _HASH_PREFIX_RE.finditer(text):
+        _add("hash", m.group(1).lower())
+    # Tool-context: only fold in standalone hex tokens when a hash tool
+    # name appears somewhere in the same command text.
+    if _HASH_TOOL_NAME_RE.search(text):
+        for m in _HEX_RE.finditer(text):
+            _add("hash", m.group(0).lower())
+
     return out
 
 
