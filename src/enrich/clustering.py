@@ -62,16 +62,25 @@ def compute_centroids(
     return centroids
 
 
-def novelty_score(normalized_emb: "np.ndarray", centroids: dict[int, "np.ndarray"]) -> float:
-    """1 - max cosine_sim to any centroid. embedding must already be L2-normalized."""
+def novelty_score(vec: "np.ndarray", centroids: dict[int, "np.ndarray"]) -> float:
+    """1 - max cosine_sim to any centroid. Vec need not be unit-norm.
+
+    Proper cosine sim — divides by `|vec| * |c|`. Backward compatible for the
+    L2-normalized embedding case (|vec|=1 → identical to the prior formula),
+    but also correct on the scalar-augmented rows used at clustering time
+    (ROADMAP #12: in-run novelty is scored in the same space HDBSCAN saw).
+    """
     if not centroids:
+        return 1.0
+    norm_v = float(np.linalg.norm(vec))
+    if norm_v == 0.0:
         return 1.0
     best = -1.0
     for c in centroids.values():
         norm_c = float(np.linalg.norm(c))
         if norm_c == 0.0:
             continue
-        sim = float(np.dot(normalized_emb, c)) / norm_c
+        sim = float(np.dot(vec, c)) / (norm_v * norm_c)
         if sim > best:
             best = sim
     return float(1.0 - max(0.0, best))
@@ -171,13 +180,22 @@ def run_layer_clustering(
       2. L2-normalize embeddings -> n×D matrix.
       3. Optionally hstack a weighted scalar block.
       4. Run HDBSCAN.
-      5. Compute centroids from the pure embedding matrix.
-      6. Score novelty per doc against centroids.
+      5. Compute centroids in BOTH spaces (pure + augmented when scalar_weight>0).
+      6. Score per-doc novelty in the augmented space (same one HDBSCAN saw).
       7. Bulk-update doc cluster fields via update_script.
-      8. Write centroid + run_summary docs to clusters_index.
+      8. Persist pure-embedding centroids + run_summary docs to clusters_index.
 
-    Centroids are computed from pure embeddings (not scalar-augmented) so
-    centroid storage and triage scoring stay consistent across layers.
+    Why two centroid sets (ROADMAP #12): HDBSCAN labels come from
+    `cluster_matrix` (pure embedding + weighted scalar block). Scoring a row's
+    novelty against pure-embedding centroids would let a row that was pulled
+    into cluster X by its scalars score high novelty against X — the
+    "in-cluster doc escalated as novel" Heisenbug. So the per-doc
+    `novelty_score` is computed in the same augmented space.
+
+    The *persisted* centroid stays pure-embedding because `load_centroids` +
+    triage compare it against a fresh command's bare embedding — triage has no
+    way to materialise that command's scalars (occurrence_count, etc. are
+    corpus-derived, not known at first-touch time).
     """
     require_cluster_deps()
 
@@ -229,7 +247,6 @@ def run_layer_clustering(
         metric="euclidean",
     )
     cluster_labels_arr = clusterer.fit_predict(cluster_matrix)
-    del cluster_matrix
 
     unique_labels = [int(l) for l in np.unique(cluster_labels_arr)]
     valid_cluster_ids = [l for l in unique_labels if l >= 0]
@@ -237,7 +254,16 @@ def run_layer_clustering(
     n_outliers = int(np.sum(cluster_labels_arr == -1))
     log.info("[%s] HDBSCAN: %d clusters, %d outliers", layer_label, n_clusters, n_outliers)
 
+    # Pure-embedding centroids — persisted to ES for triage / external use.
     centroids = compute_centroids(normalized, cluster_labels_arr)
+    # Augmented-space centroids — used for in-run novelty scoring so the
+    # score reflects the same geometry HDBSCAN clustered on. When
+    # scalar_weight==0 the two are identical; share the dict to save the
+    # extra pass over the matrix.
+    if scalar_weight > 0.0:
+        centroids_for_novelty = compute_centroids(cluster_matrix, cluster_labels_arr)
+    else:
+        centroids_for_novelty = centroids
 
     sample_map: dict[int, list[str]] = {lbl: [] for lbl in valid_cluster_ids}
     for lbl, label_text in zip(cluster_labels_arr, labels_list):
@@ -253,7 +279,7 @@ def run_layer_clustering(
         lbl = int(lbl)
         is_outlier = lbl < 0
         cluster_id = "outlier" if is_outlier else f"cluster_{lbl}"
-        score = 1.0 if is_outlier else novelty_score(normalized[i], centroids)
+        score = 1.0 if is_outlier else novelty_score(cluster_matrix[i], centroids_for_novelty)
         update_actions.append({
             "_op_type": "update",
             "_id": doc_id,
@@ -267,6 +293,7 @@ def run_layer_clustering(
                 },
             },
         })
+    del cluster_matrix
 
     cluster_docs: list[dict] = []
     for lbl, centroid_vec in centroids.items():
