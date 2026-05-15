@@ -1,0 +1,28 @@
+description: >-
+  Secure Shell remote login client. In Cowrie attack chains: rare in the
+  honeypot session itself, but seen when attackers attempt to pivot —
+  `ssh root@<internal_ip>` after harvesting credentials, or
+  `ssh-keygen` + key install for persistence.
+flags:
+  "-i": "Use the specified identity (private key) file."
+  "-l": "Login name (alternative to `user@host` syntax)."
+  "-p": "Connect to the specified port (default 22)."
+  "-o": "Pass an inline ssh_config option. E.g. `-o StrictHostKeyChecking=no` (**common evasion** for unattended connects)."
+  "-N": "Don't execute a remote command. Used for port-forwarding-only sessions."
+  "-T": "Disable pseudo-terminal allocation."
+  "-t": "Force pseudo-terminal allocation (e.g. for interactive `sudo`)."
+  "-q": "Quiet — suppress most warnings/diagnostics."
+  "-v": "Verbose."
+  "-vv": "Very verbose (debug)."
+  "-vvv": "Maximum verbosity."
+  "-L": "Local port forwarding: -L [bind:]port:host:hostport."
+  "-R": "Remote port forwarding: -R [bind:]port:host:hostport. **Used for reverse shells.**"
+  "-D": "Dynamic port forwarding (SOCKS proxy)."
+  "-f": "Background after authentication."
+  "-X": "Enable X11 forwarding."
+  "-Y": "Enable trusted X11 forwarding."
+  "-A": "Forward authentication agent connection."
+  "-C": "Compress data during transfer."
+  "-n": "Redirect stdin from /dev/null."
+  "-4": "IPv4 only."
+  "-6": "IPv6 only."

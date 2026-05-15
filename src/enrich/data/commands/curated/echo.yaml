@@ -1,0 +1,10 @@
+description: >-
+  Print arguments to stdout. In Cowrie attack chains: probe execution
+  (`echo SHELL_TEST`), encoded-payload delivery (`echo -ne '\\x7fELF...' | sh`),
+  and as a heredoc-style write into files via redirection.
+flags:
+  "-n": "Suppress the trailing newline."
+  "-e": "Interpret backslash escapes (\\n, \\t, \\xNN, etc.). **Common payload-delivery flag** — used to write binary bytes."
+  "-E": "Disable backslash escape interpretation (default in some shells)."
+  "--help": "Help text."
+  "--version": "Version."

@@ -584,11 +584,19 @@ def enrich_one(
     max_retries: int,
     cooccurring_block: str = "(none)",
 ) -> tuple[Optional[CommandEnrichment], str, str]:
-    """Returns (enrichment_or_None, source, model)."""
+    """Returns (enrichment_or_None, source, model).
+
+    Injects a `<<<COMMAND_GROUND_TRUTH>>>` block (ROADMAP #11) listing the
+    binaries and the meaning of any flags actually present in the
+    command being enriched. Filtered to actually-present flags so the
+    LLM sees only what's relevant, not the whole flag vocabulary.
+    """
+    from ...command_grounding import build_ground_truth_block
     base_prompt = (
         prompt_template
         .replace("<<<COMMAND>>>", command)
         .replace("<<<COOCCURRING_COMMANDS>>>", cooccurring_block)
+        .replace("<<<COMMAND_GROUND_TRUTH>>>", build_ground_truth_block(command))
     )
     prompt = base_prompt
     last_raw = ""

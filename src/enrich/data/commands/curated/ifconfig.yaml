@@ -1,0 +1,9 @@
+description: >-
+  Configure or display network interfaces (legacy; `ip` is the modern
+  replacement). In Cowrie attack chains: reconnaissance — get the
+  internal IP and interface list to inform pivoting / lateral movement
+  decisions.
+flags:
+  "-a": "Display all interfaces (including down)."
+  "-s": "Short list (similar to `netstat -i`)."
+  "-v": "Verbose."

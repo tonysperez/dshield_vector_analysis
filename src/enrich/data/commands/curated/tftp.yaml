@@ -1,0 +1,15 @@
+description: >-
+  Trivial File Transfer Protocol client. Unauthenticated, unencrypted UDP
+  file transfer — **largely deprecated** for general use, but very common
+  in Mirai-family staging because it works on minimal embedded firmware
+  where wget/curl aren't available. `tftp -g -r <file>` is the canonical
+  "get this file" attacker invocation.
+flags:
+  "-g": "GET — fetch a file from the server."
+  "-p": "PUT — upload a file to the server."
+  "-r": "Specify the remote filename to GET/PUT."
+  "-l": "Specify the local filename."
+  "-c": "Pass `get` or `put` as a subcommand on the command line."
+  "-v": "Verbose."
+  "-V": "Version."
+  "-h": "Help."

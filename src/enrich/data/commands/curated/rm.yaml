@@ -1,0 +1,19 @@
+description: >-
+  Remove files and directories. In attacker chains: typically cleanup of
+  the dropper after the payload has been chmod'd and executed (`rm -rf
+  clean.sh; ./payload`), or removal of competing infections.
+flags:
+  "-r": "Recursive — remove a directory and all contents."
+  "-R": "Same as -r."
+  "--recursive": "Same as -r."
+  "-f": "Force — don't prompt, don't error on missing files. **Common evasion**."
+  "--force": "Same as -f."
+  "-rf": "Combined: recursive + force. Universal `wipe everything no questions` flag."
+  "-v": "Verbose — print each file removed."
+  "--verbose": "Same as -v."
+  "-i": "Interactive — prompt before each removal. Rare in scripts."
+  "--interactive": "Same as -i."
+  "-d": "Remove empty directories."
+  "--dir": "Same as -d."
+  "--preserve-root": "Refuse to act on `/`."
+  "--no-preserve-root": "Allow operation on `/`. **Highly destructive intent**."

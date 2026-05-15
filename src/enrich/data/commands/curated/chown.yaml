@@ -1,0 +1,17 @@
+description: >-
+  Change owner and/or group of files. In attacker chains: occasionally
+  used to claim ownership of dropped binaries, or to make files appear
+  to belong to a system user.
+flags:
+  "-R": "Recursive."
+  "--recursive": "Same as -R."
+  "-v": "Verbose."
+  "--verbose": "Same as -v."
+  "-c": "Report only files whose ownership changed."
+  "--changes": "Same as -c."
+  "-f": "Suppress most error messages."
+  "--silent": "Same as -f."
+  "--quiet": "Same as -f."
+  "-h": "Affect symlink itself, not the target."
+  "--no-dereference": "Same as -h."
+  "--reference": "Set owner/group to match another file's."

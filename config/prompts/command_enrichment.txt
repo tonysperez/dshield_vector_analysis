@@ -51,5 +51,14 @@ context is disabled.
 Co-occurring commands in the same sessions:
 <<<COOCCURRING_COMMANDS>>>
 
+COMMANDS REFERENCED:
+The block below lists the binaries and (when curated) the meaning of the
+flags actually present in the command being analysed. Treat it as
+authoritative ground truth — not classification material. Use it to avoid
+guessing about flag semantics. The block may be the literal string
+"(no recognized commands)" when nothing in the line could be looked up.
+
+<<<COMMAND_GROUND_TRUTH>>>
+
 Command:
 <<<COMMAND>>>

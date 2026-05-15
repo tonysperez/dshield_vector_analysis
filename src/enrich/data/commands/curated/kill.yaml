@@ -1,0 +1,12 @@
+description: >-
+  Send a signal to a process (default SIGTERM). In Cowrie attack chains:
+  competitor-evict — kill miners / backdoors from rival families before
+  installing your own. Often paired with `ps … | grep … | xargs kill`.
+flags:
+  "-9": "Send SIGKILL (uncatchable, immediate termination). **Common force-kill** for evicting competitors."
+  "-15": "Send SIGTERM (default, polite request)."
+  "-1": "Send SIGHUP."
+  "-2": "Send SIGINT."
+  "-l": "List signal names."
+  "-s": "Send the named signal."
+  "--signal": "Same as -s."

@@ -1,0 +1,21 @@
+description: >-
+  Change file attributes on a Linux filesystem. **Strong persistence /
+  anti-forensics indicator** in attacker chains — `+i` (immutable) prevents
+  deletion or modification even by root; `+a` (append-only) prevents log
+  cleanup. Often used after dropping a backdoor to lock it in place.
+flags:
+  "-R": "Recursive — apply to a directory tree."
+  "-V": "Verbose."
+  "-f": "Suppress most error messages."
+  "-v": "Set the file's version/generation number (rare in attacks)."
+  # The +/- flag specifications below aren't standard CLI flags, but they
+  # ARE the tokens an attacker types — including them lets the prompt-build
+  # surface their meaning when the LLM sees them.
+  "+i": "**Set IMMUTABLE bit** — file cannot be deleted, renamed, modified, or hard-linked. Classic persistence."
+  "-i": "Clear immutable bit."
+  "+a": "**Set APPEND-ONLY bit** — file can only be opened in append mode. Used on logs to prevent cleanup."
+  "-a": "Clear append-only bit."
+  "+s": "Set secure-delete bit (zero blocks on delete)."
+  "-s": "Clear secure-delete bit."
+  "+u": "Set undelete bit (data preserved for recovery)."
+  "-u": "Clear undelete bit."

@@ -1,0 +1,7 @@
+description: >-
+  Run a command immune to hangup (SIGHUP) signals — i.e. it survives after
+  the controlling terminal closes / the SSH session disconnects. The
+  primary persistence wrapper attackers use to detach a payload from the
+  honeypot session that launched it. Almost always paired with `&` to
+  background the process.
+flags: {}

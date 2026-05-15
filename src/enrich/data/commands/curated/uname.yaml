@@ -1,0 +1,25 @@
+description: >-
+  Print details about the kernel and operating system. The single most-
+  common reconnaissance command in Cowrie data — attackers use it as a
+  cheap fingerprint to decide which architecture-specific payload to
+  drop. `uname -a` (all info) and `uname -s -v -n -r -m` are the
+  near-universal variants.
+flags:
+  "-a": "**All** information: kernel name, hostname, release, version, machine, processor, hardware platform, OS."
+  "--all": "Same as -a."
+  "-s": "Kernel name (e.g. Linux)."
+  "--kernel-name": "Same as -s."
+  "-n": "Network node hostname."
+  "--nodename": "Same as -n."
+  "-r": "Kernel release (e.g. 5.15.0-122-generic)."
+  "--kernel-release": "Same as -r."
+  "-v": "Kernel version."
+  "--kernel-version": "Same as -v."
+  "-m": "Machine hardware name (x86_64, armv7l, mips). **Drives architecture-specific payload selection.**"
+  "--machine": "Same as -m."
+  "-p": "Processor type."
+  "--processor": "Same as -p."
+  "-i": "Hardware platform."
+  "--hardware-platform": "Same as -i."
+  "-o": "Operating system."
+  "--operating-system": "Same as -o."

@@ -1,0 +1,23 @@
+description: >-
+  Report process status. In Cowrie attack chains: reconnaissance for
+  existing infections / mining processes (`ps -ef | grep [Mm]iner`,
+  `ps aux | grep cron`), and as part of competitor-evict logic that
+  kills processes matching specific names.
+flags:
+  "-e": "Show every process (-A equivalent)."
+  "-A": "Show every process (-e equivalent)."
+  "-f": "Full format listing (UID, PID, PPID, C, STIME, TTY, TIME, CMD)."
+  "-l": "Long format."
+  "-a": "Show processes with terminals."
+  "-x": "Show processes without controlling terminals."
+  "-u": "Show user-oriented format."
+  "-w": "Wide output."
+  "-F": "Extra-full format."
+  "-H": "Show process hierarchy (forest)."
+  "-T": "Show threads as separate lines."
+  "-o": "User-defined format."
+  "--sort": "Specify a sort order."
+  "-p": "Select processes by PID."
+  "--ppid": "Select processes by parent PID."
+  "-C": "Select processes by command name."
+  "--no-headers": "Suppress column headers."

@@ -139,7 +139,7 @@ The CLI groups verbs by layer: `<verb> [<layer>] [--source <source>]`. Every lay
 | `init-indexes` | `PUT` every index for the source (default `cowrie`) with explicit ECS settings + mappings from `es-mappings/<source>/*.json`. Idempotent — already-existing indexes are no-ops. |
 | `init-indexes --layer <name>` | Init a single layer. Valid layers: `commands`, `command_clusters`, `sessions`, `session_clusters`, `ips`, `ip_clusters`, `campaigns`. |
 | `init-indexes --update-mapping` | If an index exists, push **additive** mapping changes (new fields). Cannot change existing field types. Combine with `--layer` to scope. |
-| `enrich` | Phase 1: one enrichment pass — read new command events, dedup, LLM-classify, embed, bulk-write, advance command watermark. |
+| `enrich` | Phase 1: one enrichment pass — read new command events, dedup, LLM-classify, embed, bulk-write, advance command watermark. Each LLM call is grounded with a `COMMANDS REFERENCED` block listing the binaries (and curated per-flag descriptions, filtered to actually-present flags) in the command — see [`src/enrich/data/commands/`](src/enrich/data/commands/) for the curated YAMLs + vendored tldr-pages bundle. ROADMAP issue #11. |
 | `enrich --dry-run` | Read + group events, print stats; skip LLM and writes. |
 | `enrich --no-cloud` | Force-disable Phase 2 cloud escalation for this run, even if `cloud.enabled=true` in config. |
 | `enrich --ignore-config-hash` | Per-run override of `worker.cache_auto_invalidate`. Treat the cache as fresh through a prompt/cooccurrence config edit. Useful when LLM budget is tight. Same flag on `reembed` and `pipeline`. |

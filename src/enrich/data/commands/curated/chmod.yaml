@@ -1,0 +1,15 @@
+description: >-
+  Change file mode bits (permissions). In attacker chains, almost always
+  used as `chmod +x` or `chmod 777` immediately after dropping a payload
+  to make it executable.
+flags:
+  "-R": "Recursive — change mode of every file under a directory."
+  "--recursive": "Same as -R."
+  "-v": "Verbose — report every file processed."
+  "--verbose": "Same as -v."
+  "-c": "Report only files whose mode changed."
+  "--changes": "Same as -c."
+  "-f": "Suppress most error messages. Common in scripts that don't want stderr noise."
+  "--silent": "Same as -f."
+  "--quiet": "Same as -f."
+  "--reference": "Set mode to match another file's."

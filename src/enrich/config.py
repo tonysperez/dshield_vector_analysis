@@ -351,12 +351,46 @@ def _hash_prompt_files(cfg: AppConfig) -> str:
     return "\n".join(parts)
 
 
+# Path to the command-grounding data directory (ROADMAP #11). Hashed into
+# `compute_llm_config_hash` so that edits to curated descriptions or a
+# refreshed tldr.json bundle automatically invalidate cached enrichments.
+# Resolved relative to this module so it works regardless of cwd.
+_COMMANDS_DATA_DIR = Path(__file__).parent / "data" / "commands"
+
+
+def _hash_command_grounding() -> str:
+    """SHA-256 over the command-grounding data directory's content.
+
+    Walks `src/enrich/data/commands/` recursively, hashing every regular
+    file's content alongside its relative path. Missing directory returns
+    a fixed sentinel rather than a random digest so an unconfigured
+    install doesn't churn the cache.
+    """
+    if not _COMMANDS_DATA_DIR.exists():
+        return "missing"
+    parts: list[str] = []
+    for path in sorted(_COMMANDS_DATA_DIR.rglob("*")):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(_COMMANDS_DATA_DIR).as_posix()
+        try:
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            digest = hashlib.sha256(f"unreadable:{rel}".encode("utf-8")).hexdigest()
+        parts.append(f"{rel}={digest}")
+    return "\n".join(parts)
+
+
 def compute_llm_config_hash(cfg: AppConfig) -> str:
     """Fingerprint of the inputs that affect *LLM* enrichment output.
 
     Returns a 16-hex prefix of SHA-256 over:
       - LLM-affecting cooccurrence fields (sibling-context inputs).
       - SHA-256 of each configured prompt file's content.
+      - SHA-256 of the command-grounding data directory's content
+        (ROADMAP #11) — edits to curated descriptions or a refreshed
+        tldr.json bundle change the ground-truth block injected into
+        the prompt and therefore should invalidate cached enrichments.
 
     Used as one half of the auto-invalidating cache key (ROADMAP #7). A
     change here means the cached intent/tactics/techniques/description
@@ -369,7 +403,12 @@ def compute_llm_config_hash(cfg: AppConfig) -> str:
     cooc_subset = {k: cooc[k] for k in _LLM_COOC_FIELDS if k in cooc}
     cooc_payload = json.dumps(cooc_subset, sort_keys=True, separators=(",", ":"))
     prompt_payload = _hash_prompt_files(cfg)
-    combined = f"cooc:{cooc_payload}\nprompts:{prompt_payload}"
+    grounding_payload = _hash_command_grounding()
+    combined = (
+        f"cooc:{cooc_payload}\n"
+        f"prompts:{prompt_payload}\n"
+        f"grounding:{grounding_payload}"
+    )
     return hashlib.sha256(combined.encode("utf-8")).hexdigest()[:_CONFIG_HASH_LEN]
 
 

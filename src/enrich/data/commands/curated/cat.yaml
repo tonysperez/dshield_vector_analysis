@@ -1,0 +1,21 @@
+description: >-
+  Concatenate and print files to stdout. In Cowrie attack chains:
+  reconnaissance reads of `/proc/cpuinfo`, `/proc/version`, `/etc/issue`,
+  `/etc/passwd`, `/etc/shadow`, `/etc/os-release`. Also used inside
+  `cat <<EOF` heredocs to write multi-line payloads.
+flags:
+  "-A": "Show all non-printing characters."
+  "--show-all": "Same as -A."
+  "-b": "Number non-blank output lines."
+  "--number-nonblank": "Same as -b."
+  "-e": "Like -A but no -T (tabs preserved)."
+  "-E": "Display $ at end of each line."
+  "-n": "Number all output lines."
+  "--number": "Same as -n."
+  "-s": "Squeeze multiple adjacent blank lines."
+  "--squeeze-blank": "Same as -s."
+  "-T": "Display tabs as ^I."
+  "--show-tabs": "Same as -T."
+  "-u": "Ignored (POSIX compatibility)."
+  "-v": "Display non-printing characters except for LFD and TAB."
+  "--show-nonprinting": "Same as -v."

@@ -1,0 +1,43 @@
+# Hand-curated grounding for `wget`. Takes precedence over tldr.json.
+# Per ROADMAP #11: only flags actually present in the command being enriched
+# get surfaced to the LLM; this file is the full vocabulary it can pull from.
+description: >-
+  Non-interactive network downloader. Retrieves files via HTTP, HTTPS, or FTP.
+  Extremely common in attacker dropper chains; usually paired with `chmod +x`
+  and a direct execution of the downloaded binary.
+flags:
+  "-O": "Write output to the specified file. `wget -O /tmp/x http://…` is a classic dropper pattern."
+  "-o": "Log output to the specified file (lowercase). Distinct from `-O` (uppercase) which is the output filename."
+  "-q": "Quiet mode — suppress progress output. Lowers visibility in shell logs."
+  "-c": "Continue a partially downloaded file. Rare in attack chains."
+  "-r": "Recursive download (mirror)."
+  "-l": "Recursion depth limit when used with -r."
+  "-N": "Timestamp-based update — only re-download if upstream is newer."
+  "-t": "Number of retry attempts. `-t 0` = infinite retries."
+  "--tries": "Same as -t."
+  "-T": "Read timeout in seconds."
+  "--timeout": "Same as -T."
+  "-P": "Save downloads to the specified directory (prefix)."
+  "--directory-prefix": "Same as -P."
+  "-i": "Read URLs to fetch from the given file."
+  "-U": "Set the User-Agent string. Attackers commonly impersonate browsers or curl."
+  "--user-agent": "Same as -U."
+  "--user": "HTTP/FTP username."
+  "--password": "HTTP/FTP password (visible on the command line — bad opsec, common in scripts)."
+  "--no-check-certificate": "Disable TLS certificate validation. **Strong malware indicator** when fetching over HTTPS."
+  "--no-clobber": "Don't overwrite existing files."
+  "-nc": "Same as --no-clobber."
+  "--no-cache": "Disable HTTP cache headers."
+  "--no-cookies": "Disable cookie support."
+  "--header": "Add a custom HTTP request header."
+  "-b": "Background mode — fork into background after starting."
+  "--background": "Same as -b."
+  "-v": "Verbose."
+  "-d": "Debug output."
+  "-S": "Print server response headers."
+  "--spider": "HEAD request — check existence without downloading."
+  "-4": "IPv4 only."
+  "-6": "IPv6 only."
+  "-h": "Help text."
+  "-V": "Version."
+  "--version": "Print version and exit."

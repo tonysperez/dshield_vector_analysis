@@ -1,0 +1,14 @@
+description: >-
+  POSIX shell command interpreter. In Cowrie attack chains: target of
+  `curl … | sh` and `wget -O - … | sh` payload delivery — pipe a
+  downloaded script directly into a shell for execution. Often the
+  literal final step of a multi-command dropper.
+flags:
+  "-c": "Read commands from the next argument, not from a file. Common in `sh -c 'malicious'` patterns."
+  "-s": "Read from stdin."
+  "-i": "Interactive."
+  "-l": "Login shell."
+  "-x": "Trace each command before executing it (debug)."
+  "-e": "Exit on first error."
+  "-n": "Read commands but don't execute (syntax check)."
+  "-v": "Echo each input line as read."

@@ -1,0 +1,10 @@
+description: >-
+  Single executable that bundles ~300 stripped-down Unix utilities, designed
+  for embedded systems. In Cowrie attacks: the canonical Mirai-family
+  staging tool — `busybox wget`, `busybox tftp`, `busybox echo -e` payload
+  drops are everywhere. Often invoked because the target IoT firmware
+  doesn't have full `wget`/`curl` installed.
+flags:
+  "--list": "Print the list of bundled applets."
+  "--install": "Install symlinks for each applet."
+  "--help": "Help text."

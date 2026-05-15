@@ -1,0 +1,10 @@
+description: >-
+  Manipulate the cron table — the system's scheduled-task list. **Common
+  persistence mechanism**: attackers add an entry that re-fetches the
+  payload every N minutes, surviving reboot.
+flags:
+  "-e": "Edit the current user's crontab."
+  "-l": "List the current user's crontab."
+  "-r": "**Remove** the current user's crontab. Used both legitimately and to wipe competing infections."
+  "-u": "Operate on the specified user's crontab (root only)."
+  "-i": "Prompt before delete (-r)."
