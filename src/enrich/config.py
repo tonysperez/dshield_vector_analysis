@@ -164,7 +164,24 @@ class IPConfig(BaseModel):
     cluster_min_cluster_size: int = 3
     # See SessionConfig.cluster_min_samples for rationale. ROADMAP issue #5.
     cluster_min_samples: int = 2
+    # Weight on the behavior-scalar sub-block (total_sessions,
+    # login_success_rate, mean_novelty, mean_session_duration_s). These
+    # break ties on the embedding axis and should stay subdued — 0.05 is
+    # the empirically-tuned default.
     cluster_scalar_weight: float = 0.05
+    # Weight on the attribution-scalar sub-block (country one-hot, ASN
+    # bucket, credential hash). Slightly hotter than behavior because
+    # these are attribution signals, not noise. ROADMAP issue #8.
+    cluster_attribution_weight: float = 0.10
+    # ASN bucketing: top-N ASNs each get a dedicated one-hot column; all
+    # other ASNs share a single pooled "other" column. Computed via a
+    # corpus-wide ES terms agg at cluster time.
+    attribution_top_asns: int = 50
+    # Credential feature-hash dimension. Each unique (user:pass) the IP
+    # tried is hashed into one of K bins (stable SHA-256-based hash); the
+    # column value is that bin's share of the IP's credential set, so the
+    # block sums to 1 per row. K=16 trades collisions for compactness.
+    attribution_cred_hash_dim: int = 16
     page_size: int = 1000
     batch_size: int = 200
 

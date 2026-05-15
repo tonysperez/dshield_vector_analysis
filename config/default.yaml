@@ -181,7 +181,22 @@ ip:
   cluster_min_cluster_size: 3
   # See session.cluster_min_samples for rationale. ROADMAP issue #5.
   cluster_min_samples: 2
-  # Scalars: total_sessions, login_success_rate, mean_novelty_score, mean_session_duration_s.
+  # Weight on the BEHAVIOR sub-block (total_sessions, login_success_rate,
+  # mean_novelty_score, mean_session_duration_s). Subdued because these
+  # break ties on the embedding axis.
   cluster_scalar_weight: 0.05
+  # Weight on the ATTRIBUTION sub-block (country one-hot, ASN bucket,
+  # credential hash). Slightly hotter than behavior because these are
+  # attribution signals, not noise — keeps two-bots-running-Mirai-from-
+  # different-ASNs from clustering together. ROADMAP issue #8.
+  cluster_attribution_weight: 0.10
+  # Top-N ASNs each get a dedicated one-hot column in the ASN bucket;
+  # all others share a pooled "other" column. Computed via a corpus-wide
+  # ES terms agg at cluster time.
+  attribution_top_asns: 50
+  # Credential feature-hash dimension. Each unique (user:pass) the IP
+  # tried is hashed into one of K bins; the column is that bin's share
+  # of the IP's credential set (sum=1 per row).
+  attribution_cred_hash_dim: 16
   page_size: 1000
   batch_size: 200

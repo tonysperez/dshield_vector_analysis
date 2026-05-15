@@ -51,6 +51,7 @@
                       "first_seen":              { "type": "date" },
                       "last_seen":               { "type": "date" },
                       "ip_embed_version":        { "type": "keyword" },
+                      "credentials":             { "type": "keyword" },
                       "embedding": {
                         "type": "dense_vector",
                         "dims": 768,

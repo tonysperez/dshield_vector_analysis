@@ -10,6 +10,7 @@ concept) are mined into a separate index by `dshield_prism mine campaigns`.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
@@ -42,6 +43,12 @@ _IP_CLUSTER_UPDATE_SCRIPT = (
 )
 
 _IP_CLUSTER_SAMPLE_SIZE = 5
+
+# Per-IP credential set cap. Keeps the rollup doc bounded while preserving
+# the long tail of credential-spray attackers; collisions in the hash
+# feature are already the dominant noise source, so capping at 200 is
+# fine for the salient signal.
+_MAX_CREDENTIALS_PER_IP = 200
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +101,7 @@ def _fetch_ip_session_docs(
         "_source": [
             "source.geo", "source.as",
             "event.start", "event.end", "event.duration",
+            "user.name", "cowrie.password",
             "dshield.cowrie.enrichment.session.command_count",
             "dshield.cowrie.enrichment.session.login_success_count",
             "dshield.cowrie.enrichment.session.file_download_count",
@@ -143,6 +151,7 @@ def _build_ip_doc(
     last_seen: Optional[str] = None
     geo_info: dict = {}
     as_info: dict = {}
+    credentials_set: set[str] = set()
 
     for s in sessions:
         en = ((s.get("dshield") or {}).get("cowrie") or {}).get("enrichment", {}).get("session", {})
@@ -184,6 +193,18 @@ def _build_ip_doc(
         if not as_info and (s.get("source") or {}).get("as"):
             as_info = s["source"]["as"]
 
+        # Credential fingerprint accumulator. The session rollup carries
+        # the first-seen (user, password) it observed — we collect the
+        # union across the IP's sessions for the attribution scalar
+        # block (ROADMAP issue #8). Empty user OR empty password both
+        # contribute a tuple — credential-spray scanners frequently
+        # connect without a username and the empty-string case is
+        # itself a fingerprint.
+        username = ((s.get("user") or {}).get("name") or "")
+        password = ((s.get("cowrie") or {}).get("password") or "")
+        if username or password:
+            credentials_set.add(f"{username}:{password}")
+
     embedding = _mean_pool(embeddings) if embeddings else None
     dominant_intent = Counter(intents).most_common(1)[0][0] if intents else None
     mean_novelty = round(sum(novelty_scores) / len(novelty_scores), 4) if novelty_scores else None
@@ -214,6 +235,9 @@ def _build_ip_doc(
         ip_block["last_seen"] = last_seen
     if embedding:
         ip_block["embedding"] = embedding
+    if credentials_set:
+        # Sorted + capped so the doc is bounded and idempotent across runs.
+        ip_block["credentials"] = sorted(credentials_set)[:_MAX_CREDENTIALS_PER_IP]
 
     source_block: dict = {"ip": ip}
     if geo_info:
@@ -328,16 +352,25 @@ def iter_ip_docs(
     index: str,
     page_size: int = 1000,
 ) -> Iterator[tuple[str, list[float], str, dict]]:
-    """Yield (doc_id, embedding, source_ip, scalars)."""
+    """Yield (doc_id, embedding, source_ip, scalars).
+
+    `scalars` carries the behavior signals (`total_sessions`,
+    `login_success_rate`, `mean_novelty_score`, `mean_session_duration_s`)
+    *and* the attribution signals (`country_iso_code`, `as_number`,
+    `credentials`) used by the attribution scalar block. ROADMAP issue #8.
+    """
     body: dict = {
         "size": page_size,
         "_source": [
             "source.ip",
+            "source.geo.country_iso_code",
+            "source.as.number",
             "dshield.cowrie.enrichment.ip.embedding",
             "dshield.cowrie.enrichment.ip.total_sessions",
             "dshield.cowrie.enrichment.ip.successful_sessions",
             "dshield.cowrie.enrichment.ip.mean_novelty_score",
             "dshield.cowrie.enrichment.ip.mean_session_duration_s",
+            "dshield.cowrie.enrichment.ip.credentials",
         ],
         "query": {"exists": {"field": "dshield.cowrie.enrichment.ip.embedding"}},
         "sort": [{"@timestamp": "asc"}, {"_doc": "asc"}],
@@ -359,7 +392,10 @@ def iter_ip_docs(
             emb = ip_en.get("embedding")
             if not emb:
                 continue
-            source_ip = (src.get("source") or {}).get("ip", h["_id"])
+            source = src.get("source") or {}
+            source_ip = source.get("ip", h["_id"])
+            country = ((source.get("geo") or {}).get("country_iso_code")) or ""
+            as_number = ((source.get("as") or {}).get("number"))
             total = ip_en.get("total_sessions") or 1
             success = ip_en.get("successful_sessions") or 0
             scalars = {
@@ -367,13 +403,126 @@ def iter_ip_docs(
                 "login_success_rate": success / total,
                 "mean_novelty_score": ip_en.get("mean_novelty_score") or 0.0,
                 "mean_session_duration_s": ip_en.get("mean_session_duration_s") or 0.0,
+                # Attribution inputs:
+                "country_iso_code": country,
+                "as_number": int(as_number) if as_number is not None else None,
+                "credentials": list(ip_en.get("credentials") or []),
             }
             yield h["_id"], emb, source_ip, scalars
         search_after = hits[-1]["sort"]
 
 
-def build_ip_scalar_block(scalars_list: list[dict], weight: float) -> "np.ndarray":
-    """(n, 4) weighted scalar matrix for IP-level HDBSCAN."""
+def _compute_top_asns(es: Elasticsearch, ips_index: str, top_n: int) -> list[int]:
+    """Return the top-N most-frequent ASN numbers across the IP rollup.
+
+    Used by the attribution-block builder to bucket every other ASN into
+    a pooled "other" column. ROADMAP issue #8.
+
+    Returns an empty list when the index is empty or the agg fails — the
+    caller falls back to assigning every IP to the "other" bucket, which
+    just means ASN doesn't differentiate IPs in this run.
+    """
+    if top_n <= 0:
+        return []
+    try:
+        resp = es.search(
+            index=ips_index, size=0,
+            query={"exists": {"field": "source.as.number"}},
+            aggs={"by_asn": {"terms": {"field": "source.as.number", "size": top_n}}},
+        )
+        return [int(b["key"]) for b in resp["aggregations"]["by_asn"]["buckets"]]
+    except Exception as exc:
+        log.warning("could not compute top-ASN list: %s", exc)
+        return []
+
+
+def _hash_credential_bin(cred: str, k: int) -> int:
+    """Stable SHA-256-based hash of a credential string into [0, k).
+
+    Stable across processes (Python's built-in `hash` is randomised).
+    """
+    if k <= 0:
+        return 0
+    digest = hashlib.sha256(cred.encode("utf-8", errors="replace")).digest()
+    return int.from_bytes(digest[:8], "big") % k
+
+
+def _build_attribution_block(
+    scalars_list: list[dict],
+    *,
+    top_asns: list[int],
+    weight: float,
+    cred_hash_dim: int,
+) -> "np.ndarray":
+    """Attribution scalar sub-block: country one-hot + ASN bucket + cred hash.
+
+    Each of the three feature groups is pre-normalised to L2 ≤ 1, then
+    scaled by `weight`. Stacked horizontally so the resulting matrix has
+    shape `(n, k_country + k_asn + cred_hash_dim)` where:
+
+      - `k_country` = number of distinct country ISO codes observed
+        (empty-string IPs contribute to a single "unknown" column).
+      - `k_asn`     = `len(top_asns) + 1` (top-N + one "other" pool).
+      - `cred_hash_dim` is the fixed feature-hash width.
+
+    L2 contribution per row is at most ~`weight * sqrt(3)` (one active
+    column in each of country + ASN, and a unit-norm cred distribution).
+    With `weight=0.10` that's ~0.17, slightly above the behavior block's
+    max ~0.10 — matches the roadmap's "slightly hotter" target.
+
+    ROADMAP issue #8.
+    """
+    import numpy as np
+
+    n = len(scalars_list)
+    if n == 0:
+        return np.zeros((0, 0), dtype=np.float32)
+
+    # --- country one-hot ---------------------------------------------------
+    countries = [s.get("country_iso_code") or "" for s in scalars_list]
+    country_vocab = sorted(set(countries))
+    country_index = {c: i for i, c in enumerate(country_vocab)}
+    country_block = np.zeros((n, len(country_vocab)), dtype=np.float32)
+    for i, c in enumerate(countries):
+        country_block[i, country_index[c]] = 1.0
+
+    # --- ASN bucket: top-N one-hot + pooled "other" ------------------------
+    asn_index: dict[int, int] = {asn: i for i, asn in enumerate(top_asns)}
+    asn_block = np.zeros((n, len(top_asns) + 1), dtype=np.float32)
+    other_col = len(top_asns)
+    for i, s in enumerate(scalars_list):
+        asn = s.get("as_number")
+        col = asn_index.get(asn, other_col) if asn is not None else other_col
+        asn_block[i, col] = 1.0
+
+    # --- credential feature hash ------------------------------------------
+    cred_block = np.zeros((n, cred_hash_dim), dtype=np.float32)
+    if cred_hash_dim > 0:
+        for i, s in enumerate(scalars_list):
+            creds = s.get("credentials") or []
+            if not creds:
+                continue
+            counts = np.zeros(cred_hash_dim, dtype=np.float32)
+            for c in creds:
+                counts[_hash_credential_bin(c, cred_hash_dim)] += 1.0
+            total = counts.sum()
+            if total > 0:
+                cred_block[i] = counts / total  # normalised distribution
+
+    block = np.hstack([country_block, asn_block, cred_block]).astype(np.float32)
+    return block * weight
+
+
+def _build_behavior_block(
+    scalars_list: list[dict], weight: float,
+) -> "np.ndarray":
+    """Behavior scalar sub-block: total_sessions, login_success_rate,
+    mean_novelty_score, mean_session_duration_s.
+
+    Unchanged from the pre-#8 layout — split out from the combined
+    builder so the attribution block can be hstack'd separately at its
+    own (hotter) weight.
+    """
     import numpy as np
     total = np.array([s.get("total_sessions") or 1 for s in scalars_list], dtype=np.float32)
     success_rate = np.array([s.get("login_success_rate", 0.0) for s in scalars_list], dtype=np.float32)
@@ -389,6 +538,49 @@ def build_ip_scalar_block(scalars_list: list[dict], weight: float) -> "np.ndarra
     block[:, 2] = np.clip(novelty, 0.0, 1.0) * weight
     block[:, 3] = (np.log1p(duration) / np.log1p(max_duration)) * weight
     return block
+
+
+def build_ip_scalar_block(scalars_list: list[dict], weight: float) -> "np.ndarray":
+    """Backward-compat shim: behavior-only block at the given weight.
+
+    The full IP scalar block (behavior + attribution) is built by
+    `make_full_scalar_builder` and wired into `run_cluster` directly.
+    This shim is preserved for any external caller (smoke tests, etc.)
+    that still expects the simple `(scalars_list, weight) -> matrix`
+    signature.
+    """
+    return _build_behavior_block(scalars_list, weight)
+
+
+def make_full_scalar_builder(
+    *,
+    top_asns: list[int],
+    attribution_weight: float,
+    cred_hash_dim: int,
+):
+    """Return a builder closure that produces the combined IP scalar
+    matrix (behavior + attribution) given the per-run attribution params.
+
+    The clustering core (`run_layer_clustering`) accepts a single
+    `(scalars_list, weight)` callable for `scalar_block_builder`. The
+    weight argument it passes is the *behavior* weight; the attribution
+    weight is captured in the closure. ROADMAP issue #8.
+    """
+    import numpy as np
+
+    def _builder(scalars_list: list[dict], behavior_weight: float) -> "np.ndarray":
+        behavior = _build_behavior_block(scalars_list, behavior_weight)
+        attribution = _build_attribution_block(
+            scalars_list,
+            top_asns=top_asns,
+            weight=attribution_weight,
+            cred_hash_dim=cred_hash_dim,
+        )
+        if attribution.shape[1] == 0:
+            return behavior
+        return np.hstack([behavior, attribution]).astype(np.float32)
+
+    return _builder
 
 
 def run_cluster(
@@ -409,6 +601,22 @@ def run_cluster(
             "Run 'rollup ips' first, or check elasticsearch.indexes.cowrie.ips_rollup in config."
         )
 
+    # Compute the top-N ASN bucket once per run; share across all rows.
+    top_asns = _compute_top_asns(es, ips_idx, ipcfg.attribution_top_asns)
+    log.info(
+        "[cowrie.ips] attribution: top_asns=%d (configured=%d) cred_hash_dim=%d "
+        "behavior_weight=%.3f attribution_weight=%.3f",
+        len(top_asns), ipcfg.attribution_top_asns,
+        ipcfg.attribution_cred_hash_dim,
+        ipcfg.cluster_scalar_weight, ipcfg.cluster_attribution_weight,
+    )
+
+    scalar_builder = make_full_scalar_builder(
+        top_asns=top_asns,
+        attribution_weight=ipcfg.cluster_attribution_weight,
+        cred_hash_dim=ipcfg.attribution_cred_hash_dim,
+    )
+
     return run_layer_clustering(
         es=es,
         docs_iter=iter_ip_docs(es, ips_idx, ipcfg.page_size),
@@ -416,7 +624,7 @@ def run_cluster(
         clusters_index=clusters_idx,
         mapping_path=_IP_CLUSTERS_MAPPING,
         update_script=_IP_CLUSTER_UPDATE_SCRIPT,
-        scalar_block_builder=build_ip_scalar_block,
+        scalar_block_builder=scalar_builder,
         min_cluster_size=ipcfg.cluster_min_cluster_size,
         min_samples=ipcfg.cluster_min_samples,
         scalar_weight=ipcfg.cluster_scalar_weight,
