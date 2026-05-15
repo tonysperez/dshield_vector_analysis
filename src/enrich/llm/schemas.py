@@ -255,6 +255,73 @@ PLAYBOOK_NAME_JSON_SCHEMA: dict = {
 
 
 # ---------------------------------------------------------------------------
+# Playbook-name disambiguation (ROADMAP #10): pass 2 re-prompts the LLM
+# when multiple clusters end up with the same pass-1 name. The LLM returns
+# a structured list of distinct new names, one per renamable cluster.
+# ---------------------------------------------------------------------------
+
+class PlaybookRename(BaseModel):
+    cluster_id: str
+    new_name: str
+    rationale: str = ""
+
+    @field_validator("new_name")
+    @classmethod
+    def _clean(cls, v: str) -> str:
+        v = (v or "").strip().strip('"').strip("'").rstrip(".")
+        words = v.split()
+        # Pass-2 names can be slightly longer than pass-1's 3-5 words to
+        # accommodate a distinguishing suffix (e.g. "via 47.83.203.183").
+        if len(words) > 8:
+            words = words[:8]
+        return " ".join(words)
+
+
+class PlaybookDisambiguation(BaseModel):
+    """LLM response for a pass-2 disambiguation call. One element per
+    renamable cluster in the collision group."""
+    renames: list[PlaybookRename]
+
+
+PLAYBOOK_DISAMBIGUATE_JSON_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "renames": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "cluster_id": {
+                        "type": "string",
+                        "description": "Cluster id this rename applies to.",
+                        "minLength": 1,
+                    },
+                    "new_name": {
+                        "type": "string",
+                        "description": (
+                            "3-8 word distinct name. Must keep the family signal "
+                            "and add a distinguishing axis (IOC / intent / behaviour)."
+                        ),
+                        "minLength": 3,
+                        "maxLength": 120,
+                    },
+                    "rationale": {
+                        "type": "string",
+                        "description": "One short sentence on what makes this cluster distinct.",
+                        "maxLength": 200,
+                    },
+                },
+                "required": ["cluster_id", "new_name"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["renames"],
+    "additionalProperties": False,
+}
+
+
+# ---------------------------------------------------------------------------
 # Cluster-pair explanation (interactive: "why didn't these two playbooks merge?")
 # ---------------------------------------------------------------------------
 

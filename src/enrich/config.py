@@ -207,6 +207,12 @@ class PromptsConfig(BaseModel):
     command_enrichment: str
     command_deep_dive: Optional[str] = None
     playbook_name: Optional[str] = None
+    # Pass-2 of `name playbooks`: re-prompts the LLM when multiple clusters
+    # end up with the same pass-1 name, asking it to produce distinct
+    # names that capture what makes each cluster substantively different.
+    # Optional — when unset, pass 2 is skipped (collisions keep their
+    # pass-1 names). ROADMAP issue #10.
+    playbook_disambiguate: Optional[str] = None
     # Console-facing: plain-language explanation of why two session clusters
     # weren't merged into the same playbook. Used by the /compare endpoint
     # and the explain_cluster_pair.py CLI's --explain flag.

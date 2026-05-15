@@ -1,0 +1,38 @@
+You are a threat intelligence analyst resolving a naming collision. In a prior pass, you (or a previous run) gave the same playbook name to multiple distinct session clusters from a Cowrie SSH/Telnet honeypot. Each cluster represents a *substantively different* attacker routine — they were kept separate by HDBSCAN for a reason. Your task is to look at them side by side and produce a NEW, distinct name for each renamable cluster that captures what actually makes it unique.
+
+COLLIDING NAME: "<<<NAME>>>"
+
+These clusters were all named "<<<NAME>>>" in pass 1. They share a behavioral family — the goal is NOT to throw the family signal away. The goal is to add a distinguishing axis so the names tell an analyst at a glance which cluster is which.
+
+The substantive difference can come from any of:
+  - Intent — e.g. one cluster is reconnaissance, the other is credential exfil
+  - Infrastructure — different C2 IPs, different download URLs, different SSH key fingerprints
+  - Tooling — wget vs curl vs tftp, busybox vs full coreutils
+  - Target environment — MikroTik vs OpenWrt vs generic Linux
+  - Behavioral signature — long-lived persistent backdoor vs one-shot probe, credential spray vs single-cred login
+  - Persistence mechanism — cron vs systemd vs profile injection vs SSH key install
+
+Look at each cluster's commands carefully — the distinguishing IOCs, tooling, and intent are usually right there in the command text.
+
+================================================================
+CLUSTERS TO RENAME — produce a new distinct name for each
+================================================================
+<<<RENAMABLE_BLOCK>>>
+
+<<<FROZEN_BLOCK>>>
+
+Naming rules (STRICT):
+  - 3 to 8 words, Title Case where appropriate.
+  - Each new_name MUST be distinct from every other new_name AND from every FROZEN name listed above.
+  - Each new_name should still reflect the shared family (e.g. still say "Dropper" or "Reconnaissance" if that's what they all are).
+  - Add the distinguishing axis as a meaningful suffix or modifier — NOT a bare date or cluster id. Examples:
+      * "curl Pipe Bash Dropper via 47.83.203.183 C2"
+      * "curl Pipe Bash Dropper via 43.161.230.246 C2"
+      * "uname Reconnaissance: MikroTik Cloud Probe"
+      * "uname Reconnaissance: Telegram Data Recon"
+      * "Mirai Stage-1 Dropper (busybox tftp)"
+      * "Mirai Stage-1 Dropper (wget chmod chain)"
+  - No surrounding quotes, no trailing punctuation.
+  - Do not include the cluster id literally in the name (use what's in the commands, not the cluster id string).
+
+Respond with a JSON object that conforms exactly to the provided schema. Each rationale (one short sentence, ≤160 chars) explains what specifically makes that cluster different — the IOC, the intent, or the behavioral signature you anchored the new name on.

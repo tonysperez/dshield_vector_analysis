@@ -11,6 +11,7 @@ import logging
 import math
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Iterable, Iterator, Optional
 
 from elasticsearch import Elasticsearch
@@ -18,7 +19,12 @@ from elasticsearch import Elasticsearch
 from ...cache import StateDB
 from ...config import AppConfig, Secrets, SessionConfig
 from ...es_client import bulk_write, make_client
-from ...llm.schemas import PLAYBOOK_NAME_JSON_SCHEMA, PlaybookName
+from ...llm.schemas import (
+    PLAYBOOK_DISAMBIGUATE_JSON_SCHEMA,
+    PLAYBOOK_NAME_JSON_SCHEMA,
+    PlaybookDisambiguation,
+    PlaybookName,
+)
 from .commands import hash_command, normalize
 
 log = logging.getLogger(__name__)
@@ -694,6 +700,318 @@ def _fetch_member_session_ids(
         search_after = hits[-1]["sort"]
 
 
+def _load_other_playbook_names(
+    es: Elasticsearch,
+    session_clusters_idx: str,
+    exclude_run_id: str,
+) -> dict[str, dict]:
+    """Load already-named playbooks from `session_clusters`, *excluding*
+    centroids written in the current run.
+
+    Returns `{playbook_id: {"name": str, "sample_session_ids": list[str],
+    "cluster_ids": list[str]}}`. A single playbook can span multiple
+    centroid docs (HDBSCAN clusters merged at name time share one
+    `playbook_id`); we collapse those into one entry per playbook.
+
+    Used by pass-2 disambiguation (ROADMAP #10) to find collisions
+    against playbooks named in any prior run.
+    """
+    by_pid: dict[str, dict] = {}
+    try:
+        body: dict = {
+            "size": 1000,
+            "_source": ["playbook_id", "playbook_name", "sample_session_ids",
+                        "cluster_id", "run_id"],
+            "query": {"bool": {"must": [
+                {"term": {"doc_type": "cluster"}},
+                {"exists": {"field": "playbook_id"}},
+                {"exists": {"field": "playbook_name"}},
+            ]}},
+            "sort": [{"@timestamp": "desc"}, {"_doc": "asc"}],
+        }
+        search_after = None
+        while True:
+            if search_after:
+                body["search_after"] = search_after
+            resp = es.search(index=session_clusters_idx, **body)
+            hits = resp["hits"]["hits"]
+            if not hits:
+                break
+            for h in hits:
+                src = h["_source"]
+                if src.get("run_id") == exclude_run_id:
+                    continue
+                pid = src.get("playbook_id")
+                if not pid:
+                    continue
+                entry = by_pid.setdefault(pid, {
+                    "playbook_id": pid,
+                    "name": src.get("playbook_name") or "",
+                    "sample_session_ids": [],
+                    "cluster_ids": [],
+                })
+                # Newest doc wins for name (centroid rewrites land first).
+                if not entry["name"] and src.get("playbook_name"):
+                    entry["name"] = src["playbook_name"]
+                for sid in (src.get("sample_session_ids") or []):
+                    if sid not in entry["sample_session_ids"]:
+                        entry["sample_session_ids"].append(sid)
+                cid = src.get("cluster_id")
+                if cid and cid not in entry["cluster_ids"]:
+                    entry["cluster_ids"].append(cid)
+            search_after = hits[-1]["sort"]
+    except Exception as exc:
+        log.warning("could not load existing playbook names (continuing): %s", exc)
+    return by_pid
+
+
+def _detect_name_collisions(
+    pass1_named: list[dict],
+    existing_playbooks: dict[str, dict],
+) -> list[dict]:
+    """Pure function — group playbooks by case-insensitive trimmed name.
+
+    `pass1_named` is the list of playbooks named in the current run (each
+    dict has `playbook_id`, `name`, plus pass-2 context fields). Entries
+    with empty names are silently skipped.
+
+    `existing_playbooks` is the output of `_load_other_playbook_names` —
+    playbooks named in any prior run. Entries are folded into a
+    collision group only if their name matches a name produced this run.
+    We never disturb an existing playbook's name in pass 2; existing
+    colliders are listed as "frozen" so the LLM can differentiate the
+    new ones from them.
+
+    Returns one entry per collision group with at least one renamable
+    member AND at least 2 total members (renamable + frozen). Groups
+    with a single playbook (no collision) are omitted.
+    """
+    by_name: dict[str, dict] = {}
+    def _key(n: str) -> str:
+        return (n or "").strip().lower()
+    for pb in pass1_named:
+        k = _key(pb.get("name"))
+        if not k:
+            continue
+        g = by_name.setdefault(k, {"name": pb["name"], "renamable": [], "frozen": []})
+        g["renamable"].append(pb)
+    for pb in existing_playbooks.values():
+        k = _key(pb.get("name"))
+        if not k:
+            continue
+        if k in by_name:
+            by_name[k]["frozen"].append(pb)
+    return [
+        g for g in by_name.values()
+        if g["renamable"] and (len(g["renamable"]) + len(g["frozen"])) > 1
+    ]
+
+
+def _format_cluster_block(pb: dict, commands: list[str]) -> str:
+    """Render one cluster's context (playbook id, sample sids, sample commands)
+    as a textual block for inclusion in the pass-2 disambiguation prompt."""
+    sids = pb.get("sample_session_ids") or []
+    cids = pb.get("cluster_ids") or []
+    lines = [
+        f"  Playbook id: {pb.get('playbook_id', '?')}",
+        f"  Cluster ids: {', '.join(cids) if cids else '(unknown)'}",
+        f"  Sample session ids: {', '.join(sids[:5]) if sids else '(none)'}",
+        "  Commands executed (sampled, deduplicated):",
+    ]
+    if commands:
+        lines.extend(f"    - {c}" for c in commands[:15])
+    else:
+        lines.append("    (no commands available)")
+    return "\n".join(lines)
+
+
+def _apply_playbook_name(
+    es: Elasticsearch,
+    session_clusters_idx: str,
+    sessions_idx: str,
+    run_id: str,
+    member_cids: list[str],
+    playbook_id: str,
+    name: str,
+    stats: dict,
+    *,
+    log_prefix: str = "playbook",
+) -> None:
+    """Write playbook_id + playbook_name onto the centroid docs and onto
+    every member session via update_by_query. Shared by pass-1 initial
+    naming and pass-2 disambiguation rename.
+    """
+    try:
+        es.update_by_query(
+            index=session_clusters_idx,
+            body={
+                "query": {"bool": {"must": [
+                    {"term": {"run_id": run_id}},
+                    {"term": {"doc_type": "cluster"}},
+                    {"terms": {"cluster_id": member_cids}},
+                ]}},
+                "script": {
+                    "source": (
+                        "ctx._source.playbook_id = params.playbook_id;"
+                        "ctx._source.playbook_name = params.name;"
+                    ),
+                    "params": {"playbook_id": playbook_id, "name": name},
+                },
+            },
+        )
+    except Exception as exc:
+        log.warning("Failed to update centroids for %s %s: %s", log_prefix, playbook_id, exc)
+        stats["centroid_update_errors"] += 1
+    try:
+        es.update_by_query(
+            index=sessions_idx,
+            body={
+                "query": {"terms": {
+                    "dshield.cowrie.enrichment.session.cluster.id": member_cids,
+                }},
+                "script": {
+                    "source": _SESSION_PLAYBOOK_NAME_SCRIPT,
+                    "params": {"playbook_id": playbook_id, "playbook_name": name},
+                },
+            },
+        )
+    except Exception as exc:
+        log.warning("Failed to update session docs for %s %s: %s", log_prefix, playbook_id, exc)
+        stats["session_update_errors"] += 1
+
+
+def _run_disambiguation_pass(
+    *,
+    es: Elasticsearch,
+    llm,                                            # open llm client
+    prompt_template: str,
+    group: dict,                                    # output of _detect_name_collisions
+    run_id: str,
+    session_clusters_idx: str,
+    sessions_idx: str,
+    events_idx: str,
+    cfg: AppConfig,
+    stats: dict,
+) -> None:
+    """Resolve one name-collision group via a single LLM call.
+
+    Builds the pass-2 prompt with each renamable cluster's rich context
+    plus any frozen colliders (already-named playbooks from prior runs
+    that share the name — for context only, never renamed). Calls the
+    LLM, validates the response, and applies the renames via
+    `_apply_playbook_name`.
+
+    Soft-fails on any LLM error / invalid JSON / collision in the
+    response — original pass-1 names stay. ROADMAP issue #10.
+    """
+    name = group["name"]
+    renamable = group["renamable"]
+    frozen = group["frozen"]
+
+    # Build context blocks. For frozen colliders we fetch sample commands
+    # from the events index using their stored sample_session_ids.
+    renamable_blocks: list[str] = []
+    for pb in renamable:
+        renamable_blocks.append(_format_cluster_block(pb, pb.get("unique_commands") or []))
+
+    frozen_blocks: list[str] = []
+    for pb in frozen:
+        sids = pb.get("sample_session_ids") or []
+        cmds = _fetch_session_sample_commands(
+            es, events_idx, sids[:5],
+            max_commands=cfg.session.playbook_sample_commands,
+        ) if sids else []
+        frozen_blocks.append(
+            f"  Name: \"{pb.get('name', '?')}\"\n" + _format_cluster_block(pb, cmds)
+        )
+
+    frozen_section = (
+        "FROZEN (already-named in a prior run; do NOT rename, listed for differentiation):\n"
+        + "\n\n".join(frozen_blocks)
+    ) if frozen_blocks else (
+        "FROZEN (already-named in a prior run; do NOT rename, listed for differentiation):\n"
+        "  (none — this is a within-run collision only)"
+    )
+
+    prompt = (
+        prompt_template
+        .replace("<<<NAME>>>", name)
+        .replace("<<<RENAMABLE_BLOCK>>>", "\n\n".join(renamable_blocks))
+        .replace("<<<FROZEN_BLOCK>>>", frozen_section)
+    )
+
+    try:
+        raw = llm.generate_json(
+            prompt,
+            schema=PLAYBOOK_DISAMBIGUATE_JSON_SCHEMA,
+            schema_name="playbook_disambiguate",
+            options={"max_tokens": 1024},
+        )
+        parsed = PlaybookDisambiguation.model_validate_json(raw)
+    except Exception as exc:
+        log.warning(
+            "Pass-2 LLM call failed for name '%s' (%d renamable, %d frozen): %s",
+            name, len(renamable), len(frozen), exc,
+        )
+        stats["disambiguate_failed"] += 1
+        return
+
+    # Build a {playbook_id: PlaybookRename} map. The LLM is told to use
+    # cluster ids; we tolerate either playbook_id or any of the member
+    # cluster ids as the key (LLMs occasionally confuse them).
+    by_pid: dict[str, str] = {pb["playbook_id"]: pb["playbook_id"] for pb in renamable}
+    by_cid: dict[str, str] = {}
+    for pb in renamable:
+        for cid in pb["member_cids"]:
+            by_cid[cid] = pb["playbook_id"]
+    resolved: dict[str, str] = {}
+    for r in parsed.renames:
+        if r.cluster_id in by_pid:
+            resolved[r.cluster_id] = r.new_name
+        elif r.cluster_id in by_cid:
+            resolved[by_cid[r.cluster_id]] = r.new_name
+
+    if len(resolved) < len(renamable):
+        log.warning(
+            "Pass-2 LLM omitted renames for %d cluster(s) under '%s'; "
+            "keeping pass-1 names for those",
+            len(renamable) - len(resolved), name,
+        )
+
+    # Final-distinctness gate: every new name must be distinct from the
+    # others in this group AND from all frozen names. Otherwise drop the
+    # offending one — pass-1 name stays.
+    frozen_names_lc = {(pb.get("name") or "").strip().lower() for pb in frozen}
+    seen_new_lc: set[str] = set()
+    final_renames: dict[str, str] = {}
+    for pid, new_name in resolved.items():
+        nlc = new_name.strip().lower()
+        if not nlc or nlc in frozen_names_lc or nlc in seen_new_lc:
+            log.warning(
+                "Pass-2 rename rejected (collides with frozen or another new name): "
+                "pid=%s new_name=%r", pid, new_name,
+            )
+            continue
+        seen_new_lc.add(nlc)
+        final_renames[pid] = new_name
+
+    # Apply.
+    for pb in renamable:
+        new_name = final_renames.get(pb["playbook_id"])
+        if not new_name:
+            continue
+        log.info(
+            "Pass-2 rename: %s '%s' → '%s'",
+            pb["playbook_id"], pb["name"], new_name,
+        )
+        _apply_playbook_name(
+            es, session_clusters_idx, sessions_idx,
+            run_id, pb["member_cids"], pb["playbook_id"], new_name, stats,
+            log_prefix="disambig",
+        )
+        stats["clusters_renamed"] += 1
+
+
 def _fetch_session_sample_commands(
     es: Elasticsearch,
     events_index: str,
@@ -728,7 +1046,6 @@ def run_name_playbooks(
     if not cfg.prompts.playbook_name:
         raise RuntimeError("prompts.playbook_name is unset in config.")
 
-    from pathlib import Path
     prompt_template = Path(cfg.prompts.playbook_name).read_text()
 
     es = make_client(cfg.elasticsearch, secrets)
@@ -816,6 +1133,9 @@ def run_name_playbooks(
     # Outliers don't appear in `nameable` — record them here for parity with
     # the old per-cluster stats.
     stats["skipped_outlier"] = sum(1 for c in clusters if c.get("cluster_id") == "outlier")
+    # Pass-1 named playbooks (carries pass-2 disambiguation context).
+    # ROADMAP issue #10.
+    named_in_run: list[dict] = []
 
     try:
         for group_id in sorted(docs_by_group.keys()):
@@ -921,51 +1241,53 @@ def run_name_playbooks(
                 group_id, member_cids, total_size, name, parsed.rationale or "no rationale",
             )
             stats["named"] += 1
+            named_in_run.append({
+                "playbook_id": playbook_id,
+                "name": name,
+                "member_cids": member_cids,
+                "sample_session_ids": sample_sids,
+                "unique_commands": unique_commands,
+                "group_id": group_id,
+                "size": total_size,
+            })
 
-            try:
-                es.update_by_query(
-                    index=session_clusters_idx,
-                    body={
-                        "query": {"bool": {"must": [
-                            {"term": {"run_id": run_id}},
-                            {"term": {"doc_type": "cluster"}},
-                            {"terms": {"cluster_id": member_cids}},
-                        ]}},
-                        "script": {
-                            "source": (
-                                "ctx._source.playbook_id = params.playbook_id;"
-                                "ctx._source.playbook_name = params.name;"
-                            ),
-                            "params": {
-                                "playbook_id": playbook_id,
-                                "name": name,
-                            },
-                        },
-                    },
-                )
-            except Exception as exc:
-                log.warning("Failed to update centroids for playbook %s: %s", group_id, exc)
-                stats["centroid_update_errors"] += 1
+            _apply_playbook_name(
+                es, session_clusters_idx, sessions_idx,
+                run_id, member_cids, playbook_id, name, stats,
+                log_prefix="playbook",
+            )
 
-            try:
-                es.update_by_query(
-                    index=sessions_idx,
-                    body={
-                        "query": {"terms": {
-                            "dshield.cowrie.enrichment.session.cluster.id": member_cids,
-                        }},
-                        "script": {
-                            "source": _SESSION_PLAYBOOK_NAME_SCRIPT,
-                            "params": {
-                                "playbook_id":   playbook_id,
-                                "playbook_name": name,
-                            },
-                        },
-                    },
+        # -------------------------------------------------------------------
+        # Pass 2 — disambiguate any naming collisions (ROADMAP issue #10).
+        # -------------------------------------------------------------------
+        if cfg.prompts.playbook_disambiguate and named_in_run:
+            existing = _load_other_playbook_names(
+                es, session_clusters_idx, exclude_run_id=run_id,
+            )
+            collisions = _detect_name_collisions(named_in_run, existing)
+            stats["collisions_detected"] = len(collisions)
+            if collisions:
+                disamb_prompt_template = Path(cfg.prompts.playbook_disambiguate).read_text()
+                log.info(
+                    "Pass-2 disambiguation: %d name collision group(s) "
+                    "(in-run renamables: %d; frozen colliders: %d)",
+                    len(collisions),
+                    sum(len(g["renamable"]) for g in collisions),
+                    sum(len(g["frozen"]) for g in collisions),
                 )
-            except Exception as exc:
-                log.warning("Failed to update session docs for playbook %s: %s", group_id, exc)
-                stats["session_update_errors"] += 1
+                for group in collisions:
+                    _run_disambiguation_pass(
+                        es=es,
+                        llm=llm,
+                        prompt_template=disamb_prompt_template,
+                        group=group,
+                        run_id=run_id,
+                        session_clusters_idx=session_clusters_idx,
+                        sessions_idx=sessions_idx,
+                        events_idx=events_idx,
+                        cfg=cfg,
+                        stats=stats,
+                    )
 
     finally:
         llm.__exit__(None, None, None)

@@ -132,6 +132,12 @@ prompts:
   command_enrichment:        "config/prompts/command_enrichment.txt"
   command_deep_dive:         "config/prompts/command_deep_dive.txt"
   playbook_name:             "config/prompts/playbook_name.txt"
+  # Pass-2 of `name playbooks`: re-prompts the LLM when multiple clusters
+  # end up with the same pass-1 name, asking it to produce distinct
+  # names that capture what makes each cluster substantively different.
+  # Comment out to skip pass 2 (collisions keep their pass-1 names).
+  # ROADMAP issue #10.
+  playbook_disambiguate:     "config/prompts/playbook_disambiguate.txt"
   # Used by the console's /compare page (and the explain_cluster_pair CLI
   # script's --explain flag). Local LLM only.
   cluster_pair_explanation:  "config/prompts/cluster_pair_explanation.txt"
