@@ -584,7 +584,17 @@ def run_mine_infrastructure(
             for a in sess_arts.get(s, ()):
                 if a in useful_arts:
                     art_counts[a] += 1
-        top_arts = sorted(art_counts.items(), key=lambda kv: -kv[1])[:_TOP_ARTIFACTS_PER_CAMPAIGN]
+        # Secondary sort key on `(kind, value)` keeps top-N ordering stable
+        # across re-runs when two artifacts tie on count. Python sort is
+        # stable but Counter iteration order depends on `sess_arts` insertion
+        # (ES-scan order on the raw session set), so without an explicit tie
+        # break the fingerprint string at line 595 could rotate just because
+        # a re-run produced the artifact ties in a different order — which
+        # would rotate the campaign id. Same family as the playbook-id
+        # rotation bug from ROADMAP #2; preempt the rotation here. #17.
+        top_arts = sorted(
+            art_counts.items(), key=lambda kv: (-kv[1], kv[0])
+        )[:_TOP_ARTIFACTS_PER_CAMPAIGN]
 
         ts_list = [sess_ts[s] for s in sids if s in sess_ts]
         first_seen = min(ts_list) if ts_list else None
