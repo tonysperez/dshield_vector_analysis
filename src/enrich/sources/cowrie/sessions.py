@@ -107,6 +107,7 @@ def _make_playbook_id(member_session_ids: Iterable[str]) -> str:
 def merge_clusters_into_playbooks(
     centroids: dict[str, list[float]],
     threshold: float,
+    linkage_delta: float = 0.03,
 ) -> dict[str, str]:
     """Group HDBSCAN cluster centroids into playbooks by cosine similarity.
 
@@ -123,6 +124,19 @@ def merge_clusters_into_playbooks(
 
     Outliers should be filtered out *before* calling this — they have no
     centroid and shouldn't be grouped. Empty input → empty dict.
+
+    Complete-linkage guard (ROADMAP #20): after the single-linkage
+    union-find, each merged group is validated by checking that *every*
+    pairwise sim among its members is ≥ `threshold - linkage_delta`. Any
+    group that fails is split back to one-cluster-per-playbook. This
+    prevents transitive mega-merges through a chain of borderline edges:
+    A~B at 0.965, B~C at 0.965, A~C at 0.89 would single-linkage into
+    one playbook even though A and C aren't really similar. With the
+    guard and `linkage_delta=0.03`, that group's min-pairwise (0.89) is
+    below `threshold-delta` (0.93), so the chain splits. Cheap O(k²) per
+    group; k is small. Pass `linkage_delta=0.0` to require every member
+    to pass the raw threshold; pass a larger delta for more permissive
+    merging.
     """
     import numpy as np
 
@@ -154,11 +168,40 @@ def merge_clusters_into_playbooks(
                 if ri != rj:
                     parent[ri] = rj
 
-    # Collect groups, key them by lex-smallest member for deterministic numbering.
+    # Collect raw single-linkage groups. Members per group are already
+    # cluster_ids sorted (insertion order over the sorted `cluster_ids`
+    # list at the top of this function).
     by_root: dict[int, list[str]] = {}
     for idx, cid in enumerate(cluster_ids):
         by_root.setdefault(find(idx), []).append(cid)
-    groups = sorted(by_root.values(), key=lambda members: members[0])
+
+    # Complete-linkage validation. Any merged group whose minimum pairwise
+    # sim is below `threshold - linkage_delta` is rejected and falls back
+    # to one-cluster-per-playbook. Groups of size ≤ 1 are unconditionally
+    # accepted (nothing to validate).
+    cutoff = threshold - linkage_delta
+    cid_to_idx = {c: i for i, c in enumerate(cluster_ids)}
+    validated_groups: list[list[str]] = []
+    for members in by_root.values():
+        if len(members) <= 1:
+            validated_groups.append(members)
+            continue
+        idxs = [cid_to_idx[c] for c in members]
+        min_sim = 1.0
+        for a in range(len(idxs)):
+            for b in range(a + 1, len(idxs)):
+                s = float(sim[idxs[a], idxs[b]])
+                if s < min_sim:
+                    min_sim = s
+        if min_sim >= cutoff:
+            validated_groups.append(members)
+        else:
+            # Split: each cluster becomes its own playbook.
+            for c in members:
+                validated_groups.append([c])
+
+    # Renumber deterministically: groups sorted by lex-smallest member.
+    groups = sorted(validated_groups, key=lambda members: members[0])
 
     out: dict[str, str] = {}
     for gidx, members in enumerate(groups):
