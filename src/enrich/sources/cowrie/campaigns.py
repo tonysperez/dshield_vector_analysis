@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import re
 import time
 import uuid
@@ -68,7 +69,11 @@ _DEFAULT_MINE_WINDOW_DAYS = 30
 
 _INFRA_MIN_SESSIONS = 3            # connected component must have >=N sessions
 _INFRA_MIN_DISTINCT_IPS = 2        # ...and >=N distinct source IPs (a single IP is not a campaign)
-_INFRA_MAX_ARTIFACT_FREQ = 0.50    # ignore artifacts present in >50% of all sessions (too generic)
+# `_INFRA_MAX_ARTIFACT_FREQ` was removed as part of the #22 follow-on:
+# the hard frequency cutoff dropped legitimate large-scale shared-infra
+# campaigns (e.g. an SSH public key adopted by every IP in a botnet).
+# Commodity artifacts are now demoted by per-artifact IDF weighting in
+# the top-N selection rather than excluded outright.
 _INFRA_MAX_COMPONENT_SIZE = 5000   # sanity cap on members per component to keep ES docs sane
 
 _SAMPLE_IPS_PER_CAMPAIGN      = 50
@@ -783,15 +788,37 @@ def run_mine_infrastructure(
         len(unique_hashes), n_llm_distinct, llm_arts_added, llm_arts_already_present,
     )
 
-    # Drop artifacts that appear in too many sessions (generic) or only one
-    # (no joining power).
-    max_freq_count = max(1, int(n_sessions * _INFRA_MAX_ARTIFACT_FREQ))
-    useful_arts = {
+    # Drop only artifacts that can't join sessions (df<2). The hard 50%
+    # upper cap that used to drop "too generic" artifacts was removed
+    # (#22 follow-on): a high-specificity artifact like a specific SSH
+    # public key can legitimately appear in >50% of sessions when the
+    # campaign is large, and the old filter dropped exactly those campaigns
+    # — treating success-at-scale as evidence of noise. Commodity artifacts
+    # still exist but are now demoted by the per-artifact IDF score
+    # (`log((N+1)/(df+1))`) used during top-N selection below, so a
+    # df=N commodity has weight ≈ 0 and sinks to the bottom of the
+    # campaign fingerprint without being categorically excluded.
+    n_sessions = len(sess_arts)  # recomputed post-overlay; LLM IOCs can add new sids
+    joinable_arts = {
         a: sids for a, sids in art_to_sessions.items()
-        if 2 <= len(sids) <= max_freq_count
+        if len(sids) >= 2
     }
-    log.info("[mine infra] %d/%d artifacts retained after frequency filter "
-             "(>=2 and <=%d sessions)", len(useful_arts), len(art_to_sessions), max_freq_count)
+    log.info("[mine infra] %d/%d artifacts retained as joinable (df >= 2)",
+             len(joinable_arts), len(art_to_sessions))
+
+    # Per-artifact IDF score for top-N selection. log((N+1)/(df+1)) — same
+    # shape as cooccurrence (#6) and pool weights (#19). Commodity artifacts
+    # (df ≈ N) get idf ≈ 0 → near-zero weight in top-N. Rare-and-distinctive
+    # artifacts get high idf and drive the fingerprint.
+    log_n = math.log(n_sessions + 1) if n_sessions > 0 else 0.0
+    idf_by_art: dict[tuple[str, str], float] = {
+        a: log_n - math.log(len(sids) + 1)
+        for a, sids in joinable_arts.items()
+    }
+    n_idf_zero = sum(1 for v in idf_by_art.values() if v <= 0.0)
+    log.info("[mine infra] %d/%d joinable artifacts at IDF=0 (df==N, "
+             "commodity — kept but weight-zero in fingerprint)",
+             n_idf_zero, len(joinable_arts))
 
     # Build session-session edge list via star expansion: each artifact
     # connects all its sessions to a synthetic "artifact-node" so we get
@@ -799,7 +826,7 @@ def run_mine_infrastructure(
     nodes: set[str] = set(sess_arts.keys())
     edges: list[tuple[str, str]] = []
     art_node_prefix = "__art__:"
-    for art, sids in useful_arts.items():
+    for art, sids in joinable_arts.items():
         anode = art_node_prefix + f"{art[0]}|{art[1]}"
         nodes.add(anode)
         for sid in sids:
@@ -825,18 +852,19 @@ def run_mine_infrastructure(
         art_counts: dict[tuple[str, str], int] = defaultdict(int)
         for s in sids:
             for a in sess_arts.get(s, ()):
-                if a in useful_arts:
+                if a in joinable_arts:
                     art_counts[a] += 1
-        # Secondary sort key on `(kind, value)` keeps top-N ordering stable
-        # across re-runs when two artifacts tie on count. Python sort is
-        # stable but Counter iteration order depends on `sess_arts` insertion
-        # (ES-scan order on the raw session set), so without an explicit tie
-        # break the fingerprint string at line 595 could rotate just because
-        # a re-run produced the artifact ties in a different order — which
-        # would rotate the campaign id. Same family as the playbook-id
-        # rotation bug from ROADMAP #2; preempt the rotation here. #17.
+        # Top-N selection uses `count * idf` so the rare-and-distinctive
+        # artifacts (high idf) dominate the fingerprint and a commodity
+        # artifact at df≈N (idf≈0) sinks even if it has high in-component
+        # count. Secondary sort key on `(kind, value)` keeps ties
+        # deterministic across re-runs (#17 rotation guard preserved).
         top_arts = sorted(
-            art_counts.items(), key=lambda kv: (-kv[1], kv[0])
+            art_counts.items(),
+            key=lambda kv: (
+                -(kv[1] * idf_by_art.get(kv[0], 0.0)),
+                kv[0],
+            ),
         )[:_TOP_ARTIFACTS_PER_CAMPAIGN]
 
         ts_list = [sess_ts[s] for s in sids if s in sess_ts]
@@ -890,7 +918,8 @@ def run_mine_infrastructure(
         "events_scanned":      n_events,
         "sessions_with_artifacts": n_sessions,
         "distinct_artifacts":  len(art_to_sessions),
-        "useful_artifacts":    len(useful_arts),
+        "joinable_artifacts":  len(joinable_arts),
+        "commodity_artifacts": n_idf_zero,
         "components_found":    len(real_components),
         "campaigns_written":   len(docs),
         "llm_iocs_added":      llm_arts_added,
