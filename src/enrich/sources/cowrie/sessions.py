@@ -262,16 +262,42 @@ def _command_entropy(counts: dict[str, int]) -> float:
 
 
 def _mean_pool(embeddings: list[list[float]]) -> list[float]:
-    """Mean-pool equal-length float vectors. Pure Python — no numpy required."""
+    """Mean-pool equal-length float vectors, then L2-normalize the result.
+
+    Each input is L2-normalized before summing so commands with slightly
+    larger embedding norms don't dominate the pooled vector (the embedding
+    model returns approximately-but-not-exactly unit-norm vectors, and the
+    norm bias is not uniform across command types). The pooled output is
+    also L2-normalized so direct cosine comparisons downstream (kNN, cluster
+    diagnostics, explain page) don't need a "did this caller remember to
+    normalize?" footgun. ROADMAP #13. Pure Python — no numpy required.
+    """
     if not embeddings:
         return []
     dims = len(embeddings[0])
     result = [0.0] * dims
-    n = len(embeddings)
+    n = 0
     for emb in embeddings:
+        norm = math.sqrt(sum(v * v for v in emb))
+        if norm == 0.0:
+            continue
+        inv = 1.0 / norm
         for i, v in enumerate(emb):
-            result[i] += v
-    return [v / n for v in result]
+            result[i] += v * inv
+        n += 1
+    if n == 0:
+        # Every input had zero norm — pathological but possible. Return a
+        # zero vector of correct dim rather than an empty list so downstream
+        # callers (which already gate `if embeddings else None`) don't have
+        # to special-case a sudden change in shape.
+        return [0.0] * dims
+    out_norm = math.sqrt(sum(v * v for v in result))
+    if out_norm == 0.0:
+        # Antipodal vectors summed to zero. Vanishingly unlikely on a 768-d
+        # embedding model; return a zero vector rather than NaN-ing the doc.
+        return [0.0] * dims
+    inv_out = 1.0 / out_norm
+    return [v * inv_out for v in result]
 
 
 def _build_session_doc(
