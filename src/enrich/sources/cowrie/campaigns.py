@@ -42,6 +42,7 @@ from elasticsearch.helpers import bulk
 
 from ...config import AppConfig, Secrets
 from ...es_client import init_index, make_client
+from .commands import hash_command, normalize
 
 log = logging.getLogger(__name__)
 
@@ -485,6 +486,147 @@ def _extract_artifacts(text: str) -> list[tuple[str, str]]:
     return out
 
 
+_HASH_LENS = {32, 40, 64}  # MD5 / SHA1 / SHA256 — same set as enrich/llm/schemas.py
+
+
+def _indicators_to_iocs(indicators: list[dict] | None) -> dict:
+    """Convert ECS `threat.indicator[]` back into the flat `iocs` shape
+    that `_validate_llm_iocs` consumes.
+
+    The enrichment pipeline persists LLM IOCs only as ECS indicators
+    (see `_build_indicators` in commands.py); the raw `iocs` block isn't
+    kept on the doc. This helper undoes that mapping so the overlay can
+    use a single validator regardless of input shape. ROADMAP #22.
+
+    Note: all hash lengths land under `file.hash.sha256` upstream (pre-
+    existing convention in `_build_indicators`), so we read just that
+    field — `_validate_llm_iocs` length-checks the hex against
+    `_HASH_LENS = {32, 40, 64}` so the actual MD5 / SHA1 / SHA256
+    distinction is preserved.
+    """
+    urls: list[str] = []
+    hashes: list[str] = []
+    for ind in indicators or []:
+        if not isinstance(ind, dict):
+            continue
+        t = ind.get("type")
+        if t == "url":
+            url_obj = ind.get("url") or {}
+            full = url_obj.get("full") if isinstance(url_obj, dict) else None
+            if isinstance(full, str):
+                urls.append(full)
+        elif t == "file":
+            file_obj = ind.get("file") or {}
+            if not isinstance(file_obj, dict):
+                continue
+            hash_obj = file_obj.get("hash") or {}
+            if not isinstance(hash_obj, dict):
+                continue
+            for hash_value in hash_obj.values():
+                if isinstance(hash_value, str):
+                    hashes.append(hash_value)
+    return {"urls": urls, "hashes": hashes}
+
+
+def _validate_llm_iocs(
+    iocs: dict | None,
+    sample_cmd: str,
+) -> list[tuple[str, str]]:
+    """Filter LLM-extracted IOCs down to the same shape `_extract_artifacts`
+    would emit, applying the same context-anchoring guards as the regex
+    miner (ROADMAP #22).
+
+    Hallucination guard:
+      - urls: must `fullmatch` `_URL_RE` (requires `http(s)://` scheme).
+        Bare hostnames or `evil.com` without scheme get rejected.
+      - hashes: bare hex of MD5/SHA1/SHA256 length AND the command text
+        must contain a known hash-producing tool name (sha256sum, md5sum,
+        openssl dgst, etc.). Matches the `_HASH_TOOL_NAME_RE` gate the
+        regex miner uses for bare hex tokens.
+
+    Returns `[(kind, value), ...]` deduped within this call.
+    """
+    if not iocs:
+        return []
+    out: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def _add(kind: str, value: str) -> None:
+        key = (kind, value)
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(key)
+
+    for url in iocs.get("urls", []) or []:
+        if not isinstance(url, str):
+            continue
+        u = url.strip()
+        if _URL_RE.fullmatch(u):
+            _add("url", u)
+
+    raw_hashes = iocs.get("hashes", []) or []
+    if raw_hashes and _HASH_TOOL_NAME_RE.search(sample_cmd or ""):
+        for h in raw_hashes:
+            if not isinstance(h, str):
+                continue
+            hh = h.strip().lower()
+            if len(hh) in _HASH_LENS and _HEX_RE.fullmatch(hh):
+                _add("hash", hh)
+
+    return out
+
+
+def _fetch_llm_iocs(
+    es: Elasticsearch,
+    commands_index: str,
+    hashes: set[str],
+    sample_cmd_by_hash: dict[str, str],
+    *,
+    batch_size: int = 500,
+) -> dict[str, list[tuple[str, str]]]:
+    """Bulk-mget enrichment docs by command hash; return `{hash: [(kind, value), ...]}`.
+
+    Each enrichment's `iocs.urls` / `iocs.hashes` is filtered through
+    `_validate_llm_iocs` using the per-hash sample command text. Missing
+    docs and docs without an `iocs` block yield an empty list.
+
+    Batched to keep ES requests bounded. Defensive: any exception during a
+    batch logs a warning and that batch's hashes get empty IOC lists
+    (mining continues — regex artifacts are unaffected).
+    """
+    out: dict[str, list[tuple[str, str]]] = {h: [] for h in hashes}
+    if not hashes:
+        return out
+    ids = list(hashes)
+    for i in range(0, len(ids), batch_size):
+        chunk = ids[i:i + batch_size]
+        try:
+            resp = es.mget(index=commands_index, ids=chunk)
+        except Exception as exc:
+            log.warning(
+                "[mine infra] LLM-IOC mget failed for batch of %d (continuing): %s",
+                len(chunk), exc,
+            )
+            continue
+        for doc in resp.get("docs") or []:
+            if not doc.get("found"):
+                continue
+            h = doc.get("_id")
+            if not h:
+                continue
+            src = doc.get("_source") or {}
+            # LLM IOCs are persisted as ECS `threat.indicator[]`, not as a
+            # raw iocs block (see _build_indicators in commands.py). Convert
+            # back to flat shape so the validator can apply the same gates
+            # the regex miner uses.
+            indicators = (src.get("threat") or {}).get("indicator")
+            iocs = _indicators_to_iocs(indicators)
+            sample = sample_cmd_by_hash.get(h, "")
+            out[h] = _validate_llm_iocs(iocs, sample)
+    return out
+
+
 def _iter_command_input_events(
     es: Elasticsearch, idx: str,
     *,
@@ -566,6 +708,7 @@ def run_mine_infrastructure(
     es = make_client(cfg.elasticsearch, secrets)
     raw_idx       = cfg.elasticsearch.indexes.cowrie.sessions_raw
     sessions_idx  = cfg.elasticsearch.indexes.cowrie.sessions_rollup
+    commands_idx  = cfg.elasticsearch.indexes.cowrie.commands
     out_idx       = cfg.elasticsearch.indexes.cowrie.campaigns
 
     t0 = time.time()
@@ -579,6 +722,12 @@ def run_mine_infrastructure(
     sess_ip:   dict[str, str] = {}
     sess_ts:   dict[str, str] = {}
     art_to_sessions: dict[tuple[str, str], set[str]] = defaultdict(set)
+    # Per-event hash record so we can fold in LLM-extracted IOCs after the
+    # streaming pass (ROADMAP #22). One sample of the raw command per
+    # unique hash is kept for the LLM-IOC validation gate (the hash-tool
+    # context anchor reads the sample command text).
+    sess_hash_pairs: list[tuple[str, str]] = []
+    sample_cmd_by_hash: dict[str, str] = {}
     n_events = 0
     for src in _iter_command_input_events(es, raw_idx, window_days=window_days):
         sid = (src.get("cowrie") or {}).get("session_id")
@@ -595,10 +744,44 @@ def run_mine_infrastructure(
         for art in _extract_artifacts(cmd):
             sess_arts[sid].add(art)
             art_to_sessions[art].add(sid)
+        # Capture (sid, hash) for the LLM-IOC overlay pass. Normalize +
+        # hash by the same rules the enrichment index keyed on, so the
+        # later mget hits the right docs.
+        if cmd:
+            cmd_norm, _ = normalize(cmd, cfg.worker.command_max_chars)
+            if cmd_norm:
+                h = hash_command(cmd_norm)
+                sess_hash_pairs.append((sid, h))
+                if h not in sample_cmd_by_hash:
+                    sample_cmd_by_hash[h] = cmd
     n_sessions = len(sess_arts)
     log.info("[mine infra] scanned %d command-input events across %d sessions; "
-             "extracted %d distinct artifacts",
+             "extracted %d distinct artifacts (regex pass)",
              n_events, n_sessions, len(art_to_sessions))
+
+    # Pass 2 — LLM IOC overlay. mget enrichments for every unique command
+    # hash we saw, validate IOCs against the same context-anchoring as the
+    # regex miner, and fold them into sess_arts / art_to_sessions. ROADMAP #22.
+    unique_hashes = set(sample_cmd_by_hash.keys())
+    iocs_by_hash = _fetch_llm_iocs(es, commands_idx, unique_hashes, sample_cmd_by_hash)
+    llm_arts_added = 0
+    llm_arts_already_present = 0
+    for sid, h in sess_hash_pairs:
+        for art in iocs_by_hash.get(h, ()):
+            if art in sess_arts[sid]:
+                llm_arts_already_present += 1
+                continue
+            sess_arts[sid].add(art)
+            art_to_sessions[art].add(sid)
+            llm_arts_added += 1
+    n_llm_distinct = sum(1 for arts in iocs_by_hash.values() for _ in arts)
+    log.info(
+        "[mine infra] LLM-IOC overlay: %d unique hashes consulted, "
+        "%d validated IOCs across all enrichments, "
+        "%d (sid, art) pairs added (regex didn't already have them), "
+        "%d (sid, art) pairs already covered by regex",
+        len(unique_hashes), n_llm_distinct, llm_arts_added, llm_arts_already_present,
+    )
 
     # Drop artifacts that appear in too many sessions (generic) or only one
     # (no joining power).
@@ -710,6 +893,8 @@ def run_mine_infrastructure(
         "useful_artifacts":    len(useful_arts),
         "components_found":    len(real_components),
         "campaigns_written":   len(docs),
+        "llm_iocs_added":      llm_arts_added,
+        "llm_iocs_redundant_with_regex": llm_arts_already_present,
         "run_id":              run_id,
         "dry_run":             dry_run,
         "runtime_seconds":     round(time.time() - t0, 2),
