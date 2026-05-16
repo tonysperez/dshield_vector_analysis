@@ -300,35 +300,70 @@ def _command_entropy(counts: dict[str, int]) -> float:
     return -sum((c / total) * math.log2(c / total) for c in counts.values() if c > 0)
 
 
-def _mean_pool(embeddings: list[list[float]]) -> list[float]:
-    """Mean-pool equal-length float vectors, then L2-normalize the result.
+# Fixed corpus-scale denominator for the IDF-style pool weight (ROADMAP #19).
+# Mirrors `_SCALAR_DENOM_OCCURRENCE_COUNT` from the command-cluster scalar
+# block (#14) — chosen well above the long-term P99 of command
+# occurrence_count so the weight is stable run-to-run and a future outlier
+# above the denominator just clamps to a small positive weight rather than
+# going negative.
+_POOL_IDF_N = 100000.0
+
+
+def _idf_pool_weight(occurrence_count: int | float | None) -> float:
+    """log((N+1)/(occ+1)) with `occ` clamped to [1, N]. Rare commands get
+    big weights; boilerplate gets small. Always positive (>= ~0)."""
+    if occurrence_count is None or occurrence_count < 1:
+        occurrence_count = 1
+    # Clamp the input so a misconfigured corpus that pushed `occ` above N
+    # doesn't make the log negative. The output minimum is then 0.
+    occ = min(float(occurrence_count), _POOL_IDF_N)
+    return math.log((_POOL_IDF_N + 1.0) / (occ + 1.0))
+
+
+def _mean_pool(
+    embeddings: list[list[float]],
+    weights: list[float] | None = None,
+) -> list[float]:
+    """Weighted mean-pool of equal-length float vectors, then L2-normalize.
 
     Each input is L2-normalized before summing so commands with slightly
-    larger embedding norms don't dominate the pooled vector (the embedding
-    model returns approximately-but-not-exactly unit-norm vectors, and the
-    norm bias is not uniform across command types). The pooled output is
-    also L2-normalized so direct cosine comparisons downstream (kNN, cluster
-    diagnostics, explain page) don't need a "did this caller remember to
-    normalize?" footgun. ROADMAP #13. Pure Python — no numpy required.
+    larger embedding norms don't dominate the pooled vector (ROADMAP #13).
+    The pooled output is also L2-normalized so direct cosine comparisons
+    downstream (kNN, cluster diagnostics, explain page) don't need a "did
+    this caller remember to normalize?" footgun.
+
+    When `weights` is supplied, each input's L2-normalized vector is
+    multiplied by its weight before summing — rare commands count more,
+    boilerplate counts less (ROADMAP #19, option (a)). Weight signs are
+    expected non-negative; pass `None` for uniform weighting.
+
+    Pure Python — no numpy required.
     """
     if not embeddings:
         return []
+    if weights is not None and len(weights) != len(embeddings):
+        raise ValueError(
+            f"weights/embeddings length mismatch: {len(weights)} vs {len(embeddings)}"
+        )
     dims = len(embeddings[0])
     result = [0.0] * dims
-    n = 0
-    for emb in embeddings:
+    n_contributing = 0
+    for idx, emb in enumerate(embeddings):
         norm = math.sqrt(sum(v * v for v in emb))
         if norm == 0.0:
             continue
-        inv = 1.0 / norm
+        w = 1.0 if weights is None else float(weights[idx])
+        if w == 0.0:
+            continue
+        scale = w / norm
         for i, v in enumerate(emb):
-            result[i] += v * inv
-        n += 1
-    if n == 0:
-        # Every input had zero norm — pathological but possible. Return a
-        # zero vector of correct dim rather than an empty list so downstream
-        # callers (which already gate `if embeddings else None`) don't have
-        # to special-case a sudden change in shape.
+            result[i] += v * scale
+        n_contributing += 1
+    if n_contributing == 0:
+        # Every input had zero norm OR zero weight — pathological but possible.
+        # Return a zero vector of correct dim rather than an empty list so
+        # downstream callers (which already gate `if embeddings else None`)
+        # don't have to special-case a sudden change in shape.
         return [0.0] * dims
     out_norm = math.sqrt(sum(v * v for v in result))
     if out_norm == 0.0:
@@ -432,6 +467,9 @@ def _build_session_doc(
             cowrie_extra["hassh_algorithms"] = cowrie["hassh_algorithms"]
 
     embeddings: list[list[float]] = []
+    # Per-command IDF weight for the pool — boilerplate (high occurrence)
+    # gets small weight, rare/distinctive commands dominate. ROADMAP #19.
+    embedding_weights: list[float] = []
     intents: list[str] = []
     novelty_scores: list[float] = []
     confidences: list[float] = []
@@ -444,6 +482,7 @@ def _build_session_doc(
         emb = en.get("embedding")
         if emb:
             embeddings.append(emb)
+            embedding_weights.append(_idf_pool_weight(en.get("occurrence_count")))
         if en.get("intent"):
             intents.append(en["intent"])
         cluster = en.get("cluster") or {}
@@ -454,7 +493,7 @@ def _build_session_doc(
         if c is not None:
             confidences.append(float(c))
 
-    embedding = _mean_pool(embeddings) if embeddings else None
+    embedding = _mean_pool(embeddings, embedding_weights) if embeddings else None
 
     dominant_intent, intent_distribution = _summarize_intents(intents)
 
