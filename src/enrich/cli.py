@@ -412,6 +412,16 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_mc.add_argument("--dry-run", action="store_true",
                       help="Mine without writing campaign docs")
+    p_mc.add_argument(
+        "--window-days",
+        type=int,
+        default=None,
+        help="Only consider sessions/events from the last N days. "
+             "Default (None) uses the miner's built-in default (currently 30); "
+             "pass 0 to disable windowing and scan the entire corpus (legacy "
+             "unbounded behaviour — slower and memory-hungrier on large "
+             "corpora). ROADMAP #21.",
+    )
 
     # pipeline — run every processing stage in order, raw → fully processed.
     # Mirrors the analytics + ingest systemd units but in one verb so a
@@ -692,7 +702,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[ERROR] Source {args.source!r} has no `campaigns` miner", flush=True)
             return 1
         try:
-            stats = mod.run_mine(cfg, secrets, kind=args.kind, dry_run=args.dry_run)
+            stats = mod.run_mine(
+                cfg, secrets,
+                kind=args.kind, dry_run=args.dry_run,
+                window_days=args.window_days,
+            )
         except RuntimeError as exc:
             print(f"[ERROR] {exc}", flush=True)
             return 1

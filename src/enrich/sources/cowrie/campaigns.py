@@ -35,7 +35,7 @@ import time
 import uuid
 from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Iterable
+from typing import Iterable, Optional
 
 from elasticsearch import Elasticsearch
 from elasticsearch.helpers import bulk
@@ -56,6 +56,14 @@ _CAMPAIGNS_MAPPING = "es-mappings/cowrie/campaigns.json"
 _BEHAVIOUR_MIN_SUPPORT_IPS = 5     # itemset must hold for >=N IPs to be a campaign
 _BEHAVIOUR_MIN_ITEMSET_SIZE = 2    # singletons aren't campaigns — they're playbooks
 _BEHAVIOUR_MAX_ITEMSET_SIZE = 6    # combinatorial guard; very few real ops chain >6 playbooks
+
+# Default look-back window for both miners. Pre-#21 both iterators read every
+# session/event ever indexed → IO + working-set grew linearly with corpus age,
+# and January-vs-June IPs could co-support an itemset that no real operator
+# ever assembled (a correctness issue separate from the OOM concern). 30 days
+# matches typical SOC pivot horizon. Override per-run via CLI `--window-days N`;
+# pass 0 (or negative) to disable the window entirely.
+_DEFAULT_MINE_WINDOW_DAYS = 30
 
 _INFRA_MIN_SESSIONS = 3            # connected component must have >=N sessions
 _INFRA_MIN_DISTINCT_IPS = 2        # ...and >=N distinct source IPs (a single IP is not a campaign)
@@ -126,11 +134,35 @@ def _campaign_id(kind: str, fingerprint: str) -> str:
     return f"cmp-{kind[:3]}-{h}"
 
 
+def _build_window_query(field: str, window_days: Optional[int]) -> dict:
+    """Return an ES query that scopes results to the last `window_days` days
+    by `field` (e.g. `event.start` for rollups, `@timestamp` for raw events).
+
+    `window_days <= 0` or `None` → `match_all` (no window). ROADMAP #21.
+    """
+    if window_days is None or window_days <= 0:
+        return {"match_all": {}}
+    return {
+        "range": {
+            field: {"gte": f"now-{int(window_days)}d/d"}
+        }
+    }
+
+
 def _iter_session_rollups(
-    es: Elasticsearch, idx: str, page_size: int = 1000,
+    es: Elasticsearch, idx: str,
+    *,
+    window_days: Optional[int] = _DEFAULT_MINE_WINDOW_DAYS,
+    page_size: int = 1000,
 ) -> Iterable[dict]:
-    """Yield every session rollup doc's _source. Uses search_after pagination
-    for stable iteration over potentially millions of docs."""
+    """Yield session rollup docs whose `event.start` is within the last
+    `window_days` days. Uses search_after pagination for stable iteration.
+
+    Window scoping (ROADMAP #21) keeps IO + working-set bounded as the
+    corpus ages and prevents January-vs-June IPs from co-supporting an
+    itemset that no real operator ever assembled. Pass `window_days=0` to
+    disable the window (legacy behaviour — read everything).
+    """
     body = {
         "size": page_size,
         "_source": [
@@ -139,7 +171,7 @@ def _iter_session_rollups(
             "dshield.cowrie.enrichment.session.playbook_name",
             "dshield.cowrie.enrichment.session.command_count",
         ],
-        "query": {"match_all": {}},
+        "query": _build_window_query("event.start", window_days),
         "sort": [{"event.start": "asc"}, {"_doc": "asc"}],
     }
     search_after = None
@@ -209,7 +241,12 @@ def _frequent_itemsets(
     return all_frequent
 
 
-def _build_ip_to_playbooks(es: Elasticsearch, sessions_idx: str) -> dict[str, dict]:
+def _build_ip_to_playbooks(
+    es: Elasticsearch,
+    sessions_idx: str,
+    *,
+    window_days: Optional[int] = _DEFAULT_MINE_WINDOW_DAYS,
+) -> dict[str, dict]:
     """Group session-rollup docs by source.ip; for each IP collect the
     *set* of canonical playbook ids it visited, plus the session ids and a
     time bound.
@@ -222,7 +259,7 @@ def _build_ip_to_playbooks(es: Elasticsearch, sessions_idx: str) -> dict[str, di
                    "first_seen": iso, "last_seen": iso}}`.
     """
     out: dict[str, dict] = {}
-    for src in _iter_session_rollups(es, sessions_idx):
+    for src in _iter_session_rollups(es, sessions_idx, window_days=window_days):
         ip  = (src.get("source") or {}).get("ip")
         sid = (src.get("cowrie") or {}).get("session_id")
         senr = (src.get("dshield", {}).get("cowrie", {}).get("enrichment", {}).get("session") or {})
@@ -260,6 +297,7 @@ def run_mine_behaviour(
     min_support: int = _BEHAVIOUR_MIN_SUPPORT_IPS,
     min_size: int   = _BEHAVIOUR_MIN_ITEMSET_SIZE,
     max_size: int   = _BEHAVIOUR_MAX_ITEMSET_SIZE,
+    window_days: Optional[int] = _DEFAULT_MINE_WINDOW_DAYS,
 ) -> dict:
     """Itemset-mining campaign discovery (the "A" approach).
 
@@ -268,14 +306,20 @@ def run_mine_behaviour(
     member sessions are those IPs' sessions in any of the itemset's
     playbooks. Closed itemsets only — if an itemset is a strict subset of
     another with the same support, only the larger is kept.
+
+    `window_days` scopes the source-session window. Default 30; pass 0 to
+    disable. ROADMAP #21.
     """
     es = make_client(cfg.elasticsearch, secrets)
     sessions_idx = cfg.elasticsearch.indexes.cowrie.sessions_rollup
     out_idx      = cfg.elasticsearch.indexes.cowrie.campaigns
 
     t0 = time.time()
-    log.info("[mine behaviour] reading session rollup %s", sessions_idx)
-    ip_to_pb = _build_ip_to_playbooks(es, sessions_idx)
+    log.info(
+        "[mine behaviour] reading session rollup %s (window_days=%s)",
+        sessions_idx, window_days if window_days else "all",
+    )
+    ip_to_pb = _build_ip_to_playbooks(es, sessions_idx, window_days=window_days)
     log.info("[mine behaviour] %d IPs with >=1 non-outlier playbook session", len(ip_to_pb))
 
     transactions = [frozenset(rec["playbooks"]) for rec in ip_to_pb.values()]
@@ -442,16 +486,26 @@ def _extract_artifacts(text: str) -> list[tuple[str, str]]:
 
 
 def _iter_command_input_events(
-    es: Elasticsearch, idx: str, page_size: int = 1000,
+    es: Elasticsearch, idx: str,
+    *,
+    window_days: Optional[int] = _DEFAULT_MINE_WINDOW_DAYS,
+    page_size: int = 1000,
 ) -> Iterable[dict]:
-    """Yield raw cowrie command-input event _sources."""
+    """Yield raw cowrie command-input event _sources within the last
+    `window_days` days (by `@timestamp`). Pass `window_days=0` to disable
+    the window. ROADMAP #21.
+    """
+    must: list[dict] = [{"term": {"event.action": "cowrie.command.input"}}]
+    window = _build_window_query("@timestamp", window_days)
+    if "match_all" not in window:
+        must.append(window)
     body = {
         "size": page_size,
         "_source": [
             "cowrie.session_id", "process.command_line", "source.ip",
             "@timestamp", "event.start",
         ],
-        "query": {"term": {"event.action": "cowrie.command.input"}},
+        "query": {"bool": {"must": must}},
         "sort": [{"@timestamp": "asc"}, {"_doc": "asc"}],
     }
     search_after = None
@@ -497,14 +551,17 @@ def run_mine_infrastructure(
     dry_run: bool = False,
     min_sessions:    int = _INFRA_MIN_SESSIONS,
     min_distinct_ips: int = _INFRA_MIN_DISTINCT_IPS,
+    window_days: Optional[int] = _DEFAULT_MINE_WINDOW_DAYS,
 ) -> dict:
     """Shared-artifact campaign discovery (the "D" approach).
 
-    Pulls every cowrie.command.input event, extracts URL / SSH-key / hash
-    artifacts from the command line, and joins sessions through shared
-    artifacts. Each connected component of >=`min_sessions` becomes a
-    campaign. Very-common artifacts (>50% of all sessions) are dropped as
-    too generic — they'd glue everything together.
+    Pulls every cowrie.command.input event within the last `window_days`,
+    extracts URL / SSH-key / hash artifacts from the command line, and
+    joins sessions through shared artifacts. Each connected component of
+    >=`min_sessions` becomes a campaign. Very-common artifacts (>50% of
+    all in-window sessions) are dropped as too generic — they'd glue
+    everything together. Pass `window_days=0` to disable the window
+    (legacy behaviour). ROADMAP #21.
     """
     es = make_client(cfg.elasticsearch, secrets)
     raw_idx       = cfg.elasticsearch.indexes.cowrie.sessions_raw
@@ -512,7 +569,10 @@ def run_mine_infrastructure(
     out_idx       = cfg.elasticsearch.indexes.cowrie.campaigns
 
     t0 = time.time()
-    log.info("[mine infra] reading %s for command-input events", raw_idx)
+    log.info(
+        "[mine infra] reading %s for command-input events (window_days=%s)",
+        raw_idx, window_days if window_days else "all",
+    )
 
     # session -> set of (kind, value); session -> source.ip; session -> earliest_ts
     sess_arts: dict[str, set[tuple[str, str]]] = defaultdict(set)
@@ -520,7 +580,7 @@ def run_mine_infrastructure(
     sess_ts:   dict[str, str] = {}
     art_to_sessions: dict[tuple[str, str], set[str]] = defaultdict(set)
     n_events = 0
-    for src in _iter_command_input_events(es, raw_idx):
+    for src in _iter_command_input_events(es, raw_idx, window_days=window_days):
         sid = (src.get("cowrie") or {}).get("session_id")
         if not sid:
             continue
@@ -686,14 +746,28 @@ def run_mine_infrastructure(
 def run_mine(
     cfg: AppConfig, secrets: Secrets, *,
     kind: str = "all", dry_run: bool = False,
+    window_days: Optional[int] = None,
 ) -> dict:
-    """Dispatch to the requested miner(s)."""
+    """Dispatch to the requested miner(s).
+
+    `window_days`: time window passed to each miner. `None` → use each
+    miner's default (`_DEFAULT_MINE_WINDOW_DAYS`); explicit `0` → disable
+    windowing (legacy unbounded scan). ROADMAP #21.
+    """
     kind = kind.lower().strip()
     if kind not in ("behaviour", "infrastructure", "all"):
         raise ValueError(f"unknown campaign mining kind: {kind}")
     out: dict = {}
+    # If caller passed None, defer to each miner's default rather than
+    # forcing 30 here — leaves the module constant as the single source
+    # of truth for the default.
+    behaviour_kwargs: dict = {"dry_run": dry_run}
+    infra_kwargs: dict = {"dry_run": dry_run}
+    if window_days is not None:
+        behaviour_kwargs["window_days"] = window_days
+        infra_kwargs["window_days"] = window_days
     if kind in ("behaviour", "all"):
-        out["behaviour"] = run_mine_behaviour(cfg, secrets, dry_run=dry_run)
+        out["behaviour"] = run_mine_behaviour(cfg, secrets, **behaviour_kwargs)
     if kind in ("infrastructure", "all"):
-        out["infrastructure"] = run_mine_infrastructure(cfg, secrets, dry_run=dry_run)
+        out["infrastructure"] = run_mine_infrastructure(cfg, secrets, **infra_kwargs)
     return out
