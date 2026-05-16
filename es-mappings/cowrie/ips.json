@@ -46,9 +46,13 @@
                       "file_download_count":     { "type": "long" },
                       "dominant_intent":         { "type": "keyword" },
                       "intent_distribution": {
-                        "type": "nested",
                         "properties": {
-                          "intent": { "type": "keyword" },
+                          "intent": {
+                            "type": "text",
+                            "fields": {
+                              "keyword": { "type": "keyword", "ignore_above": 256 }
+                            }
+                          },
                           "count":  { "type": "long" }
                         }
                       },

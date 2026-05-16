@@ -339,6 +339,22 @@ def _mean_pool(embeddings: list[list[float]]) -> list[float]:
     return [v * inv_out for v in result]
 
 
+_MAX_CREDENTIALS_PER_SESSION = 200
+
+
+def _record_credential(credentials_set: set[str], ev: dict) -> None:
+    """Add the `(user.name, cowrie.password)` tuple from a login event to the
+    session's credential set. Either part may be empty — empty user OR
+    empty password both still contribute a tuple, since credential-spray
+    scanners frequently use one of the two and the empty-string position
+    is itself a fingerprint (matches the IP-layer convention at #8).
+    """
+    user = ((ev.get("user") or {}).get("name") or "")
+    password = ((ev.get("cowrie") or {}).get("password") or "")
+    if user or password:
+        credentials_set.add(f"{user}:{password}")
+
+
 def _build_session_doc(
     session_id: str,
     events: list[dict],
@@ -354,6 +370,12 @@ def _build_session_doc(
     file_upload_count = 0
     command_hashes: list[str] = []
     unique_hashes: set[str] = set()
+    # Every (user, password) pair attempted in this session, deduped. The
+    # legacy top-level cowrie.password / user.name fields keep first-seen
+    # for compatibility, but credential-spray bots can fire 50+ unique
+    # pairs in one session and the IP-layer attribution feature (ROADMAP
+    # #8) needs all of them — ROADMAP #16.
+    credentials_set: set[str] = set()
 
     for ev in events:
         action = (ev.get("event") or {}).get("action", "")
@@ -363,8 +385,10 @@ def _build_session_doc(
             closed_event = ev
         elif action == "cowrie.login.success":
             login_success_count += 1
+            _record_credential(credentials_set, ev)
         elif action == "cowrie.login.failed":
             login_fail_count += 1
+            _record_credential(credentials_set, ev)
         elif action == "cowrie.session.file_download":
             file_download_count += 1
         elif action == "cowrie.session.file_upload":
@@ -451,6 +475,10 @@ def _build_session_doc(
         session_block["dominant_intent"] = dominant_intent
     if intent_distribution:
         session_block["intent_distribution"] = intent_distribution
+    if credentials_set:
+        # Sorted + capped so the doc is bounded and idempotent across runs.
+        # Cap matches the IP-layer cap pattern from issue #8.
+        session_block["credentials"] = sorted(credentials_set)[:_MAX_CREDENTIALS_PER_SESSION]
     if novelty_scores:
         session_block["mean_novelty_score"] = round(sum(novelty_scores) / len(novelty_scores), 4)
         session_block["max_novelty_score"] = round(max(novelty_scores), 4)

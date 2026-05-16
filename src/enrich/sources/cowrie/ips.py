@@ -117,6 +117,7 @@ def _fetch_ip_session_docs(
             "dshield.cowrie.enrichment.session.mean_novelty_score",
             "dshield.cowrie.enrichment.session.max_novelty_score",
             "dshield.cowrie.enrichment.session.embedding",
+            "dshield.cowrie.enrichment.session.credentials",
             "cowrie.session_id",
         ],
         "query": {"term": {"source.ip": ip}},
@@ -201,17 +202,23 @@ def _build_ip_doc(
         if not as_info and (s.get("source") or {}).get("as"):
             as_info = s["source"]["as"]
 
-        # Credential fingerprint accumulator. The session rollup carries
-        # the first-seen (user, password) it observed — we collect the
-        # union across the IP's sessions for the attribution scalar
-        # block (ROADMAP issue #8). Empty user OR empty password both
-        # contribute a tuple — credential-spray scanners frequently
-        # connect without a username and the empty-string case is
-        # itself a fingerprint.
-        username = ((s.get("user") or {}).get("name") or "")
-        password = ((s.get("cowrie") or {}).get("password") or "")
-        if username or password:
-            credentials_set.add(f"{username}:{password}")
+        # Credential fingerprint accumulator. Prefer the per-session
+        # `credentials` list (ROADMAP #16 — every (user, password) pair
+        # attempted, not just the first-seen) when present; fall back to
+        # the legacy first-seen top-level pair for pre-#16 session docs
+        # whose backward pass hasn't recomputed them yet. Empty user OR
+        # empty password both still contribute a tuple — credential-spray
+        # scanners frequently use one of the two and the empty-string
+        # position is itself a fingerprint. The IP-layer attribution
+        # scalar block (issue #8) reads this set.
+        session_creds = en.get("credentials") or []
+        if session_creds:
+            credentials_set.update(session_creds)
+        else:
+            username = ((s.get("user") or {}).get("name") or "")
+            password = ((s.get("cowrie") or {}).get("password") or "")
+            if username or password:
+                credentials_set.add(f"{username}:{password}")
 
     embedding = _mean_pool(embeddings) if embeddings else None
     dominant_intent, intent_distribution = _summarize_intents(intents)
