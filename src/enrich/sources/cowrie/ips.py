@@ -21,7 +21,7 @@ from elasticsearch import Elasticsearch
 from ...cache import StateDB
 from ...config import AppConfig, IPConfig, Secrets
 from ...es_client import bulk_write, init_index, make_client
-from .sessions import _mean_pool
+from .sessions import _mean_pool, _summarize_intents
 
 log = logging.getLogger(__name__)
 
@@ -214,7 +214,7 @@ def _build_ip_doc(
             credentials_set.add(f"{username}:{password}")
 
     embedding = _mean_pool(embeddings) if embeddings else None
-    dominant_intent = Counter(intents).most_common(1)[0][0] if intents else None
+    dominant_intent, intent_distribution = _summarize_intents(intents)
     mean_novelty = round(sum(novelty_scores) / len(novelty_scores), 4) if novelty_scores else None
     max_novelty = round(max(novelty_scores), 4) if novelty_scores else None
     mean_duration_s = round(sum(durations_s) / len(durations_s), 2) if durations_s else None
@@ -231,6 +231,8 @@ def _build_ip_doc(
     }
     if dominant_intent:
         ip_block["dominant_intent"] = dominant_intent
+    if intent_distribution:
+        ip_block["intent_distribution"] = intent_distribution
     if mean_novelty is not None:
         ip_block["mean_novelty_score"] = mean_novelty
     if max_novelty is not None:

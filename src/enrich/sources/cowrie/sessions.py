@@ -264,6 +264,34 @@ def _mget_enrichment(
     return {doc["_id"]: doc["_source"] for doc in resp["docs"] if doc.get("found")}
 
 
+def _summarize_intents(
+    intents: list[str], top_n: int = 3
+) -> tuple[Optional[str], list[dict]]:
+    """Return `(dominant_intent, intent_distribution)` from a list of intent
+    labels. The distribution is the top-N `(intent, count)` pairs sorted by
+    `(-count, intent)` so ties resolve lexically — deterministic across runs.
+
+    The previous code used `Counter(intents).most_common(1)[0][0]`, which
+    relies on Counter insertion order to break ties. A 2-command session with
+    one `reconnaissance` and one `execution` produced a different
+    `dominant_intent` depending on whichever order the unique-hash iteration
+    happened to surface them in — ROADMAP #15.
+
+    Empty input → `(None, [])`. Used by both session and IP rollups; the IP
+    layer composes per-IP intents from per-session `dominant_intent` values
+    so this helper fixes both layers in one place.
+    """
+    if not intents:
+        return None, []
+    counter = Counter(intents)
+    # Lexical tie-break: sort by (-count, name). Counter.most_common is
+    # stable but ordering depends on insertion — explicit sort makes ties
+    # deterministic regardless of how the input was enumerated.
+    pairs = sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))
+    distribution = [{"intent": name, "count": count} for name, count in pairs[:top_n]]
+    return pairs[0][0], distribution
+
+
 def _command_entropy(counts: dict[str, int]) -> float:
     """Shannon entropy (bits) of the command frequency distribution."""
     total = sum(counts.values())
@@ -404,9 +432,7 @@ def _build_session_doc(
 
     embedding = _mean_pool(embeddings) if embeddings else None
 
-    dominant_intent: Optional[str] = None
-    if intents:
-        dominant_intent = Counter(intents).most_common(1)[0][0]
+    dominant_intent, intent_distribution = _summarize_intents(intents)
 
     hash_counts = Counter(command_hashes)
     entropy = _command_entropy(dict(hash_counts))
@@ -423,6 +449,8 @@ def _build_session_doc(
     }
     if dominant_intent:
         session_block["dominant_intent"] = dominant_intent
+    if intent_distribution:
+        session_block["intent_distribution"] = intent_distribution
     if novelty_scores:
         session_block["mean_novelty_score"] = round(sum(novelty_scores) / len(novelty_scores), 4)
         session_block["max_novelty_score"] = round(max(novelty_scores), 4)

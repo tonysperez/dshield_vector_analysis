@@ -45,6 +45,13 @@
                       "total_commands":          { "type": "long" },
                       "file_download_count":     { "type": "long" },
                       "dominant_intent":         { "type": "keyword" },
+                      "intent_distribution": {
+                        "type": "nested",
+                        "properties": {
+                          "intent": { "type": "keyword" },
+                          "count":  { "type": "long" }
+                        }
+                      },
                       "mean_novelty_score":      { "type": "float" },
                       "max_novelty_score":       { "type": "float" },
                       "mean_session_duration_s": { "type": "float" },
