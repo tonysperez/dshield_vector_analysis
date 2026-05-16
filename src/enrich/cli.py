@@ -353,6 +353,36 @@ def _build_parser() -> argparse.ArgumentParser:
     p_reenrich.add_argument("--dry-run", action="store_true",
                             help="Count stale rows without calling LLM or writing.")
 
+    # re-triage — re-evaluate stored `triage_reasons` against current rules.
+    # No LLM/cloud calls. Closes the gap that `re-enrich-stale` doesn't cover:
+    # triage.py changes (e.g. ROADMAP #23) don't affect llm_config_hash, so
+    # stored triage_reasons on already-enriched docs go stale silently.
+    p_retriage = sub.add_parser(
+        "re-triage",
+        help=(
+            "Re-evaluate stored `triage_reasons` on every enriched command "
+            "using the current triage rules. No LLM or cloud calls. Useful "
+            "after a triage-rule change (e.g. #23) that re-enrich-stale "
+            "won't pick up. Preserves runtime-only reasons "
+            "(budget_exhausted/cloud_failed/sample). ROADMAP #23 follow-on."
+        ),
+    )
+    p_retriage.add_argument("--source", default="cowrie",
+                            help="Source name (default: cowrie)")
+    p_retriage.add_argument(
+        "--backward", action="store_true",
+        help="Required. Scan every already-enriched doc and rewrite "
+             "triage_reasons. Required flag so the verb has room for a "
+             "future --forward mode without breaking call sites.",
+    )
+    p_retriage.add_argument(
+        "--window-days", type=int, default=None,
+        help="Only re-evaluate docs whose @timestamp is within the last N "
+             "days. Default: all docs. Matches the #21 pattern.",
+    )
+    p_retriage.add_argument("--dry-run", action="store_true",
+                            help="Report what would change without writing.")
+
     # bless-cache — stamp existing cache rows with the current config hash so
     # they're treated as fresh after a #7-style auto-invalidating config change.
     # The user opts into this when they know existing enrichments are
@@ -622,6 +652,27 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[ERROR] Source {args.source!r} has no commands layer", flush=True)
             return 1
         stats = mod.run_reenrich_stale(cfg, secrets, dry_run=args.dry_run)
+        print(json.dumps(stats, indent=2, default=str))
+        return 0
+
+    if args.verb == "re-triage":
+        if not args.backward:
+            print(
+                "[ERROR] re-triage requires --backward. Forward mode isn't "
+                "implemented yet; --backward signals 'rewrite triage_reasons "
+                "on every already-enriched doc using current rules.'",
+                flush=True,
+            )
+            return 1
+        mod = _commands_layer(args.source)
+        if mod is None:
+            print(f"[ERROR] Source {args.source!r} has no commands layer", flush=True)
+            return 1
+        stats = mod.run_retriage(
+            cfg, secrets,
+            dry_run=args.dry_run,
+            window_days=args.window_days,
+        )
         print(json.dumps(stats, indent=2, default=str))
         return 0
 

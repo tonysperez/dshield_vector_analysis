@@ -12,6 +12,7 @@ import json
 import logging
 import math
 import re
+import time
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Iterator, Optional
@@ -111,6 +112,24 @@ _CLUSTER_UPDATE_SCRIPT = (
     "en.cluster.novelty_score = params.novelty_score;"
     "en.cluster.is_outlier = params.is_outlier;"
     "en.cluster.scored_at = params.scored_at;"
+)
+
+# Painless: replace `triage_reasons` in-place. Used by `re-triage --backward`
+# to retroactively re-evaluate rule-derived escalation reasons after a triage-
+# rule change (e.g. ROADMAP #23 tightening the `base64_blob` gate). Does NOT
+# touch enrichment fields or cluster.* — purely cosmetic to the stored list.
+# An empty `params.triage_reasons` removes the field entirely so a row that
+# would no longer escalate doesn't carry a stale empty list.
+_RETRIAGE_SCRIPT = (
+    "if (ctx._source.dshield == null) { ctx._source.dshield = [:]; }"
+    "if (ctx._source.dshield.cowrie == null) { ctx._source.dshield.cowrie = [:]; }"
+    "if (ctx._source.dshield.cowrie.enrichment == null) { ctx._source.dshield.cowrie.enrichment = [:]; }"
+    "def en = ctx._source.dshield.cowrie.enrichment;"
+    "if (params.triage_reasons == null || params.triage_reasons.size() == 0) {"
+    "  en.remove('triage_reasons');"
+    "} else {"
+    "  en.triage_reasons = params.triage_reasons;"
+    "}"
 )
 
 _CLUSTER_SAMPLE_SIZE = 5
@@ -1585,6 +1604,270 @@ def run_reenrich_stale(cfg: AppConfig, secrets: Secrets, dry_run: bool = False) 
         live_llm_config_hash=live_llm_hash,
         live_embed_config_hash=live_embed_hash,
     )
+
+
+# ---------------------------------------------------------------------------
+# Re-triage (rule-derived triage_reasons rewrite — no LLM, no cloud)
+# ---------------------------------------------------------------------------
+
+# Reasons emitted by `reasons_to_escalate` whose firing is rule-derived and
+# reproducible from the stored doc. Re-triage owns these — they get rewritten
+# on every run.
+_RULE_DERIVED_REASONS = frozenset({
+    "low_confidence",  # prefix match; see _strip_rule_reasons below for the actual filter
+    "base64_blob",
+    "ip_literal",
+    "rare_tld",
+    "novel_embedding",
+    "local_failed",    # also reproducible — derived from confidence==1 + intent==unknown
+})
+
+# Reasons that came from RUNTIME state at original-enrich time and can't be
+# reproduced now (e.g. cloud was down, budget was exhausted, the random
+# `sample` rule fired). Re-triage leaves these alone if present.
+_RUNTIME_ONLY_REASONS = frozenset({
+    "budget_exhausted",
+    "cloud_parse_failed",
+    "cloud_failed",
+    "sample",
+})
+
+
+def _strip_rule_reasons(reasons: list[str]) -> list[str]:
+    """Drop rule-derived reasons from a stored list, preserving runtime-only
+    reasons. The `low_confidence<=N` reason embeds the threshold value so we
+    match by prefix."""
+    out: list[str] = []
+    for r in reasons or []:
+        if r.startswith("low_confidence"):
+            continue
+        if r in _RULE_DERIVED_REASONS:
+            continue
+        out.append(r)
+    return out
+
+
+def _iter_docs_for_retriage(
+    es: Elasticsearch,
+    commands_index: str,
+    window_days: Optional[int] = None,
+    page_size: int = 1000,
+) -> Iterator[tuple[str, dict]]:
+    """Yield `(doc_id, source_dict)` for every enriched command. Optional
+    `window_days` scopes to docs with `@timestamp` in the last N days
+    (matches the #21 windowing pattern; default None = scan everything).
+
+    `_source` is projected to just what `reasons_to_escalate` needs:
+    command text, confidence, embedding, and the existing triage_reasons
+    so we can diff. Stable iteration via search_after on `_id`.
+    """
+    must: list[dict] = [
+        {"exists": {"field": "dshield.cowrie.enrichment.confidence"}},
+    ]
+    if window_days and window_days > 0:
+        must.append({"range": {"@timestamp": {"gte": f"now-{int(window_days)}d/d"}}})
+    body = {
+        "size": page_size,
+        "_source": [
+            "process.command_line",
+            "dshield.cowrie.enrichment.confidence",
+            "dshield.cowrie.enrichment.intent",
+            "dshield.cowrie.enrichment.embedding",
+            "dshield.cowrie.enrichment.triage_reasons",
+        ],
+        "query": {"bool": {"must": must}},
+        # Sort on `@timestamp` + `_doc` for stable search_after pagination
+        # — matches the other iterators in this file. Sorting by `_id`
+        # directly requires `indices.id_field_data.enabled` which ES 8+
+        # ships disabled by default.
+        "sort": [{"@timestamp": "asc"}, {"_doc": "asc"}],
+    }
+    search_after = None
+    while True:
+        if search_after:
+            body["search_after"] = search_after
+        resp = es.search(index=commands_index, **body)
+        hits = resp["hits"]["hits"]
+        if not hits:
+            return
+        for h in hits:
+            yield h["_id"], h["_source"]
+        search_after = hits[-1]["sort"]
+
+
+def run_retriage(
+    cfg: AppConfig,
+    secrets: Secrets,
+    *,
+    dry_run: bool = False,
+    window_days: Optional[int] = None,
+) -> dict:
+    """Retroactively re-evaluate `triage_reasons` on every enriched command
+    using the *current* rules in `enrich.triage`. No LLM/cloud calls.
+
+    Use case: a triage-rule change (e.g. ROADMAP #23 tightening `base64_blob`)
+    can leave stored `triage_reasons` lists carrying stale entries that
+    wouldn't fire under current rules. `re-enrich-stale` doesn't pick this
+    up because `triage.py` lives outside the `llm_config_hash`. This verb
+    closes the gap.
+
+    Semantics:
+      - Rule-derived reasons in `_RULE_DERIVED_REASONS` (plus the
+        `low_confidence<=N` prefix) are recomputed and replace whatever was
+        stored.
+      - Runtime-only reasons in `_RUNTIME_ONLY_REASONS` (`budget_exhausted`,
+        `cloud_failed`, `cloud_parse_failed`, `sample`) are preserved
+        unchanged — they reflect what happened back then and can't be
+        reproduced now.
+      - The random `sample` rule is suppressed during re-triage by passing
+        a deterministic rng so re-runs over the same corpus produce the
+        same output.
+      - Empty result removes the `triage_reasons` field entirely (rather
+        than leaving an empty array).
+
+    `window_days`: optional time scoping (matches #21 pattern). Default
+    `None` = scan every enriched command. Pass an int to limit to docs in
+    the last N days.
+    """
+    import random
+    from ...clustering import load_centroids
+    from ...llm.schemas import IOCs
+
+    es = make_client(cfg.elasticsearch, secrets)
+    commands_idx = cfg.elasticsearch.indexes.cowrie.commands
+    clusters_idx = cfg.elasticsearch.indexes.cowrie.command_clusters
+
+    t0 = time.time()
+    log.info(
+        "[re-triage] scanning %s (window_days=%s, dry_run=%s)",
+        commands_idx, window_days if window_days else "all", dry_run,
+    )
+
+    # Load centroids once for the novel_embedding rule. If there are no
+    # cluster centroids yet, the rule will silently no-op per
+    # reasons_to_escalate's existing guard.
+    centroids = load_centroids(es, clusters_idx)
+    log.info("[re-triage] loaded %d centroids for novel_embedding rule",
+             len(centroids))
+
+    deterministic_rng = random.Random(0)
+    stats: dict = {
+        "scanned":  0,
+        "changed":  0,
+        "unchanged": 0,
+        "added_by_rule":   defaultdict(int),
+        "removed_by_rule": defaultdict(int),
+    }
+    update_actions: list[dict] = []
+
+    for doc_id, src in _iter_docs_for_retriage(
+        es, commands_idx, window_days=window_days,
+    ):
+        stats["scanned"] += 1
+        en = ((src.get("dshield") or {}).get("cowrie") or {}).get("enrichment") or {}
+        confidence = en.get("confidence")
+        if confidence is None:
+            # No usable parsed enrichment; can't re-triage. Skip.
+            continue
+        command = (src.get("process") or {}).get("command_line") or ""
+        embedding = en.get("embedding")
+        old_reasons = list(en.get("triage_reasons") or [])
+
+        # Reconstruct a minimal CommandEnrichment shim. Only `confidence`
+        # is read by reasons_to_escalate; other fields don't influence
+        # rule firing.
+        parsed = CommandEnrichment(
+            intent=en.get("intent") or "unknown",
+            confidence=int(confidence),
+            description="",
+            tactics=[],
+            techniques=[],
+            notes="",
+            iocs=IOCs(ips=[], domains=[], urls=[], hashes=[], files=[]),
+        )
+
+        # Re-run the rule set. `local_failed=False` is the safe choice —
+        # if this doc has a parsed enrichment with a confidence, local
+        # enrichment didn't fail. `sample` is random; suppress for
+        # determinism (also dropped explicitly below).
+        new_reasons_full = triage_mod.reasons_to_escalate(
+            command=command,
+            parsed=parsed,
+            local_failed=False,
+            cfg=cfg.cloud,
+            embedding=embedding,
+            centroids=centroids if embedding and centroids else None,
+            rng=deterministic_rng,
+        )
+        # Keep only rule-derived reasons from the new run; merge in
+        # runtime-only reasons from the old list.
+        new_rule_reasons = [
+            r for r in new_reasons_full if r != "sample"
+        ]
+        preserved_runtime = [
+            r for r in old_reasons if r in _RUNTIME_ONLY_REASONS
+        ]
+        merged = sorted(set(new_rule_reasons) | set(preserved_runtime))
+
+        old_set = set(old_reasons)
+        new_set = set(merged)
+        if old_set == new_set:
+            stats["unchanged"] += 1
+            continue
+
+        stats["changed"] += 1
+        for r in (new_set - old_set):
+            stats["added_by_rule"][r] += 1
+        # Removals come only from rule-derived reasons we own; the
+        # runtime-only ones are preserved above, so any old reason
+        # missing from merged must be a rule-derived one.
+        for r in (old_set - new_set):
+            stats["removed_by_rule"][r] += 1
+
+        update_actions.append({
+            "_op_type": "update",
+            "_id": doc_id,
+            "script": {
+                "source": _RETRIAGE_SCRIPT,
+                "params": {"triage_reasons": merged},
+            },
+        })
+
+    # Convert defaultdicts to plain dicts for clean JSON output.
+    stats["added_by_rule"] = dict(stats["added_by_rule"])
+    stats["removed_by_rule"] = dict(stats["removed_by_rule"])
+    stats["runtime_seconds"] = round(time.time() - t0, 2)
+
+    if dry_run:
+        log.info("[re-triage] dry-run: would update %d/%d docs", stats["changed"], stats["scanned"])
+        stats["status"] = "dry_run"
+        return stats
+
+    if not update_actions:
+        log.info("[re-triage] no docs to update")
+        return stats
+
+    bulk_ok = 0
+    bulk_errors = 0
+    batch = 500
+    for start in range(0, len(update_actions), batch):
+        chunk = update_actions[start: start + batch]
+        ok, errs = bulk_write(es, commands_idx, chunk)
+        bulk_ok += ok
+        bulk_errors += len(errs)
+        if errs:
+            log.warning("[re-triage] bulk errors (%d): %s", len(errs), errs[:2])
+    try:
+        es.indices.refresh(index=commands_idx)
+    except Exception as exc:
+        log.warning("[re-triage] post-write refresh failed (continuing): %s", exc)
+
+    stats["docs_updated"] = bulk_ok
+    stats["bulk_errors"] = bulk_errors
+    log.info("[re-triage] wrote %d updates in %ss; +%s -%s",
+             bulk_ok, stats["runtime_seconds"],
+             stats["added_by_rule"], stats["removed_by_rule"])
+    return stats
 
 
 # ---------------------------------------------------------------------------

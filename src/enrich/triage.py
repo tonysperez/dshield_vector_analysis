@@ -20,6 +20,30 @@ log = logging.getLogger(__name__)
 
 # A run of base64-ish chars. The threshold is configurable.
 _BASE64_RE = re.compile(r"[A-Za-z0-9+/=]{40,}")
+
+
+def _has_mixed_classes(s: str) -> bool:
+    """True iff `s` contains at least one ASCII upper, one ASCII lower,
+    and one digit.
+
+    Used to gate `base64_blob` triage so a long hex digest (only lower-or-
+    upper + digits) or a bare uppercase id (no lowercase, no digits) stops
+    triggering the rule. ROADMAP #23 — character-class entropy guard.
+
+    Base64 padding (`=`) and the URL-safe extras (`+`, `/`) don't count
+    toward any class — only ASCII alnum does.
+    """
+    has_upper = has_lower = has_digit = False
+    for c in s:
+        if "A" <= c <= "Z":
+            has_upper = True
+        elif "a" <= c <= "z":
+            has_lower = True
+        elif "0" <= c <= "9":
+            has_digit = True
+        if has_upper and has_lower and has_digit:
+            return True
+    return False
 _IPV4_RE = re.compile(r"(?<!\d)(?:\d{1,3}\.){3}\d{1,3}(?!\d)")
 
 # Host-context anchor: only fire `rare_tld` when the hostname.tld pattern
@@ -72,9 +96,17 @@ def reasons_to_escalate(
 
     # Suspicious IOC patterns — independent of what the local model extracted,
     # since we may be escalating *because* the local model missed them.
+    # `base64_blob` requires the matched run to mix upper, lower, AND digit
+    # (ROADMAP #23) so a long hex digest or a bare uppercase id doesn't trip
+    # the rule — both legitimately match `[A-Za-z0-9+/=]{40,}` but are not
+    # base64 in shape.
     longest_b64 = 0
     for m in _BASE64_RE.finditer(command):
-        longest_b64 = max(longest_b64, len(m.group(0)))
+        run = m.group(0)
+        if not _has_mixed_classes(run):
+            continue
+        if len(run) > longest_b64:
+            longest_b64 = len(run)
     if longest_b64 >= cfg.triage.base64_min_run:
         reasons.append("base64_blob")
 
