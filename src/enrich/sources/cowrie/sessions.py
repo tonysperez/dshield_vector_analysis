@@ -33,6 +33,17 @@ _SESSION_WATERMARK_KEY = "session_last_processed_at"
 _SESSIONS_MAPPING = "es-mappings/cowrie/sessions.json"
 _SESSION_CLUSTERS_MAPPING = "es-mappings/cowrie/session_clusters.json"
 
+# Fixed corpus-scale denominators for the log1p-normalized scalar block,
+# replacing the previous per-batch `np.max(...)` (ROADMAP #14). Per-batch
+# normalization meant the same session yielded different scalar contributions
+# across re-runs purely because a bigger neighbour appeared. These constants
+# are chosen well above the long-term P99.9 observed in production
+# (command_count P99.9 ≈ 10 today, max ≈ 20 — 1000 leaves headroom for
+# unusually-long future sessions). The block output is clipped to [0, 1]
+# so a future outlier above the denominator doesn't blow the normalization.
+_SCALAR_DENOM_COMMAND_COUNT = 1000.0
+_SCALAR_DENOM_UNIQUE_COMMANDS = 1000.0
+
 _SESSION_CLUSTER_UPDATE_SCRIPT = (
     "if (ctx._source.dshield == null) { ctx._source.dshield = [:]; }"
     "if (ctx._source.dshield.cowrie == null) { ctx._source.dshield.cowrie = [:]; }"
@@ -619,19 +630,24 @@ def iter_session_docs(
 
 
 def build_session_scalar_block(scalars_list: list[dict], weight: float) -> "np.ndarray":
-    """(n, 4) weighted scalar matrix for session-level HDBSCAN."""
+    """(n, 4) weighted scalar matrix for session-level HDBSCAN.
+
+    log1p-normalized fields use fixed corpus-scale denominators (ROADMAP #14)
+    so the same session yields identical scalar contributions across re-runs,
+    regardless of who else is in the batch. Output clipped to [0, 1].
+    """
     import numpy as np
     counts = np.array([s.get("command_count") or 1 for s in scalars_list], dtype=np.float32)
     unique = np.array([s.get("unique_commands") or 1 for s in scalars_list], dtype=np.float32)
     success_rate = np.array([s.get("login_success_rate", 0.0) for s in scalars_list], dtype=np.float32)
     novelty = np.array([s.get("mean_novelty_score", 0.0) for s in scalars_list], dtype=np.float32)
 
-    max_count = float(np.max(counts)) if counts.max() > 0 else 1.0
-    max_unique = float(np.max(unique)) if unique.max() > 0 else 1.0
+    denom_count = float(np.log1p(_SCALAR_DENOM_COMMAND_COUNT))
+    denom_unique = float(np.log1p(_SCALAR_DENOM_UNIQUE_COMMANDS))
 
     block = np.zeros((len(scalars_list), 4), dtype=np.float32)
-    block[:, 0] = (np.log1p(counts) / np.log1p(max_count)) * weight
-    block[:, 1] = (np.log1p(unique) / np.log1p(max_unique)) * weight
+    block[:, 0] = np.clip(np.log1p(counts) / denom_count, 0.0, 1.0) * weight
+    block[:, 1] = np.clip(np.log1p(unique) / denom_unique, 0.0, 1.0) * weight
     block[:, 2] = np.clip(success_rate, 0.0, 1.0) * weight
     block[:, 3] = np.clip(novelty, 0.0, 1.0) * weight
     return block

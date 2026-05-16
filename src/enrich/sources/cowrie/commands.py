@@ -34,6 +34,14 @@ log = logging.getLogger(__name__)
 _COMMANDS_MAPPING = "es-mappings/cowrie/commands.json"
 _COMMAND_CLUSTERS_MAPPING = "es-mappings/cowrie/command_clusters.json"
 
+# Fixed corpus-scale denominators for the log1p-normalized scalar block
+# (ROADMAP #14). See sessions.py for the rationale. occurrence_count P99.9
+# ≈ 50 today on a young corpus, but on multi-year data widely-deployed
+# commands like `ls`/`cat` will easily hit 6+ figures; 100000 covers that.
+# unique_source_ips scales sublinearly with occurrences — 10000 is fine.
+_SCALAR_DENOM_OCCURRENCE_COUNT = 100000.0
+_SCALAR_DENOM_UNIQUE_SOURCE_IPS = 10000.0
+
 # Painless: patch only the embedding vector.
 _REEMBED_SCRIPT = (
     "if (ctx._source.dshield == null) { ctx._source.dshield = [:]; }"
@@ -1633,19 +1641,24 @@ def iter_enriched_docs(
 
 
 def build_command_scalar_block(scalars_list: list[dict], weight: float) -> "np.ndarray":
-    """(n, 4) weighted scalar matrix appended to L2-normalized embeddings."""
+    """(n, 4) weighted scalar matrix appended to L2-normalized embeddings.
+
+    log1p-normalized fields use fixed corpus-scale denominators (ROADMAP #14)
+    so a given command yields identical scalar contributions across re-runs.
+    Output clipped to [0, 1].
+    """
     import numpy as np
     counts = np.array([s.get("occurrence_count") or 1 for s in scalars_list], dtype=np.float32)
     ips = np.array([s.get("unique_source_ips") or 1 for s in scalars_list], dtype=np.float32)
     conf = np.array([s.get("confidence") or 5 for s in scalars_list], dtype=np.float32)
     reuse = np.array([s.get("session_reuse_rate", 1.0) for s in scalars_list], dtype=np.float32)
 
-    max_count = float(np.max(counts)) if counts.max() > 0 else 1.0
-    max_ips = float(np.max(ips)) if ips.max() > 0 else 1.0
+    denom_count = float(np.log1p(_SCALAR_DENOM_OCCURRENCE_COUNT))
+    denom_ips = float(np.log1p(_SCALAR_DENOM_UNIQUE_SOURCE_IPS))
 
     block = np.zeros((len(scalars_list), 4), dtype=np.float32)
-    block[:, 0] = (np.log1p(counts) / np.log1p(max_count)) * weight
-    block[:, 1] = (np.log1p(ips) / np.log1p(max_ips)) * weight
+    block[:, 0] = np.clip(np.log1p(counts) / denom_count, 0.0, 1.0) * weight
+    block[:, 1] = np.clip(np.log1p(ips) / denom_ips, 0.0, 1.0) * weight
     block[:, 2] = (conf / 10.0) * weight
     block[:, 3] = np.clip(reuse, 0.0, 1.0) * weight
     return block

@@ -44,6 +44,14 @@ _IP_CLUSTER_UPDATE_SCRIPT = (
 
 _IP_CLUSTER_SAMPLE_SIZE = 5
 
+# Fixed corpus-scale denominators for the log1p-normalized scalar block
+# (ROADMAP #14). See sessions.py for the rationale; here total_sessions
+# P99.9 ≈ 1400 today, max ≈ 14000, so 100000 leaves substantial headroom.
+# mean_session_duration_s P99.9 is ~135s today — 3600s (1h) covers long
+# interactive-shell sessions a real attacker might run.
+_SCALAR_DENOM_TOTAL_SESSIONS = 100000.0
+_SCALAR_DENOM_SESSION_DURATION_S = 3600.0
+
 # Per-IP credential set cap. Keeps the rollup doc bounded while preserving
 # the long tail of credential-spray attackers; collisions in the hash
 # feature are already the dominant noise source, so capping at 200 is
@@ -529,14 +537,14 @@ def _build_behavior_block(
     novelty = np.array([s.get("mean_novelty_score", 0.0) for s in scalars_list], dtype=np.float32)
     duration = np.array([s.get("mean_session_duration_s", 0.0) for s in scalars_list], dtype=np.float32)
 
-    max_total = float(np.max(total)) if total.max() > 0 else 1.0
-    max_duration = float(np.max(duration)) if duration.max() > 0 else 1.0
+    denom_total = float(np.log1p(_SCALAR_DENOM_TOTAL_SESSIONS))
+    denom_duration = float(np.log1p(_SCALAR_DENOM_SESSION_DURATION_S))
 
     block = np.zeros((len(scalars_list), 4), dtype=np.float32)
-    block[:, 0] = (np.log1p(total) / np.log1p(max_total)) * weight
+    block[:, 0] = np.clip(np.log1p(total) / denom_total, 0.0, 1.0) * weight
     block[:, 1] = np.clip(success_rate, 0.0, 1.0) * weight
     block[:, 2] = np.clip(novelty, 0.0, 1.0) * weight
-    block[:, 3] = (np.log1p(duration) / np.log1p(max_duration)) * weight
+    block[:, 3] = np.clip(np.log1p(duration) / denom_duration, 0.0, 1.0) * weight
     return block
 
 
