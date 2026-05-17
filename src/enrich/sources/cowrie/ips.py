@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import time
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from typing import Iterator, Optional
@@ -600,6 +601,207 @@ def make_full_scalar_builder(
     return _builder
 
 
+def annotate_ip_clusters_with_dominant_playbook(
+    es: Elasticsearch,
+    *,
+    ips_rollup_index: str,
+    ip_clusters_index: str,
+    sessions_rollup_index: str,
+    top_n: int = 3,
+    page_size: int = 1000,
+) -> dict:
+    """Post-pass after IP clustering: stamp each IP-cluster centroid doc
+    with the modal `playbook_id` / `playbook_name` across its member IPs'
+    sessions, plus a top-N `playbook_distribution` array. ROADMAP #24.
+
+    Why: IP clusters are unnamed actor-profile buckets. Until now the
+    centroid doc didn't carry any human-readable label answering "what
+    does cluster_9 *do*?" — a console query had to multi-hop join
+    `ip.cluster.id → IP → session → playbook_id`. This post-pass does the
+    join once at cluster-time and persists the answer.
+
+    Deterministic: ties on count resolve lexically by `playbook_id` (same
+    pattern as #15 / #17). Re-runs over unchanged data produce the same
+    annotation.
+
+    Stats returned: `{clusters_seen, clusters_annotated, runtime_seconds}`.
+    Annotation is skipped (no field written) for clusters whose member IPs
+    have no playbook-bearing sessions.
+    """
+    t0 = time.time()
+    stats: dict = {
+        "clusters_seen":     0,
+        "clusters_annotated": 0,
+    }
+
+    # Step 1: find the latest cluster run on the IP clusters index.
+    try:
+        resp = es.search(
+            index=ip_clusters_index,
+            size=1,
+            query={"term": {"doc_type": "cluster"}},
+            sort=[{"@timestamp": "desc"}, {"_doc": "asc"}],
+            _source=["run_id"],
+        )
+    except Exception as exc:
+        log.warning("[ip-playbook-annot] could not locate latest run (%s); skipping", exc)
+        stats["runtime_seconds"] = round(time.time() - t0, 2)
+        return stats
+    hits = resp["hits"]["hits"]
+    if not hits:
+        stats["runtime_seconds"] = round(time.time() - t0, 2)
+        return stats
+    run_id = hits[0]["_source"].get("run_id")
+    if not run_id:
+        stats["runtime_seconds"] = round(time.time() - t0, 2)
+        return stats
+
+    # Step 2: walk the IP rollup index for cluster.id → set of member IPs.
+    cluster_to_ips: dict[str, set[str]] = defaultdict(set)
+    body = {
+        "size": page_size,
+        "query": {"exists": {"field": "dshield.cowrie.enrichment.ip.cluster.id"}},
+        "_source": ["source.ip", "dshield.cowrie.enrichment.ip.cluster.id"],
+        "sort": [{"_doc": "asc"}],
+    }
+    search_after = None
+    while True:
+        if search_after:
+            body["search_after"] = search_after
+        resp = es.search(index=ips_rollup_index, **body)
+        hits = resp["hits"]["hits"]
+        if not hits:
+            break
+        for h in hits:
+            src = h["_source"]
+            ip = (src.get("source") or {}).get("ip")
+            cid = (((src.get("dshield") or {}).get("cowrie") or {})
+                   .get("enrichment", {}).get("ip", {}).get("cluster", {}).get("id"))
+            if ip and cid and cid != "outlier":
+                cluster_to_ips[cid].add(ip)
+        search_after = hits[-1]["sort"]
+
+    stats["clusters_seen"] = len(cluster_to_ips)
+
+    # Step 3: for each cluster's IPs, fetch playbook_id/name across their
+    # sessions and compute the mode + top-N distribution.
+    update_actions: list[dict] = []
+    PB_FIELD = "dshield.cowrie.enrichment.session.playbook_id"
+    PB_NAME_FIELD = "dshield.cowrie.enrichment.session.playbook_name"
+
+    for cid, ips in cluster_to_ips.items():
+        if not ips:
+            continue
+        # Counter keyed by playbook_id; remember the most recent name per id
+        # (names are eventually-stable per #2's content-addressed scheme).
+        pb_counts: Counter = Counter()
+        pb_names: dict[str, str] = {}
+        ip_list = list(ips)
+        # Chunk to avoid hitting ES terms-query limits (default 65536).
+        CHUNK = 1000
+        for start in range(0, len(ip_list), CHUNK):
+            chunk = ip_list[start: start + CHUNK]
+            sbody = {
+                "size": page_size,
+                "query": {"bool": {"must": [
+                    {"terms": {"source.ip": chunk}},
+                    {"exists": {"field": PB_FIELD}},
+                ]}},
+                "_source": [PB_FIELD, PB_NAME_FIELD],
+                "sort": [{"_doc": "asc"}],
+            }
+            sa = None
+            while True:
+                if sa:
+                    sbody["search_after"] = sa
+                sresp = es.search(index=sessions_rollup_index, **sbody)
+                shits = sresp["hits"]["hits"]
+                if not shits:
+                    break
+                for sh in shits:
+                    en = (((sh["_source"].get("dshield") or {}).get("cowrie") or {})
+                          .get("enrichment", {}).get("session", {}))
+                    pid = en.get("playbook_id")
+                    if not pid:
+                        continue
+                    pb_counts[pid] += 1
+                    name = en.get("playbook_name")
+                    if name:
+                        pb_names[pid] = name
+                sa = shits[-1]["sort"]
+
+        if not pb_counts:
+            continue
+
+        # Sort by (-count, playbook_id) — deterministic lex tie-break.
+        ranked = sorted(pb_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        dominant_id = ranked[0][0]
+        dominant_name = pb_names.get(dominant_id)
+        distribution = [
+            {
+                "playbook_id":   pid,
+                "playbook_name": pb_names.get(pid),
+                "count":         cnt,
+            }
+            for pid, cnt in ranked[:top_n]
+        ]
+
+        # Find the centroid doc for this cluster_id in the latest run.
+        # Update it in-place via update-by-query on (run_id, cluster_id).
+        params: dict = {
+            "dominant_playbook_id":   dominant_id,
+            "playbook_distribution":  distribution,
+        }
+        if dominant_name:
+            params["dominant_playbook_name"] = dominant_name
+        update_actions.append({
+            "_op_type": "update_by_query",
+            "_index":   ip_clusters_index,
+            "query":    {"bool": {"must": [
+                {"term": {"doc_type": "cluster"}},
+                {"term": {"run_id": run_id}},
+                {"term": {"cluster_id": cid}},
+            ]}},
+            "params":   params,
+        })
+        stats["clusters_annotated"] += 1
+
+    # update_by_query isn't a `_bulk` op — apply each individually. There's
+    # one per cluster, k = O(n_clusters) which is small (~tens), so this is
+    # fine even without batching.
+    script_source = (
+        "ctx._source.dominant_playbook_id = params.dominant_playbook_id;"
+        "ctx._source.playbook_distribution = params.playbook_distribution;"
+        "if (params.containsKey('dominant_playbook_name')) {"
+        "  ctx._source.dominant_playbook_name = params.dominant_playbook_name;"
+        "} else {"
+        "  ctx._source.remove('dominant_playbook_name');"
+        "}"
+    )
+    for action in update_actions:
+        try:
+            es.update_by_query(
+                index=action["_index"],
+                query=action["query"],
+                script={"source": script_source, "params": action["params"]},
+                refresh=False,
+                conflicts="proceed",
+            )
+        except Exception as exc:
+            log.warning("[ip-playbook-annot] update failed for cluster %s: %s",
+                        action["params"]["dominant_playbook_id"], exc)
+
+    try:
+        es.indices.refresh(index=ip_clusters_index)
+    except Exception as exc:
+        log.warning("[ip-playbook-annot] post-write refresh failed (continuing): %s", exc)
+
+    stats["runtime_seconds"] = round(time.time() - t0, 2)
+    log.info("[ip-playbook-annot] annotated %d/%d clusters in %ss",
+             stats["clusters_annotated"], stats["clusters_seen"], stats["runtime_seconds"])
+    return stats
+
+
 def run_cluster(
     cfg: AppConfig,
     secrets: Secrets,
@@ -634,6 +836,14 @@ def run_cluster(
         cred_hash_dim=ipcfg.attribution_cred_hash_dim,
     )
 
+    # NOTE: the `dominant_playbook` annotation post-pass (ROADMAP #24) is
+    # NOT called here. It depends on `session.playbook_id` being populated,
+    # which only happens after `name playbooks` runs — and the backward
+    # task runs `cluster ips` *before* `name playbooks`. Calling it here
+    # would always produce zeros. The annotation is invoked via the
+    # separate `name ip-clusters` CLI verb, which the backward task runs
+    # *after* `name playbooks`.
+
     return run_layer_clustering(
         es=es,
         docs_iter=iter_ip_docs(es, ips_idx, ipcfg.page_size),
@@ -650,4 +860,37 @@ def run_cluster(
         centroid_sample_field="sample_ips",
         dry_run=dry_run,
         layer_label="cowrie.ips",
+    )
+
+
+def run_name_ip_clusters(
+    cfg: AppConfig,
+    secrets: Secrets,
+    *,
+    dry_run: bool = False,
+) -> dict:
+    """Annotate every IP-cluster centroid in the latest run with its
+    `dominant_playbook_id` / `dominant_playbook_name` / `playbook_distribution`.
+
+    Standalone CLI verb (ROADMAP #24). Must run AFTER `name playbooks` —
+    it reads `session.playbook_id` from the session rollup index, which
+    only gets filled in by `name playbooks`. Running this from within
+    `cluster ips` (which is the more obvious place) would always produce
+    zero annotations because of backward-task step ordering. Cheap (~few
+    hundred ms on a few-hundred-IP cluster set); safe to re-run.
+
+    `dry_run=True` is a no-op stub for symmetry with other verbs — the
+    annotation is read-only-then-write and there's no cheap "would
+    change" path that's also cheap on ES. Returns the same stats dict
+    shape either way.
+    """
+    if dry_run:
+        log.info("[name ip-clusters] dry-run: no-op")
+        return {"status": "dry_run"}
+    es = make_client(cfg.elasticsearch, secrets)
+    return annotate_ip_clusters_with_dominant_playbook(
+        es,
+        ips_rollup_index=cfg.elasticsearch.indexes.cowrie.ips_rollup,
+        ip_clusters_index=cfg.elasticsearch.indexes.cowrie.ip_clusters,
+        sessions_rollup_index=cfg.elasticsearch.indexes.cowrie.sessions_rollup,
     )

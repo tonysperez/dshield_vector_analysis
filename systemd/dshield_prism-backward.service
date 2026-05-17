@@ -58,6 +58,11 @@ ExecStart=-/usr/bin/flock /var/lib/dshield_prism/.lock /opt/dshield_prism/.venv/
 # automatically (no --force) — only new clusters get an LLM call.
 ExecStart=-/usr/bin/flock /var/lib/dshield_prism/.lock /opt/dshield_prism/.venv/bin/python -m enrich.cli --config /opt/dshield_prism/config/default.yaml name playbooks
 
+# --- Step 7b: annotate IP-cluster centroids with their dominant playbook
+# now that session.playbook_id has been filled in by step 7. No LLM
+# calls — just a join over session rollups. ROADMAP #24.
+ExecStart=-/usr/bin/flock /var/lib/dshield_prism/.lock /opt/dshield_prism/.venv/bin/python -m enrich.cli --config /opt/dshield_prism/config/default.yaml name ip-clusters
+
 # --- Step 8: mine multi-session campaigns over the refreshed playbook
 # set. Stable campaign IDs (content-hashed playbook set, ROADMAP #2).
 ExecStart=-/usr/bin/flock /var/lib/dshield_prism/.lock /opt/dshield_prism/.venv/bin/python -m enrich.cli --config /opt/dshield_prism/config/default.yaml mine campaigns --kind all

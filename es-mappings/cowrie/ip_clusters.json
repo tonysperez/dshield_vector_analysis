@@ -20,6 +20,28 @@
       },
       "sample_ips": { "type": "ip" },
 
+      "dominant_playbook_id": {
+        "type": "text",
+        "fields": { "keyword": { "type": "keyword", "ignore_above": 256 } }
+      },
+      "dominant_playbook_name": {
+        "type": "text",
+        "fields": { "keyword": { "type": "keyword", "ignore_above": 256 } }
+      },
+      "playbook_distribution": {
+        "properties": {
+          "playbook_id": {
+            "type": "text",
+            "fields": { "keyword": { "type": "keyword", "ignore_above": 256 } }
+          },
+          "playbook_name": {
+            "type": "text",
+            "fields": { "keyword": { "type": "keyword", "ignore_above": 256 } }
+          },
+          "count": { "type": "long" }
+        }
+      },
+
       "total_docs":      { "type": "long" },
       "n_clusters":      { "type": "long" },
       "n_outliers":      { "type": "long" },

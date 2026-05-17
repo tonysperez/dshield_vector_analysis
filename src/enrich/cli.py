@@ -172,9 +172,13 @@ def _run_pipeline(cfg, secrets, args) -> int:
         # session clustering + LLM naming (playbooks = named session clusters)
         ("cluster sessions",           lambda: sessions_mod.run_cluster(cfg, secrets, dry_run=dry),                       False),
         ("name playbooks",             lambda: sessions_mod.run_name_playbooks(cfg, secrets, dry_run=dry, force=False),   True),
-        # IP rollup + clustering (IP clusters are unnamed actor profiles)
+        # IP rollup + clustering (IP clusters are unnamed actor profiles).
+        # `name ip-clusters` annotates each centroid with its dominant
+        # playbook — must run AFTER `name playbooks` above (depends on
+        # session.playbook_id being populated). ROADMAP #24.
         ("rollup ips",                 lambda: ips_mod.run_rollup(cfg, secrets, dry_run=dry),                             False),
         ("cluster ips",                lambda: ips_mod.run_cluster(cfg, secrets, dry_run=dry),                            False),
+        ("name ip-clusters",           lambda: ips_mod.run_name_ip_clusters(cfg, secrets, dry_run=dry),                   True),
         # multi-session campaign mining (separate concept; programmatic names)
         ("mine campaigns",             lambda: campaigns_mod.run_mine(cfg, secrets, kind="all", dry_run=dry),             True),
     ]
@@ -425,6 +429,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p_pb.add_argument("--source", default="cowrie", help="Source name (default: cowrie)")
     p_pb.add_argument("--dry-run", action="store_true", help="Show candidates without calling LLM")
     p_pb.add_argument("--force", action="store_true", help="Rename clusters that already have a name")
+
+    # name ip-clusters — annotate each IP-cluster centroid with its modal
+    # playbook across member IPs' sessions. Must run AFTER `name playbooks`
+    # (depends on session.playbook_id being populated). ROADMAP #24.
+    p_ipc = name_sub.add_parser(
+        "ip-clusters",
+        help="Annotate IP-cluster centroids with dominant_playbook (#24)",
+    )
+    p_ipc.add_argument("--source", default="cowrie", help="Source name (default: cowrie)")
+    p_ipc.add_argument("--dry-run", action="store_true", help="No-op")
 
     # mine campaigns — multi-session campaign discovery. Runs frequent-itemset
     # mining over per-IP playbook bags (kind=behaviour) and/or shared-artifact
@@ -729,22 +743,34 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.verb == "name":
-        if args.subject != "playbooks":
-            print(f"[ERROR] Unknown `name` subject: {args.subject!r}", flush=True)
-            return 1
-        mod = _load_source_layer(args.source, "sessions")
-        if mod is None:
-            print(f"[ERROR] Source {args.source!r} has no `sessions` layer", flush=True)
-            return 1
-        try:
-            stats = mod.run_name_playbooks(
-                cfg, secrets, dry_run=args.dry_run, force=args.force,
-            )
-        except RuntimeError as exc:
-            print(f"[ERROR] {exc}", flush=True)
-            return 1
-        print(json.dumps(stats, indent=2, default=str))
-        return 0
+        if args.subject == "playbooks":
+            mod = _load_source_layer(args.source, "sessions")
+            if mod is None:
+                print(f"[ERROR] Source {args.source!r} has no `sessions` layer", flush=True)
+                return 1
+            try:
+                stats = mod.run_name_playbooks(
+                    cfg, secrets, dry_run=args.dry_run, force=args.force,
+                )
+            except RuntimeError as exc:
+                print(f"[ERROR] {exc}", flush=True)
+                return 1
+            print(json.dumps(stats, indent=2, default=str))
+            return 0
+        if args.subject == "ip-clusters":
+            mod = _load_source_layer(args.source, "ips")
+            if mod is None:
+                print(f"[ERROR] Source {args.source!r} has no `ips` layer", flush=True)
+                return 1
+            try:
+                stats = mod.run_name_ip_clusters(cfg, secrets, dry_run=args.dry_run)
+            except RuntimeError as exc:
+                print(f"[ERROR] {exc}", flush=True)
+                return 1
+            print(json.dumps(stats, indent=2, default=str))
+            return 0
+        print(f"[ERROR] Unknown `name` subject: {args.subject!r}", flush=True)
+        return 1
 
     if args.verb == "mine":
         # `mine campaigns` is the only subject so far.
