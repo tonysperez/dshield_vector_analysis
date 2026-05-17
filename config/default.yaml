@@ -206,3 +206,75 @@ ip:
   attribution_cred_hash_dim: 16
   page_size: 1000
   batch_size: 200
+
+# External threat-intel subsystem (ROADMAP "Research-mode strategic gaps" A).
+# Runs alongside the enrichment pipeline; writes per-artifact intel docs to
+# project-owned `intel-*-default` indices. Disabled by default — flip
+# `enabled: true` in local.yaml after configuring providers + never-query
+# CIDRs. Milestone 1 ships three free-tier IP providers (Tor exit list,
+# Spamhaus DNS, ISC daily feed); other artifact kinds + providers land in
+# subsequent milestones.
+intel:
+  enabled: false
+
+  # Project-owned intel indices, one per artifact kind. Pre-allocated so
+  # adding a kind later doesn't require a config migration.
+  indexes:
+    ip:     "intel-dshield-ip-default"
+    url:    "intel-dshield-url-default"
+    domain: "intel-dshield-domain-default"
+    hash:   "intel-dshield-hash-default"
+
+  providers:
+    tor:
+      enabled: true
+      exit_list_url: "https://check.torproject.org/torbulkexitlist"
+      refresh_minutes: 60
+      cache_file: "/var/lib/dshield_prism/intel_tor_exits.txt"
+    # abuse.ch FeodoTracker — active malware C2 IPs. HTTP-based bulk
+    # download (no DNS-blocklist resolver gotchas). High precision;
+    # the `_recommended` endpoint pre-filters to currently-active C2.
+    feodotracker:
+      enabled: true
+      feed_url: "https://feodotracker.abuse.ch/downloads/ipblocklist_recommended.json"
+      refresh_minutes: 60
+      cache_file: "/var/lib/dshield_prism/intel_feodotracker.json"
+    # FireHOL Level 1 — aggregated IP reputation across hundreds of
+    # upstream feeds (CINS, DROP/EDROP, BinaryDefense, AlienVault,
+    # EmergingThreats, …). The strictest tier — very low FP. Single
+    # plain-text netset file with mixed IPs and CIDRs.
+    firehol:
+      enabled: true
+      feed_url: "https://iplists.firehol.org/files/firehol_level1.netset"
+      refresh_minutes: 360
+      cache_file: "/var/lib/dshield_prism/intel_firehol_level1.netset"
+    isc:
+      enabled: true
+      sources_url: "https://isc.sans.edu/api/sources/attacks/2000?json"
+      refresh_minutes: 360
+      cache_file: "/var/lib/dshield_prism/intel_isc_top.json"
+
+  # Priority-queue weights. `priority = novelty_w * novelty +
+  #                                     low_conf_w * (1 - confidence/10) +
+  #                                     centrality_w * centrality_norm +
+  #                                     recency_w * recency_decay`.
+  # Local novelty dominates by design (per 2026-05-16 design decision):
+  # scarce free-tier lookups go first to artifacts most likely to be
+  # research discoveries.
+  priority:
+    novelty_w: 0.50
+    low_conf_w: 0.20
+    centrality_w: 0.15
+    recency_w: 0.15
+    recency_half_life_hours: 168.0
+
+  # CIDRs that MUST NOT be queried against external feeds. RFC1918 +
+  # loopback + link-local + multicast + reserved are already filtered
+  # at the canonicaliser (src/enrich/intel/artifact.py); add the
+  # operator's egress IP, the SO box's public IP, any peer research
+  # sensors, and any user-controlled infrastructure here.
+  never_query_cidrs: []
+
+  # Per-CLI-invocation safety cap. A misconfigured run can't exhaust
+  # daily budgets beyond this many artifact lookups.
+  max_per_run: 5000

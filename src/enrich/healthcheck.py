@@ -102,7 +102,7 @@ def _model_present(tags: dict, needed: str) -> bool:
     return any(c == needed or c.startswith(needed) for c in candidates)
 
 
-VALID_SCOPES = ("es", "llm", "sqlite", "cloud-conn", "cloud")
+VALID_SCOPES = ("es", "llm", "sqlite", "cloud-conn", "cloud", "intel")
 
 
 def _check_es(cfg: AppConfig, secrets: Secrets) -> int:
@@ -267,12 +267,59 @@ def _check_cloud(cfg: AppConfig, secrets: Secrets) -> int:
     return failures
 
 
+def _check_intel(cfg: AppConfig, secrets: Secrets) -> int:
+    """Intel subsystem health: per-provider liveness + queue depth.
+
+    Disabled-by-config returns 0 cleanly (a 'soft' OK), matching the
+    same pattern as `_cloud_preflight`. When enabled, calls each
+    provider's `health()` and reports per-provider OK/FAIL.
+    """
+    if not cfg.intel.enabled:
+        print("[ok] intel disabled (cfg.intel.enabled=false)")
+        return 0
+    failures = 0
+    try:
+        from .intel.refresh import _build_providers
+        providers = _build_providers(cfg)
+    except Exception as exc:
+        print(f"[FAIL] intel: provider construction: {exc}")
+        return 1
+    if not providers:
+        print("[warn] intel enabled but no providers are configured-on")
+        return 0
+    for prov in providers:
+        try:
+            status = prov.health()
+        except Exception as exc:
+            print(f"[FAIL] intel.{prov.name}: {exc}")
+            failures += 1
+            continue
+        if status.ok:
+            print(f"[ok] intel.{prov.name}: {status.detail}")
+        else:
+            print(f"[FAIL] intel.{prov.name}: {status.detail}")
+            failures += 1
+    try:
+        db = StateDB(cfg.worker.state_db)
+        depth = db.intel_queue_depth()
+        db.close()
+        if depth:
+            summary = ", ".join(f"{k}={v}" for k, v in sorted(depth.items()))
+            print(f"[ok] intel queue depth: {summary}")
+        else:
+            print("[ok] intel queue is empty")
+    except Exception as exc:
+        print(f"[warn] intel queue depth read failed: {exc}")
+    return failures
+
+
 _SCOPE_FNS = {
     "es": _check_es,
     "llm": _check_llm,
     "sqlite": _check_sqlite,
     "cloud-conn": _check_cloud_conn,
     "cloud": _check_cloud,
+    "intel": _check_intel,
 }
 
 

@@ -68,10 +68,28 @@ class LLMConfig(BaseModel):
     request_timeout: int = 600
 
 
+class IntelIndexes(BaseModel):
+    """Mirror of the parent IntelIndexes. Drift-tolerant: any of these
+    is optional, so older deploys without an `intel:` block in their
+    config still load. The console treats missing indices as "intel
+    not deployed yet" and degrades gracefully on the artifact pane.
+    """
+    ip:     str = "intel-dshield-ip-default"
+    url:    str = "intel-dshield-url-default"
+    domain: str = "intel-dshield-domain-default"
+    hash:   str = "intel-dshield-hash-default"
+
+
+class IntelConfig(BaseModel):
+    enabled: bool = False
+    indexes: IntelIndexes = IntelIndexes()
+
+
 class AppConfig(BaseModel):
     """Slimmed-down config — only what the console needs."""
     elasticsearch: ESConfig
     llm: Optional[LLMConfig] = None
+    intel: IntelConfig = IntelConfig()
 
 
 class Secrets(BaseSettings):
@@ -126,9 +144,11 @@ def load_config(path: Optional[str] = None) -> AppConfig:
             break
 
     raw_llm = data.get("llm")
+    raw_intel = data.get("intel") or {}
     return AppConfig(
         elasticsearch=data["elasticsearch"],
         llm=LLMConfig(**raw_llm) if raw_llm else None,
+        intel=IntelConfig(**raw_intel),
     )
 
 

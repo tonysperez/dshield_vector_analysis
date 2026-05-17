@@ -58,6 +58,12 @@ _LAYER_MAPPINGS = {
         "ip_clusters":      "es-mappings/cowrie/ip_clusters.json",
         "campaigns":        "es-mappings/cowrie/campaigns.json",
     },
+    # External threat-intel — cross-source per-artifact indices.
+    # `init-indexes --source intel` creates these. Milestone 1 ships
+    # only `ip`; the others land as subsequent providers/kinds wire up.
+    "intel": {
+        "ip":     "es-mappings/intel/ip.json",
+    },
 }
 
 
@@ -230,6 +236,14 @@ def _resolve_index_for_layer(cfg, source: str, layer: str) -> str:
             "ips":              c.ips_rollup,
             "ip_clusters":      c.ip_clusters,
             "campaigns":        c.campaigns,
+        }[layer]
+    if source == "intel":
+        i = cfg.intel.indexes
+        return {
+            "ip":     i.ip,
+            "url":    i.url,
+            "domain": i.domain,
+            "hash":   i.hash,
         }[layer]
     raise ValueError(f"Unknown source: {source}")
 
@@ -466,6 +480,27 @@ def _build_parser() -> argparse.ArgumentParser:
              "unbounded behaviour — slower and memory-hungrier on large "
              "corpora). ROADMAP #21.",
     )
+
+    # intel — external threat-intel subsystem. `refresh` runs one pass:
+    # discovers artifacts, priority-queues them, dispatches to every
+    # enabled provider, writes intel-*-default docs. `backfill` forces a
+    # full re-scan (currently identical to refresh; reserved for future
+    # scoping). See docs/ROADMAP.md "Research-mode strategic gaps" A.
+    p_intel = sub.add_parser("intel", help="External threat-intel subsystem (ROADMAP A)")
+    intel_sub = p_intel.add_subparsers(dest="subject", required=True)
+    p_intel_refresh = intel_sub.add_parser(
+        "refresh",
+        help="One refresh pass — discover, queue, lookup, write",
+    )
+    p_intel_refresh.add_argument(
+        "--dry-run", action="store_true",
+        help="Discover + queue without calling providers or writing intel docs",
+    )
+    p_intel_backfill = intel_sub.add_parser(
+        "backfill",
+        help="Force a full re-scan over the corpus (same as refresh for milestone 1)",
+    )
+    p_intel_backfill.add_argument("--dry-run", action="store_true")
 
     # pipeline — run every processing stage in order, raw → fully processed.
     # Mirrors the analytics + ingest systemd units but in one verb so a
@@ -786,6 +821,18 @@ def main(argv: list[str] | None = None) -> int:
             )
         except RuntimeError as exc:
             print(f"[ERROR] {exc}", flush=True)
+            return 1
+        print(json.dumps(stats, indent=2, default=str))
+        return 0
+
+    if args.verb == "intel":
+        from .intel.refresh import run_backfill, run_refresh
+        if args.subject == "refresh":
+            stats = run_refresh(cfg, secrets, dry_run=args.dry_run)
+        elif args.subject == "backfill":
+            stats = run_backfill(cfg, secrets, dry_run=args.dry_run)
+        else:
+            print(f"[ERROR] Unknown `intel` subject: {args.subject!r}", flush=True)
             return 1
         print(json.dumps(stats, indent=2, default=str))
         return 0

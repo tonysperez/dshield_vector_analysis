@@ -51,6 +51,37 @@ CREATE TABLE IF NOT EXISTS cloud_spend (
     output_tokens  INTEGER NOT NULL DEFAULT 0,
     cost_usd       REAL    NOT NULL DEFAULT 0.0
 );
+
+-- Intel subsystem (ROADMAP section A). The ES intel-* indices ARE the
+-- result cache — these SQLite tables track only ephemeral worker state:
+-- the priority queue, per-provider daily budget burn-down, and the
+-- circuit-breaker state for failing providers.
+CREATE TABLE IF NOT EXISTS intel_queue (
+    artifact_kind  TEXT NOT NULL,
+    artifact_value TEXT NOT NULL,
+    priority       REAL NOT NULL,
+    enqueued_at    TEXT NOT NULL,
+    attempts       INTEGER NOT NULL DEFAULT 0,
+    last_error     TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (artifact_kind, artifact_value)
+);
+CREATE INDEX IF NOT EXISTS intel_queue_priority_idx
+    ON intel_queue(priority DESC);
+
+CREATE TABLE IF NOT EXISTS intel_provider_spend (
+    provider TEXT NOT NULL,
+    day      TEXT NOT NULL,            -- YYYY-MM-DD UTC
+    calls    INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (provider, day)
+);
+
+CREATE TABLE IF NOT EXISTS intel_provider_state (
+    provider             TEXT PRIMARY KEY,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    circuit_opened_at    TEXT NOT NULL DEFAULT '',
+    last_success_at      TEXT NOT NULL DEFAULT '',
+    last_error           TEXT NOT NULL DEFAULT ''
+);
 """
 
 
@@ -245,3 +276,145 @@ class StateDB:
         else:
             cur = self.conn.execute("DELETE FROM watermark WHERE key=?", (key,))
         return cur.rowcount or 0
+
+    # --- intel subsystem ----------------------------------------------------
+
+    def intel_queue_upsert(
+        self,
+        artifact_kind: str,
+        artifact_value: str,
+        priority: float,
+        enqueued_at: str,
+    ) -> None:
+        """Insert a new artifact or refresh its priority if already queued.
+
+        Re-enqueue with a higher priority lets a high-novelty discovery
+        jump ahead of stale low-priority entries left over from a
+        previous run. Attempt count + last error are preserved.
+        """
+        self.conn.execute(
+            "INSERT INTO intel_queue(artifact_kind, artifact_value, priority, enqueued_at)"
+            " VALUES (?, ?, ?, ?)"
+            " ON CONFLICT(artifact_kind, artifact_value) DO UPDATE SET"
+            "   priority = excluded.priority,"
+            "   enqueued_at = excluded.enqueued_at",
+            (artifact_kind, artifact_value, priority, enqueued_at),
+        )
+
+    def intel_queue_pop_top(
+        self, artifact_kind: str, limit: int,
+    ) -> list[tuple[str, float]]:
+        """Return up to `limit` queued artifacts of `kind`, highest-priority first.
+
+        DOES NOT remove them from the queue — call `intel_queue_mark_done`
+        after the lookup attempt. A worker that crashes mid-batch leaves
+        the rows in place for the next run.
+        """
+        cur = self.conn.execute(
+            "SELECT artifact_value, priority FROM intel_queue"
+            " WHERE artifact_kind = ?"
+            " ORDER BY priority DESC, enqueued_at ASC"
+            " LIMIT ?",
+            (artifact_kind, limit),
+        )
+        return [(row[0], row[1]) for row in cur.fetchall()]
+
+    def intel_queue_mark_done(self, artifact_kind: str, artifact_value: str) -> None:
+        """Remove an artifact from the queue (lookup successful for all providers)."""
+        self.conn.execute(
+            "DELETE FROM intel_queue WHERE artifact_kind=? AND artifact_value=?",
+            (artifact_kind, artifact_value),
+        )
+
+    def intel_queue_mark_attempt(
+        self, artifact_kind: str, artifact_value: str, last_error: str,
+    ) -> None:
+        """Increment the attempts counter and store the last error.
+
+        Leaves the row in the queue so the next run retries. The worker
+        decides when to give up via `attempts` threshold.
+        """
+        self.conn.execute(
+            "UPDATE intel_queue"
+            " SET attempts = attempts + 1, last_error = ?"
+            " WHERE artifact_kind = ? AND artifact_value = ?",
+            (last_error, artifact_kind, artifact_value),
+        )
+
+    def intel_queue_depth(self) -> dict[str, int]:
+        """Return {kind: count} for the current queue. Used by /api/intel/health."""
+        cur = self.conn.execute(
+            "SELECT artifact_kind, COUNT(*) FROM intel_queue GROUP BY artifact_kind"
+        )
+        return {row[0]: row[1] for row in cur.fetchall()}
+
+    def intel_provider_calls_today(self, provider: str, day: str) -> int:
+        """Count of calls already made to `provider` today (UTC)."""
+        cur = self.conn.execute(
+            "SELECT calls FROM intel_provider_spend WHERE provider=? AND day=?",
+            (provider, day),
+        )
+        row = cur.fetchone()
+        return int(row[0]) if row else 0
+
+    def intel_provider_record_call(self, provider: str, day: str) -> None:
+        """Increment the daily-call counter for `provider`."""
+        self.conn.execute(
+            "INSERT INTO intel_provider_spend(provider, day, calls)"
+            " VALUES (?, ?, 1)"
+            " ON CONFLICT(provider, day) DO UPDATE SET calls = calls + 1",
+            (provider, day),
+        )
+
+    def intel_provider_get_state(self, provider: str) -> dict:
+        """Return the current circuit-breaker / failure state for a provider.
+
+        Empty result returns a default 'clean' state so callers don't
+        need to handle the missing-row case.
+        """
+        cur = self.conn.execute(
+            "SELECT consecutive_failures, circuit_opened_at, last_success_at, last_error"
+            " FROM intel_provider_state WHERE provider = ?",
+            (provider,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return {
+                "consecutive_failures": 0,
+                "circuit_opened_at": "",
+                "last_success_at": "",
+                "last_error": "",
+            }
+        return {
+            "consecutive_failures": int(row[0]),
+            "circuit_opened_at": row[1],
+            "last_success_at": row[2],
+            "last_error": row[3],
+        }
+
+    def intel_provider_record_success(self, provider: str, when: str) -> None:
+        """Mark a successful lookup. Resets consecutive_failures."""
+        self.conn.execute(
+            "INSERT INTO intel_provider_state(provider, consecutive_failures, last_success_at)"
+            " VALUES (?, 0, ?)"
+            " ON CONFLICT(provider) DO UPDATE SET"
+            "   consecutive_failures = 0,"
+            "   circuit_opened_at = '',"
+            "   last_success_at = ?,"
+            "   last_error = ''",
+            (provider, when, when),
+        )
+
+    def intel_provider_record_failure(
+        self, provider: str, error: str, when: str, open_circuit: bool,
+    ) -> None:
+        """Increment failure counter; mark circuit-open if requested."""
+        self.conn.execute(
+            "INSERT INTO intel_provider_state(provider, consecutive_failures, last_error, circuit_opened_at)"
+            " VALUES (?, 1, ?, ?)"
+            " ON CONFLICT(provider) DO UPDATE SET"
+            "   consecutive_failures = consecutive_failures + 1,"
+            "   last_error = ?,"
+            "   circuit_opened_at = CASE WHEN ? THEN ? ELSE circuit_opened_at END",
+            (provider, error, when if open_circuit else "", error, open_circuit, when),
+        )

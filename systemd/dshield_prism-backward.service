@@ -67,6 +67,14 @@ ExecStart=-/usr/bin/flock /var/lib/dshield_prism/.lock /opt/dshield_prism/.venv/
 # set. Stable campaign IDs (content-hashed playbook set, ROADMAP #2).
 ExecStart=-/usr/bin/flock /var/lib/dshield_prism/.lock /opt/dshield_prism/.venv/bin/python -m enrich.cli --config /opt/dshield_prism/config/default.yaml mine campaigns --kind all
 
+# --- Step 9: refresh external threat-intel for IPs in the rollup.
+# No-op when `intel.enabled: false`. ROADMAP "Research-mode strategic
+# gaps" section A. Runs last so it sees the latest novelty scores
+# from step 5 — high-novelty artifacts are prioritised in the queue.
+# Soft-fail: provider outages, rate-limits etc. should never abort
+# the chain; intel can always catch up on the next backward pass.
+ExecStart=-/usr/bin/flock /var/lib/dshield_prism/.lock /opt/dshield_prism/.venv/bin/python -m enrich.cli --config /opt/dshield_prism/config/default.yaml intel refresh
+
 StandardOutput=journal
 StandardError=journal
 

@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>DShield Artifact — IP</title>
+  <link rel="stylesheet" href="/static/css/app.css" />
+  <style>
+    /* Artifact pane for IP. Sibling of health.html / insights.html;
+       shares topbar styling via app.css. Milestone 1 of the
+       findings-first redesign — this is the first place TI signals
+       reach the analyst. */
+
+    #art-main {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 16px 20px 60px;
+      display: flex;
+      flex-direction: column;
+      gap: 28px;
+    }
+
+    .art-header {
+      display: flex;
+      align-items: baseline;
+      gap: 14px;
+      flex-wrap: wrap;
+    }
+    .art-kind {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: #6b7494;
+    }
+    .art-value {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 22px;
+      color: #d8dde8;
+    }
+
+    .art-badges { display: flex; gap: 8px; flex-wrap: wrap; }
+    .art-badge {
+      font-size: 11px;
+      padding: 3px 8px;
+      border-radius: 4px;
+      background: #1e2540;
+      color: #d8dde8;
+      border: 1px solid #2c3450;
+    }
+    .art-badge.malicious { background: #4b1e22; border-color: #8a3038; color: #ffd2d4; }
+    .art-badge.benign    { background: #1e3a24; border-color: #2d6b3a; color: #d2ffd8; }
+    .art-badge.neutral   { background: #1f263a; border-color: #2d3450; }
+    .art-badge.unknown   { background: #2a2538; border-color: #45355a; color: #c7b3d9; }
+
+    .art-section-title {
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      color: #6b7494;
+      margin: 0 0 14px;
+    }
+
+    .art-card {
+      background: #111827;
+      border: 1px solid #1e2540;
+      border-radius: 7px;
+      padding: 16px 18px;
+    }
+
+    .art-kv { display: grid; grid-template-columns: 200px 1fr; gap: 6px 14px; }
+    .art-kv-key { color: #6b7494; font-size: 11px; text-transform: uppercase; letter-spacing: 0.6px; }
+    .art-kv-val { color: #d8dde8; font-size: 13px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+    .providers-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      gap: 14px;
+    }
+    .provider-card {
+      background: #111827;
+      border: 1px solid #1e2540;
+      border-radius: 7px;
+      padding: 13px 15px;
+    }
+    .provider-card .pc-name {
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.7px;
+      color: #8a96b8;
+    }
+    .provider-card .pc-verdict { margin: 6px 0 10px 0; font-size: 13px; }
+    .provider-card pre {
+      font-size: 11px;
+      max-height: 200px;
+      overflow: auto;
+      background: #0c121f;
+      padding: 8px;
+      border-radius: 4px;
+      color: #adb6cc;
+      margin: 0;
+    }
+    .empty-hint {
+      color: #6b7494;
+      font-style: italic;
+      font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <a href="/" class="brand" style="text-decoration:none;color:inherit;">DShield Console</a>
+    <a href="/" class="nav-link">← Graph</a>
+    <a href="/insights" class="nav-link">Insights</a>
+    <a href="/compare" class="nav-link">Compare</a>
+    <a href="/health" class="nav-link">Health</a>
+    <div style="flex:1"></div>
+    <div id="loading" class="loading hidden" aria-live="polite"></div>
+  </header>
+
+  <main id="art-main">
+    <div class="art-header">
+      <span class="art-kind" id="art-kind">IP artifact</span>
+      <span class="art-value" id="art-value">loading…</span>
+      <div class="art-badges" id="art-badges"></div>
+    </div>
+
+    <!-- Derived consensus block — what the rest of the pipeline reads -->
+    <section>
+      <p class="art-section-title">Derived consensus
+        <span style="color:#414b62;font-weight:400;text-transform:none;letter-spacing:0;font-size:10px">computed every refresh over all providers; this is what the triage rule + cluster matrix consume</span>
+      </p>
+      <div class="art-card" id="derived-card">
+        <em class="empty-hint">loading…</em>
+      </div>
+    </section>
+
+    <!-- Local observations (IP rollup join) -->
+    <section>
+      <p class="art-section-title">Local observations
+        <span style="color:#414b62;font-weight:400;text-transform:none;letter-spacing:0;font-size:10px">what this sensor saw — sessions, novelty, geo, ASN, credentials</span>
+      </p>
+      <div class="art-card" id="rollup-card">
+        <em class="empty-hint">loading…</em>
+      </div>
+    </section>
+
+    <!-- Per-provider raw responses -->
+    <section>
+      <p class="art-section-title">External intel by provider
+        <span style="color:#414b62;font-weight:400;text-transform:none;letter-spacing:0;font-size:10px">one card per provider that returned data; click the raw JSON to inspect what they actually said</span>
+      </p>
+      <div class="providers-grid" id="providers-grid">
+        <em class="empty-hint">loading…</em>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/js/artifact_ip.js"></script>
+</body>
+</html>

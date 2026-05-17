@@ -20,7 +20,7 @@ from pydantic import BaseModel
 
 from ._config import load_config, load_secrets
 from ._es import make_client
-from . import graph, ioc, queries
+from . import graph, intel as intel_mod, ioc, queries
 # Imported as a renamed local to avoid shadowing the `health()` function
 # below that's registered as the `/api/health` system-check route.
 from . import health as health_mod
@@ -85,6 +85,16 @@ def build_app(config_path: str | None = None) -> FastAPI:
         page = WEB_DIR / "health.html"
         if not page.exists():
             raise HTTPException(500, "web/health.html missing")
+        return FileResponse(page)
+
+    @app.get("/artifact/ip/{value}")
+    def artifact_ip_page(value: str) -> FileResponse:
+        # Page is the same for every IP; the JS fetches the API.
+        # Path-parametric so the URL itself encodes the artifact and
+        # browser back/forward / linking work.
+        page = WEB_DIR / "artifact_ip.html"
+        if not page.exists():
+            raise HTTPException(500, "web/artifact_ip.html missing")
         return FileResponse(page)
 
     # ------------------------------------------------------------------
@@ -163,6 +173,18 @@ def build_app(config_path: str | None = None) -> FastAPI:
             raise HTTPException(404, msg)
         _invalidate_health_cache()
         return JSONResponse({"ok": True, "message": msg})
+
+    # ------------------------------------------------------------------
+    # Per-artifact pane — intel + local-observations join
+    # ------------------------------------------------------------------
+    @app.get("/api/artifact/ip/{value}")
+    def artifact_ip_api(value: str) -> JSONResponse:
+        try:
+            data = intel_mod.fetch_intel_ip(es, cfg, value)
+        except Exception as exc:                       # pragma: no cover
+            log.exception("artifact_ip_api failed")
+            raise HTTPException(500, f"artifact lookup failed: {exc}")
+        return JSONResponse(data)
 
     # ------------------------------------------------------------------
     # Compare clusters (interactive: "why didn't these two playbooks merge?")

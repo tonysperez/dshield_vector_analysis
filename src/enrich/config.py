@@ -186,6 +186,136 @@ class IPConfig(BaseModel):
     batch_size: int = 200
 
 
+class IntelProviderConfig(BaseModel):
+    """Generic per-provider toggle + key holder.
+
+    Each provider's own config (api key, refresh cadence, etc.) lives
+    in a typed sub-model below. This base just carries `enabled` so
+    operators can flip a provider off without removing the block.
+    """
+    enabled: bool = True
+
+
+class TorProviderConfig(IntelProviderConfig):
+    """Tor exit-list provider — bulk file download, no API key."""
+    # URL of the public exit-list file. Default is the canonical Tor
+    # Project endpoint; override only when mirroring locally.
+    exit_list_url: str = "https://check.torproject.org/torbulkexitlist"
+    # How often to re-download the full list. The file updates hourly
+    # upstream; refreshing more often wastes bandwidth.
+    refresh_minutes: int = 60
+    # On-disk cache path. Survives process restarts so a worker reboot
+    # doesn't re-download. Stored alongside other state.
+    cache_file: str = "/var/lib/dshield_prism/intel_tor_exits.txt"
+
+
+class FeodoTrackerProviderConfig(IntelProviderConfig):
+    """abuse.ch FeodoTracker — active malware C2 IP list. No API key.
+
+    Replaces the previous Spamhaus DNS provider after the public-
+    resolver block proved an architectural mismatch for the
+    transportable / research-honeypot use case. FeodoTracker is
+    HTTP-based bulk download, high-precision (active C2 only),
+    sibling format to URLhaus / ThreatFox / MalwareBazaar from the
+    same operator.
+    """
+    # Recommended endpoint — pre-filtered to currently-active C2 only.
+    # `ipblocklist.json` exists too but includes historical entries.
+    feed_url: str = "https://feodotracker.abuse.ch/downloads/ipblocklist_recommended.json"
+    refresh_minutes: int = 60
+    cache_file: str = "/var/lib/dshield_prism/intel_feodotracker.json"
+
+
+class FireholProviderConfig(IntelProviderConfig):
+    """FireHOL Level 1 IP reputation aggregator. No API key, no auth.
+
+    Aggregates hundreds of upstream feeds (CINS Army, DROP/EDROP,
+    BinaryDefense, AlienVault, EmergingThreats compromised hosts,
+    …) into a single very-low-FP block list. Level 1 is the
+    strictest tier — entries the maintainers consider safe for null-
+    routing at a network edge.
+    """
+    feed_url: str = "https://iplists.firehol.org/files/firehol_level1.netset"
+    refresh_minutes: int = 360
+    cache_file: str = "/var/lib/dshield_prism/intel_firehol_level1.netset"
+
+
+class ISCProviderConfig(IntelProviderConfig):
+    """SANS Internet Storm Center / DShield top-attackers daily feed.
+
+    The ISC API publishes a top-N list of attacking IPs daily. We
+    download once per `refresh_minutes` and answer per-IP lookups
+    from the in-memory snapshot.
+    """
+    # ISC API. Adjust if/when ISC publishes a research-friendly mirror.
+    sources_url: str = "https://isc.sans.edu/api/sources/attacks/2000?json"
+    refresh_minutes: int = 360
+    cache_file: str = "/var/lib/dshield_prism/intel_isc_top.json"
+
+
+class IntelProvidersConfig(BaseModel):
+    """Per-provider sub-blocks. Add one field per new provider."""
+    tor: TorProviderConfig = Field(default_factory=TorProviderConfig)
+    feodotracker: FeodoTrackerProviderConfig = Field(default_factory=FeodoTrackerProviderConfig)
+    firehol: FireholProviderConfig = Field(default_factory=FireholProviderConfig)
+    isc: ISCProviderConfig = Field(default_factory=ISCProviderConfig)
+
+
+class IntelPriorityConfig(BaseModel):
+    """Weights on the priority-queue scoring function.
+
+    `priority = novelty_w * novelty + low_conf_w * (1 - conf/10)
+              + centrality_w * centrality_norm
+              + recency_w * recency_decay`
+
+    Defaults follow the design decision (2026-05-16) that local
+    novelty dominates — scarce free-tier budget goes to artifacts most
+    likely to be discoveries. Weights need not sum to 1; the queue
+    sorts on the raw score.
+    """
+    novelty_w: float = 0.50
+    low_conf_w: float = 0.20
+    centrality_w: float = 0.15
+    recency_w: float = 0.15
+    # Half-life of the recency term, in hours. Recent artifacts get
+    # close to 1.0; week-old gets ~0.5; month-old gets ~0.07.
+    recency_half_life_hours: float = 168.0
+
+
+class IntelIndexes(BaseModel):
+    """Project-owned intel indices. One per artifact kind.
+
+    Only `ip` is end-to-end in milestone 1. The other names are
+    pre-allocated so adding a kind later doesn't require config
+    migration on existing deploys.
+    """
+    ip:     str = "intel-dshield-ip-default"
+    url:    str = "intel-dshield-url-default"
+    domain: str = "intel-dshield-domain-default"
+    hash:   str = "intel-dshield-hash-default"
+
+
+class IntelConfig(BaseModel):
+    """External threat-intel subsystem.
+
+    Disabled by default. Per-deploy enable + provider keys go in
+    `config/local.yaml`. See ROADMAP "Research-mode strategic gaps"
+    section A for the design.
+    """
+    enabled: bool = False
+    indexes: IntelIndexes = Field(default_factory=IntelIndexes)
+    providers: IntelProvidersConfig = Field(default_factory=IntelProvidersConfig)
+    priority: IntelPriorityConfig = Field(default_factory=IntelPriorityConfig)
+    # CIDRs the worker MUST NOT look up against external feeds. RFC1918
+    # is already filtered at canonicalisation time (artifact.py); list
+    # the operator's egress + research peer CIDRs here.
+    never_query_cidrs: list[str] = Field(default_factory=list)
+    # Max artifacts the refresh worker will process in one CLI
+    # invocation. A safety cap so a misconfigured run can't exhaust
+    # daily budgets in one go.
+    max_per_run: int = 5000
+
+
 class WorkerConfig(BaseModel):
     state_db: str
     page_size: int = 1000
@@ -229,6 +359,7 @@ class AppConfig(BaseModel):
     session: SessionConfig = Field(default_factory=SessionConfig)
     ip: IPConfig = Field(default_factory=IPConfig)
     cooccurrence: CooccurrenceConfig = Field(default_factory=CooccurrenceConfig)
+    intel: IntelConfig = Field(default_factory=IntelConfig)
 
 
 class Secrets(BaseSettings):
