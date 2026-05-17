@@ -59,10 +59,12 @@ _LAYER_MAPPINGS = {
         "campaigns":        "es-mappings/cowrie/campaigns.json",
     },
     # External threat-intel — cross-source per-artifact indices.
-    # `init-indexes --source intel` creates these. Milestone 1 ships
-    # only `ip`; the others land as subsequent providers/kinds wire up.
+    # `init-indexes --source intel` creates these. M1 shipped `ip`,
+    # M4 added `url`; `domain` / `hash` land when corpus produces
+    # extractable values.
     "intel": {
         "ip":     "es-mappings/intel/ip.json",
+        "url":    "es-mappings/intel/url.json",
     },
 }
 
@@ -501,6 +503,18 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Force a full re-scan over the corpus (same as refresh for milestone 1)",
     )
     p_intel_backfill.add_argument("--dry-run", action="store_true")
+    # intel reapply-rules — re-derive each intel doc's verdicts from its
+    # already-persisted per-provider structured data. No upstream calls,
+    # so no budget burn. Use after deploying a consensus-rule change
+    # (e.g. the 2026-05-17 authoritative_clean refinement).
+    p_intel_reapply = intel_sub.add_parser(
+        "reapply-rules",
+        help="Recompute verdicts on existing intel docs without re-fetching",
+    )
+    p_intel_reapply.add_argument(
+        "--dry-run", action="store_true",
+        help="Walk every doc + report would-be changes without writing",
+    )
 
     # pipeline — run every processing stage in order, raw → fully processed.
     # Mirrors the analytics + ingest systemd units but in one verb so a
@@ -831,6 +845,9 @@ def main(argv: list[str] | None = None) -> int:
             stats = run_refresh(cfg, secrets, dry_run=args.dry_run)
         elif args.subject == "backfill":
             stats = run_backfill(cfg, secrets, dry_run=args.dry_run)
+        elif args.subject == "reapply-rules":
+            from .intel.migrate import run_reapply_rules
+            stats = run_reapply_rules(cfg, secrets, dry_run=args.dry_run)
         else:
             print(f"[ERROR] Unknown `intel` subject: {args.subject!r}", flush=True)
             return 1

@@ -280,7 +280,7 @@ def _check_intel(cfg: AppConfig, secrets: Secrets) -> int:
     failures = 0
     try:
         from .intel.refresh import _build_providers
-        providers = _build_providers(cfg)
+        providers = _build_providers(cfg, secrets)
     except Exception as exc:
         print(f"[FAIL] intel: provider construction: {exc}")
         return 1

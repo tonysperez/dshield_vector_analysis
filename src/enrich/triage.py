@@ -14,6 +14,7 @@ from typing import Optional
 
 from .cache import StateDB
 from .config import CloudConfig
+from .intel.lookup import IntelSummary
 from .llm.schemas import CommandEnrichment
 
 log = logging.getLogger(__name__)
@@ -151,6 +152,90 @@ def reasons_to_escalate(
             seen.add(r)
             out.append(r)
     return out
+
+
+# Triage reasons that originate from the COMMAND SHAPE itself (base64,
+# IP literal, suspicious TLD). Independent of the attacker's identity —
+# even a known commodity scanner running a base64-evasion command is
+# still doing something interesting. The intel gate REFUSES to suppress
+# escalation when any of these reasons fire.
+_COMMAND_SHAPE_REASONS: frozenset[str] = frozenset(
+    {"base64_blob", "ip_literal", "rare_tld"}
+)
+
+# Triage reasons we WILL suppress when intel says the source IPs are
+# all-commodity or all-clean. These are "the LLM was uncertain" reasons,
+# not "the command itself looks evasive" reasons.
+_GATEABLE_REASONS_PREFIXES: tuple[str, ...] = (
+    "low_confidence",       # parsed.confidence <= threshold
+    "novel_embedding",      # cluster-distance novelty
+    "sample",               # random quality-monitoring sample
+)
+
+
+def _reasons_are_gateable(reasons: list[str]) -> bool:
+    """True iff every reason in the list is a gateable (LLM-uncertainty) reason.
+
+    Command-shape reasons (base64_blob / ip_literal / rare_tld) make a
+    list non-gateable — those signals are independent of attacker
+    identity and the cloud's deeper analysis is still warranted.
+    """
+    if not reasons:
+        return False
+    for r in reasons:
+        # Match by prefix because some reasons carry a suffix like
+        # "low_confidence<=4". Exact match handles the rest.
+        if any(r == p or r.startswith(p) for p in _GATEABLE_REASONS_PREFIXES):
+            continue
+        return False
+    return True
+
+
+def intel_skip_reason(
+    *,
+    triage_reasons: list[str],
+    ip_summaries: list[IntelSummary],
+    cfg: CloudConfig,
+) -> Optional[str]:
+    """Decide whether external intel grounds suppression of cloud escalation.
+
+    Returns a reason code (string) when escalation should be skipped —
+    appended to the command's `triage_reasons` so the doc records WHY
+    we didn't escalate — or None when intel has no grounds to override.
+
+    Rules (all conservative; require intel data to be unambiguous):
+
+    1. **All source IPs are authoritative-clean** → return
+       `"intel_skip_authoritative_clean"`. ShadowServer-class researchers
+       running enumeration commands don't deserve cloud-LLM budget.
+
+    2. **All source IPs have ≥2-provider malicious consensus** AND every
+       triage reason is gateable (no `base64_blob` / `ip_literal` /
+       `rare_tld`) → return `"intel_skip_commodity_consensus"`. The
+       command + attacker combination is well-known commodity activity;
+       the local LLM's enrichment is sufficient.
+
+    3. Otherwise → None. Let the existing escalation rules decide.
+
+    Disabled when `cfg.triage.intel_aware=False`. No-op when
+    `ip_summaries` is empty (e.g. intel disabled, or no IPs had data).
+    """
+    if not cfg.triage.intel_aware:
+        return None
+    if not ip_summaries:
+        return None
+    # Rule 1: every IP carries an authoritative_clean override.
+    if all(s.override_applied == "authoritative_clean" for s in ip_summaries):
+        return "intel_skip_authoritative_clean"
+    # Rule 2: every IP has strong-consensus malicious AND the only
+    # escalation reasons are gateable.
+    all_strong_commodity = all(
+        s.consensus_malicious and s.malicious_provider_count >= 2
+        for s in ip_summaries
+    )
+    if all_strong_commodity and _reasons_are_gateable(triage_reasons):
+        return "intel_skip_commodity_consensus"
+    return None
 
 
 def utc_today() -> str:

@@ -125,6 +125,17 @@
                           "is_outlier":    { "type": "boolean" },
                           "scored_at":     { "type": "date" }
                         }
+                      },
+                      "source_ip_intel": {
+                        "properties": {
+                          "consensus_malicious":      { "type": "boolean" },
+                          "consensus_label":          { "type": "keyword" },
+                          "override_applied":         { "type": "keyword" },
+                          "external_rarity_score":    { "type": "float" },
+                          "malicious_provider_count": { "type": "integer" },
+                          "clean_provider_count":     { "type": "integer" },
+                          "confidence_max":           { "type": "integer" }
+                        }
                       }
                     }
                   }

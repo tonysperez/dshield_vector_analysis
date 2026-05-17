@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional
 
 from ..cache import StateDB
 from ..config import AppConfig, Secrets
@@ -36,10 +36,14 @@ from .providers.base import (
     ProviderResult,
     ProviderUnavailable,
 )
+from .providers.abuseipdb import AbuseIPDBProvider
 from .providers.feodotracker import FeodoTrackerProvider
 from .providers.firehol import FireholProvider
+from .providers.greynoise import GreyNoiseProvider
 from .providers.isc import ISCProvider
+from .providers.threatfox import ThreatFoxProvider
 from .providers.tor import TorProvider
+from .providers.urlhaus import URLhausProvider
 from .queue import discover_and_enqueue
 from .writer import upsert_intel_doc
 
@@ -53,28 +57,59 @@ log = logging.getLogger(__name__)
 # damage in this one.
 _FAILURE_THRESHOLD = 5
 
+# Defensive ceiling on `intel_queue_pop_top` per kind per run. There
+# is intentionally NO artifact-dispatch cap (a runaway queue is
+# better discovered than silently truncated), but a buggy producer
+# enqueuing billions of rows shouldn't OOM the worker. Million-row
+# horizon is well above any realistic honeypot corpus.
+_QUEUE_FETCH_HARD_LIMIT = 1_000_000
 
-def _build_providers(cfg: AppConfig) -> list[Provider]:
+
+def _build_providers(cfg: AppConfig, secrets: Optional[Secrets] = None) -> list[Provider]:
     """Construct the enabled providers from config.
 
-    New providers are added here. The order is the order of attempts —
-    cheap/local providers first so a single artifact's enrichment has
-    its in-memory hits computed before any network calls.
+    New providers are added here. Order is the dispatch order per
+    artifact — cheap/local first so a single artifact's enrichment
+    has its in-memory hits computed before any network calls.
 
-    All milestone-1 providers are bulk-download (one fetch per refresh
-    window, then in-memory lookup) so per-artifact cost is the same
-    across the set — order matters mostly for trace readability.
+    M1 providers (`tor`, `isc`, `feodotracker`, `firehol`) are bulk-
+    download style: one fetch per refresh window, then in-memory
+    lookup. M2 providers (`greynoise`, `abuseipdb`) are per-IP HTTP
+    calls with daily-budget gates enforced by the worker via the
+    SQLite spend tracker.
+
+    `secrets` carries the M2 API keys. When unset, or when the
+    relevant `*_api_key` field is None, the corresponding M2 provider
+    silently skips construction — runtime degrades to "we run the
+    M1 providers and skip the others." That keeps a missing key from
+    being a fatal config error.
     """
     out: list[Provider] = []
     pc = cfg.intel.providers
+    # abuse.ch unified auth key shared across URLhaus / ThreatFox /
+    # FeodoTracker. Optional — providers accept None and fall back to
+    # unauthenticated endpoints with tighter rate limits.
+    abusech_key = (secrets.abuse_ch_auth_key if secrets else None)
     if pc.tor.enabled:
         out.append(TorProvider(pc.tor))
     if pc.isc.enabled:
         out.append(ISCProvider(pc.isc))
     if pc.feodotracker.enabled:
-        out.append(FeodoTrackerProvider(pc.feodotracker))
+        out.append(FeodoTrackerProvider(pc.feodotracker, auth_key=abusech_key))
     if pc.firehol.enabled:
         out.append(FireholProvider(pc.firehol))
+    gn_key = (secrets.greynoise_api_key if secrets else None)
+    if pc.greynoise.enabled and gn_key:
+        out.append(GreyNoiseProvider(pc.greynoise, gn_key))
+    abuse_key = (secrets.abuseipdb_api_key if secrets else None)
+    if pc.abuseipdb.enabled and abuse_key:
+        out.append(AbuseIPDBProvider(pc.abuseipdb, abuse_key))
+    # M4: URL-kind providers. abuse.ch family — accept optional
+    # auth_key, work unauthenticated when None.
+    if pc.urlhaus.enabled:
+        out.append(URLhausProvider(pc.urlhaus, auth_key=abusech_key))
+    if pc.threatfox.enabled:
+        out.append(ThreatFoxProvider(pc.threatfox, auth_key=abusech_key))
     return out
 
 
@@ -107,7 +142,7 @@ def run_refresh(
 
     es = make_client(cfg.elasticsearch, secrets)
     db = StateDB(cfg.worker.state_db)
-    providers = _build_providers(cfg)
+    providers = _build_providers(cfg, secrets)
     by_kind: dict[str, list[Provider]] = defaultdict(list)
     for p in providers:
         for kind in p.handles:
@@ -123,8 +158,33 @@ def run_refresh(
         "errors": [],
         "provider_calls": {p.name: 0 for p in providers},
         "provider_failures": {p.name: 0 for p in providers},
+        # Providers with a daily_budget that's already at-or-past its
+        # limit when this run starts. Surfaced explicitly so a 0 in
+        # `provider_calls` doesn't look mysterious — these are
+        # waiting for the UTC midnight reset.
+        "provider_budget_exhausted": [],
         "provider_circuits_open": [],
     }
+
+    # Pre-flight: identify providers whose daily budget is already
+    # exhausted (GreyNoise / AbuseIPDB after a few runs in one day).
+    # Surfaced in stats; the per-call gate inside the dispatch loop
+    # still enforces, but reporting upfront is clearer.
+    today = _utc_today()
+    budget_exhausted: set[str] = set()
+    for prov in providers:
+        budget = prov.rate_limit.daily_budget
+        if budget is None:
+            continue
+        spent = db.intel_provider_calls_today(prov.name, today)
+        if spent >= budget:
+            budget_exhausted.add(prov.name)
+            log.info(
+                "intel: %s daily budget already exhausted "
+                "(%d/%d); will skip this run, resets at UTC midnight",
+                prov.name, spent, budget,
+            )
+    stats["provider_budget_exhausted"] = sorted(budget_exhausted)
 
     # Step 1: discovery (queue upsert).
     discovered = discover_and_enqueue(es, db, cfg)
@@ -135,29 +195,25 @@ def run_refresh(
         db.close()
         return stats
 
-    # Step 2: per-kind processing.
-    today = _utc_today()
-    max_total = cfg.intel.max_per_run
-    processed = 0
+    # Step 2: per-kind processing. No artifact-dispatch cap — the
+    # whole queue gets a chance per run. Per-provider daily budgets
+    # (above) and circuit breakers (below) are the real safety
+    # gates; unmetered bulk providers don't have or need a cap.
     circuits_open: set[str] = set()
 
     for kind, kind_providers in by_kind.items():
-        if processed >= max_total:
-            break
-        # Pop a chunk of artifacts for this kind. Same cap so a high-
-        # volume kind doesn't starve other kinds.
-        remaining_budget = max_total - processed
+        # Pop the entire queue slice for this kind. `intel_queue_pop_top`
+        # only RETURNS; it doesn't remove. Rows stay until
+        # `intel_queue_mark_done` after a successful dispatch.
+        kind_queue = db.intel_queue_pop_top(kind, _QUEUE_FETCH_HARD_LIMIT)
         artifacts: list[Artifact] = []
-        for value, _prio in db.intel_queue_pop_top(kind, remaining_budget):
+        for value, _prio in kind_queue:
             try:
                 artifacts.append(Artifact(kind, value))
             except ValueError:
                 continue
 
         for artifact in artifacts:
-            if processed >= max_total:
-                break
-            processed += 1
             results: list[ProviderResult] = []
             any_success = False
             for prov in kind_providers:

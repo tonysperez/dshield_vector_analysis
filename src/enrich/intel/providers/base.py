@@ -46,9 +46,18 @@ class DerivedSignals:
     """Normalised provider verdict for the consensus rule.
 
     Every provider populates this from its own response. The consensus
-    rule (any-positive flags malicious — answered 2026-05-16) reads
-    only this; the raw provider payload is preserved for analyst
-    inspection but isn't consulted by automated logic.
+    rule (see `writer.compute_derived`) reads only this; the raw
+    provider payload is preserved for analyst inspection but isn't
+    consulted by automated logic.
+
+    The original (2026-05-16) consensus rule was pure any-positive.
+    The 2026-05-17 refinement adds two boolean tags so authoritative
+    benign verdicts (GreyNoise `benign` / RIOT for known-good
+    infrastructure like ShadowServer) can override aggregator-based
+    malicious votes (AbuseIPDB community reports, FireHOL aggregator)
+    — but NOT direct-observation malicious votes (FeodoTracker active
+    C2, GreyNoise's own malicious classification). See
+    `writer.compute_derived` for the rule.
     """
     # Tri-state malicious flag. None means "provider has no opinion / no
     # data on this artifact." True/False are explicit verdicts.
@@ -63,6 +72,22 @@ class DerivedSignals:
     label: Optional[str] = None
     # Optional human-readable tags ("mirai", "ssh-bruteforce", etc.).
     tags: tuple[str, ...] = ()
+    # Provider asserts this artifact is benign with high confidence.
+    # Currently set by GreyNoise on `classification=benign` AND on
+    # `riot=true` — both are well-curated GreyNoise-internal lists of
+    # known-good infrastructure (ShadowServer, Cloudflare DNS, etc.).
+    # The consensus rule uses this to override aggregator-only
+    # malicious votes (AbuseIPDB false positives on legitimate
+    # scanners are the canonical case).
+    authoritative_clean: bool = False
+    # Provider's `malicious=True` is from direct observation of bad
+    # behaviour by this provider, not from aggregated community
+    # reports. Set by FeodoTracker (sees IPs hosting C2 right now)
+    # and GreyNoise (classification="malicious" is their own
+    # observation). NOT set by AbuseIPDB / FireHOL / ISC which
+    # aggregate community/feed reports. Authoritative-clean cannot
+    # override a direct malicious vote.
+    evidence_direct: bool = False
 
 
 @dataclass(frozen=True)

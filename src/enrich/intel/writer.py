@@ -50,41 +50,94 @@ def index_for_kind(cfg: AppConfig, kind: str) -> str:
 
 
 def compute_derived(provider_signals: Iterable[DerivedSignals]) -> dict[str, Any]:
-    """Apply the any-positive consensus rule across provider signals.
+    """Apply the refined consensus rule across provider signals.
+
+    The rule (2026-05-17, supersedes the simple any-positive of
+    2026-05-16):
+
+    1. Direct-evidence malicious wins absolutely. If any provider has
+       `malicious=True AND evidence_direct=True` (FeodoTracker active
+       C2, GreyNoise's own malicious classification), consensus is
+       malicious regardless of any clean signals.
+    2. Authoritative clean overrides aggregator-only malicious votes.
+       If any provider has `authoritative_clean=True` (GreyNoise
+       benign or RIOT — its curated known-good infrastructure lists)
+       AND no direct-evidence malicious exists, consensus is clean
+       (`consensus_malicious=False`) regardless of how many aggregator
+       providers flagged the artifact. The canonical case: AbuseIPDB
+       false-positive on a legitimate scanner like ShadowServer; GN
+       benign rescues it.
+    3. Otherwise: any-positive (the original rule). Any provider
+       flagging `malicious=True` flips consensus.
 
     Returns a dict with:
-      - `consensus_malicious`: bool — True if ANY provider flagged
-        malicious=True. False only if no provider flagged True.
-      - `consensus_label`: str — first non-None label among providers
-        that flagged malicious=True, else first non-None label among
-        any provider, else "unknown".
+      - `consensus_malicious`: bool
+      - `consensus_label`: str — preferentially from the authoritative
+        signal when override applies; else from malicious providers;
+        else any provider; else "unknown".
+      - `override_applied`: str — "direct_malicious", "authoritative_clean",
+        or "" — surfaces the rule that produced the verdict.
       - `tags`: list[str] — deduplicated union of all provider tags.
-      - `providers_with_data`: int — count of provider signals with
-        non-None `malicious` field.
-      - `providers_total`: int — total count of provider signals seen.
-      - `external_rarity_score`: float — 0.0 to 1.0. Rough proxy: how
-        many providers had NO opinion on this artifact, weighted by
-        how many had ANY opinion. 1.0 means nobody knows it; 0.0 means
-        every queried provider had data on it.
+      - `providers_with_data`: int — count of signals with non-None
+        `malicious`.
+      - `providers_total`: int — total signals seen.
+      - `external_rarity_score`: float — 0.0 (everyone knows) to 1.0
+        (nobody knows). Linear in the no-opinion fraction.
+      - `malicious_provider_count`: int — count of providers that
+        voted `malicious=True`. Direct input for M3.A triage gate
+        ("skip cloud if ≥2 providers agree malicious"). Precomputed
+        so the gate doesn't have to iterate per-provider blocks.
+      - `clean_provider_count`: int — count of providers that voted
+        `malicious=False`. M5 calibration display.
+      - `confidence_max`: int|None — highest confidence among the
+        malicious-voting providers, else None. Direct triage-gate
+        tuning input ("skip cloud only if confidence_max ≥ 8").
 
     The rationale for `external_rarity_score`: research mode wants
     candidates where local novelty is high AND external feeds are
-    silent. This number is the "external feeds are silent" half. The
-    `/findings` page joins it with local novelty in the calibration
-    scatter.
+    silent. This number is the "external feeds are silent" half.
     """
     sig_list = list(provider_signals)
     total = len(sig_list)
     with_data = sum(1 for s in sig_list if s.malicious is not None)
-    malicious_signals = [s for s in sig_list if s.malicious is True]
 
-    consensus_malicious = bool(malicious_signals)
+    direct_malicious_signals = [
+        s for s in sig_list if s.malicious is True and s.evidence_direct
+    ]
+    any_malicious_signals = [s for s in sig_list if s.malicious is True]
+    authoritative_clean_signals = [
+        s for s in sig_list if s.authoritative_clean
+    ]
 
+    consensus_malicious: bool
+    override_applied: str
     label: Optional[str] = None
-    for s in malicious_signals:
-        if s.label:
-            label = s.label
-            break
+
+    if direct_malicious_signals:
+        # Rule 1: direct evidence wins.
+        consensus_malicious = True
+        override_applied = "direct_malicious"
+        for s in direct_malicious_signals:
+            if s.label:
+                label = s.label
+                break
+    elif authoritative_clean_signals:
+        # Rule 2: authoritative clean overrides aggregator-only malicious.
+        consensus_malicious = False
+        override_applied = "authoritative_clean"
+        for s in authoritative_clean_signals:
+            if s.label:
+                label = s.label
+                break
+    else:
+        # Rule 3: any-positive.
+        consensus_malicious = bool(any_malicious_signals)
+        override_applied = ""
+        for s in any_malicious_signals:
+            if s.label:
+                label = s.label
+                break
+
     if label is None:
         for s in sig_list:
             if s.label:
@@ -104,20 +157,30 @@ def compute_derived(provider_signals: Iterable[DerivedSignals]) -> dict[str, Any
     if total == 0:
         external_rarity_score = 1.0
     else:
-        # rarity = (no_opinion_count / total); when everyone weighed
-        # in with no_opinion=0, rarity is 0. When nobody has data,
-        # rarity is 1.0. Linear is fine here — the absolute scale isn't
-        # meaningful, only the relative comparison across artifacts in
-        # the same calibration view.
         external_rarity_score = (total - with_data) / total
+
+    # Rollups precomputed for downstream consumers (M3 triage gate,
+    # M5 findings page). Cheap to compute here; expensive for callers
+    # to recompute by walking per-provider blocks every time.
+    malicious_provider_count = sum(1 for s in sig_list if s.malicious is True)
+    clean_provider_count = sum(1 for s in sig_list if s.malicious is False)
+    malicious_confidences = [
+        s.confidence for s in sig_list
+        if s.malicious is True and s.confidence is not None
+    ]
+    confidence_max = max(malicious_confidences) if malicious_confidences else None
 
     return {
         "consensus_malicious": consensus_malicious,
         "consensus_label": label,
+        "override_applied": override_applied,
         "tags": tags,
         "providers_with_data": with_data,
         "providers_total": total,
         "external_rarity_score": round(external_rarity_score, 4),
+        "malicious_provider_count": malicious_provider_count,
+        "clean_provider_count": clean_provider_count,
+        "confidence_max": confidence_max,
     }
 
 
@@ -140,6 +203,8 @@ def _provider_block(r: ProviderResult) -> dict[str, Any]:
         "confidence": r.derived.confidence,
         "label": r.derived.label,
         "tags": list(r.derived.tags),
+        "authoritative_clean": r.derived.authoritative_clean,
+        "evidence_direct": r.derived.evidence_direct,
     }
 
 
@@ -183,6 +248,8 @@ def build_intel_doc(
             confidence=p.get("confidence"),
             label=p.get("label"),
             tags=tuple(p.get("tags") or ()),
+            authoritative_clean=bool(p.get("authoritative_clean", False)),
+            evidence_direct=bool(p.get("evidence_direct", False)),
         )
         for p in providers.values()
     ]

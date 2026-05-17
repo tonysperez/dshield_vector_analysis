@@ -30,7 +30,7 @@ from typing import Iterable, Iterator, Optional
 
 from ..cache import StateDB
 from ..config import AppConfig, IntelPriorityConfig
-from .artifact import Artifact, canonical_ip, is_in_cidrs, make_artifact
+from .artifact import Artifact, canonical_ip, canonical_url, is_in_cidrs, make_artifact
 
 log = logging.getLogger(__name__)
 
@@ -164,6 +164,159 @@ def _iter_ip_artifacts_from_rollup(es, cfg: AppConfig) -> Iterator[tuple[Artifac
         )
 
 
+def _iter_in_command_ip_artifacts_from_commands(es, cfg: AppConfig) -> Iterator[tuple[Artifact, PriorityInputs]]:
+    """Discover `ipv4-addr` indicators inside command bodies — the C2
+    hosts the attacker pointed at (in wget / curl / nc lines), as
+    distinct from `source.ip` (the attacker IP itself).
+
+    Source IPs come from the IP rollup. In-command IPs come from
+    `threat.indicator.type=ipv4-addr` nested entries on the enriched
+    command docs. The Artifact is still `kind=ip` — same intel index,
+    same provider dispatch — but the discovery path differs. The
+    `(kind, value)` queue key naturally dedupes when an IP appears
+    in both populations.
+
+    M4.1. Closes the gap that left URL artifact panes showing
+    `host_ip_intel=None` for in-command IPs that had never been
+    queued for enrichment.
+
+    Priority signal: only centrality (occurrence count from the
+    nested agg). No novelty/confidence available at the indicator
+    level; recency is omitted (could be added via top_hits agg
+    later if needed).
+    """
+    idx = cfg.elasticsearch.indexes.cowrie.commands
+    if not es.indices.exists(index=idx):
+        return
+    _OCCURRENCE_DENOM = 100.0
+    try:
+        resp = es.search(
+            index=idx, size=0,
+            query={"match_all": {}},
+            aggs={
+                "indicators": {
+                    "nested": {"path": "threat.indicator"},
+                    "aggs": {
+                        "ipv4_addr": {
+                            "filter": {"term": {"threat.indicator.type": "ipv4-addr"}},
+                            "aggs": {
+                                "by_ip": {
+                                    "terms": {
+                                        "field": "threat.indicator.ip",
+                                        "size": cfg.intel.max_per_run,
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+        )
+    except Exception as exc:                           # pragma: no cover
+        log.warning("intel: in-command IP nested-agg scan failed: %s", exc)
+        return
+    buckets = (
+        resp.get("aggregations", {}).get("indicators", {})
+        .get("ipv4_addr", {}).get("by_ip", {}).get("buckets", [])
+    ) or []
+    for b in buckets:
+        raw = b.get("key")
+        if not raw:
+            continue
+        canon = canonical_ip(raw)
+        if canon is None:
+            continue
+        if is_in_cidrs(canon, cfg.intel.never_query_cidrs):
+            continue
+        occurrence = int(b.get("doc_count") or 0)
+        centrality_norm = (
+            math.log1p(occurrence) / math.log1p(_OCCURRENCE_DENOM)
+            if occurrence > 0 else 0.0
+        )
+        yield (
+            Artifact("ip", canon),
+            PriorityInputs(
+                novelty_score=None,        # no command-level novelty for these
+                confidence=None,
+                centrality_norm=centrality_norm,
+                age_hours=None,
+            ),
+        )
+
+
+def _iter_url_artifacts_from_commands(es, cfg: AppConfig) -> Iterator[tuple[Artifact, PriorityInputs]]:
+    """Discover URL artifacts from the command-enrichment index.
+
+    URLs are stored under `threat.indicator[]` (mapped `nested`) with
+    `type=url` and `url.full` as the value. We aggregate distinct
+    `url.full` values via a nested terms agg — that gives both the
+    URLs and their corpus occurrence count in a single query.
+
+    Priority signal: log-scaled `occurrence_count` as centrality. No
+    direct novelty or confidence available at the URL level (those
+    live on the command docs the URL is referenced from). Recency is
+    omitted since the URL itself doesn't have a single
+    first_observed time across the command corpus — could be added
+    via a top_hits agg later if needed.
+    """
+    idx = cfg.elasticsearch.indexes.cowrie.commands
+    if not es.indices.exists(index=idx):
+        return
+    # Bounded denominator; corpus URLs are few hundreds at most.
+    _OCCURRENCE_DENOM = 100.0
+    try:
+        resp = es.search(
+            index=idx, size=0,
+            query={"match_all": {}},
+            aggs={
+                "indicators": {
+                    "nested": {"path": "threat.indicator"},
+                    "aggs": {
+                        "urls": {
+                            "filter": {"term": {"threat.indicator.type": "url"}},
+                            "aggs": {
+                                "by_url": {
+                                    "terms": {
+                                        "field": "threat.indicator.url.full",
+                                        "size": cfg.intel.max_per_run,
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+        )
+    except Exception as exc:                           # pragma: no cover
+        log.warning("intel: URL nested-agg scan failed: %s", exc)
+        return
+    buckets = (
+        resp.get("aggregations", {}).get("indicators", {})
+        .get("urls", {}).get("by_url", {}).get("buckets", [])
+    ) or []
+    for b in buckets:
+        raw = b.get("key")
+        if not raw:
+            continue
+        canon = canonical_url(raw)
+        if canon is None:
+            continue
+        occurrence = int(b.get("doc_count") or 0)
+        centrality_norm = (
+            math.log1p(occurrence) / math.log1p(_OCCURRENCE_DENOM)
+            if occurrence > 0 else 0.0
+        )
+        yield (
+            Artifact("url", canon),
+            PriorityInputs(
+                novelty_score=None,        # no URL-level novelty
+                confidence=None,           # no URL-level confidence
+                centrality_norm=centrality_norm,
+                age_hours=None,            # not tracked at URL level (yet)
+            ),
+        )
+
+
 def discover_and_enqueue(
     es, db: StateDB, cfg: AppConfig,
 ) -> dict[str, int]:
@@ -172,14 +325,25 @@ def discover_and_enqueue(
     Returns a stats dict (`{kind: count_enqueued}`) for the CLI to print.
     Idempotent and cheap-when-no-change: existing rows get their
     priority refreshed but the row stays in place.
+
+    Scans:
+      - IP rollup → `ip` artifacts (source IPs, M1)
+      - command enrichment threat.indicator → `url` artifacts (M4)
+      - command enrichment threat.indicator → `ip` artifacts
+        (in-command IPs — C2 hosts in wget/curl commands, M4.1)
     """
     weights = cfg.intel.priority
     now_iso = datetime.now(timezone.utc).isoformat()
     counts: dict[str, int] = {}
-    for artifact, inputs in _iter_ip_artifacts_from_rollup(es, cfg):
-        prio = compute_priority(inputs, weights)
-        db.intel_queue_upsert(artifact.kind, artifact.value, prio, now_iso)
-        counts[artifact.kind] = counts.get(artifact.kind, 0) + 1
+    for source_iter in (
+        _iter_ip_artifacts_from_rollup(es, cfg),
+        _iter_in_command_ip_artifacts_from_commands(es, cfg),
+        _iter_url_artifacts_from_commands(es, cfg),
+    ):
+        for artifact, inputs in source_iter:
+            prio = compute_priority(inputs, weights)
+            db.intel_queue_upsert(artifact.kind, artifact.value, prio, now_iso)
+            counts[artifact.kind] = counts.get(artifact.kind, 0) + 1
     return counts
 
 

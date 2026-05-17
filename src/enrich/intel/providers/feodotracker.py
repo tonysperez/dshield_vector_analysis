@@ -103,11 +103,16 @@ class FeodoTrackerProvider(Provider):
     # Bulk download once per refresh window; per-IP lookup is in-memory.
     rate_limit = RateLimit(capacity=1000, refill_per_second=1000.0, daily_budget=None)
 
-    def __init__(self, provider_cfg) -> None:
+    def __init__(self, provider_cfg, auth_key: Optional[str] = None) -> None:
         super().__init__(provider_cfg)
         self._rows: dict[str, dict[str, Any]] = {}
         self._loaded_at: float = 0.0
         self._lock = threading.Lock()
+        # abuse.ch unified auth (M4). Optional; falls back to
+        # unauthenticated bulk download with tighter rate limits when
+        # unset.
+        self._auth_key = auth_key
+        self._authenticated = bool(auth_key)
 
     def _stale(self) -> bool:
         return (
@@ -140,8 +145,11 @@ class FeodoTrackerProvider(Provider):
             log.warning("feodotracker: persist cache failed %s: %s", p, exc)
 
     def _fetch_remote(self) -> tuple[dict[str, dict[str, Any]], Any]:
+        headers = {"User-Agent": "dshield_prism/intel (feodotracker)"}
+        if self._auth_key:
+            headers["Auth-Key"] = self._auth_key
         try:
-            r = httpx.get(self.cfg.feed_url, timeout=30.0)
+            r = httpx.get(self.cfg.feed_url, headers=headers, timeout=30.0)
             r.raise_for_status()
             payload = r.json()
         except (httpx.HTTPError, httpx.RequestError, ValueError) as exc:
@@ -192,6 +200,10 @@ class FeodoTrackerProvider(Provider):
                 confidence=9,                          # abuse.ch curation is high-precision
                 label="feodo_c2",
                 tags=tuple(tags),
+                # FeodoTracker observes IPs hosting active C2 directly.
+                # This is the highest-trust malicious signal we carry
+                # — survives any authoritative-clean override.
+                evidence_direct=True,
             )
             structured = {
                 "is_active_c2": True,

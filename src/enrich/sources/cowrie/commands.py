@@ -713,6 +713,17 @@ def run_enrich(cfg: AppConfig, secrets: Secrets, dry_run: bool = False, no_cloud
                 cloud_client = None
                 cloud_enabled = False
 
+    # M3.A: intel-aware escalation gate. Single lookup helper for the
+    # whole run — repeated commands sharing the same source IPs hit
+    # the in-memory cache rather than ES. Disabled when cloud is off
+    # (nothing to gate) or when the operator opted out via
+    # cfg.cloud.triage.intel_aware=False.
+    intel_lookup = None
+    if cloud_enabled and cfg.cloud.triage.intel_aware:
+        from ...intel.lookup import IntelLookup
+        intel_lookup = IntelLookup(es, cfg)
+        log.info("intel-aware triage gate enabled (cfg.cloud.triage.intel_aware=true)")
+
     cooc_cfg = cfg.cooccurrence
     total_sessions = (
         _fetch_total_session_count(es, events_idx) if cooc_cfg.enabled else 0
@@ -877,7 +888,34 @@ def run_enrich(cfg: AppConfig, secrets: Secrets, dry_run: bool = False, no_cloud
                 )
                 if triage_reasons:
                     stats["triaged"] += 1
-                    if not triage_mod.can_spend(db, cfg.cloud):
+                    # M3.A: intel-aware skip gate. If the operator
+                    # opted in and every source IP for this command
+                    # is either authoritative-clean or strong-commodity
+                    # consensus, suppress the cloud call. The skip
+                    # reason is appended to triage_reasons so the doc
+                    # records why we didn't escalate.
+                    intel_skip: Optional[str] = None
+                    if intel_lookup is not None:
+                        ip_summaries_map = intel_lookup.get_many("ip", list(g["ips"]))
+                        ip_summaries = [
+                            s for s in ip_summaries_map.values() if s is not None
+                        ]
+                        # Only gate when EVERY source IP has intel data;
+                        # one unknown IP among knowns is a signal the
+                        # gate must not suppress.
+                        if (
+                            ip_summaries
+                            and len(ip_summaries) == len(g["ips"])
+                        ):
+                            intel_skip = triage_mod.intel_skip_reason(
+                                triage_reasons=triage_reasons,
+                                ip_summaries=ip_summaries,
+                                cfg=cfg.cloud,
+                            )
+                    if intel_skip is not None:
+                        stats["cloud_skipped_intel"] += 1
+                        triage_reasons.append(intel_skip)
+                    elif not triage_mod.can_spend(db, cfg.cloud):
                         stats["cloud_skipped_budget"] += 1
                         triage_reasons.append("budget_exhausted")
                     else:

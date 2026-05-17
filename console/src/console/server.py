@@ -97,6 +97,18 @@ def build_app(config_path: str | None = None) -> FastAPI:
             raise HTTPException(500, "web/artifact_ip.html missing")
         return FileResponse(page)
 
+    @app.get("/artifact/url")
+    def artifact_url_page() -> FileResponse:
+        # URL artifact pane (M4). The URL value rides as a `?value=`
+        # query-string parameter rather than a path parameter — raw
+        # URLs contain `://`, `/`, `?`, `#` which collide with path
+        # semantics and get mangled by browser path normalisation.
+        # The JS reads from `window.location.search`.
+        page = WEB_DIR / "artifact_url.html"
+        if not page.exists():
+            raise HTTPException(500, "web/artifact_url.html missing")
+        return FileResponse(page)
+
     # ------------------------------------------------------------------
     # API
     # ------------------------------------------------------------------
@@ -183,6 +195,17 @@ def build_app(config_path: str | None = None) -> FastAPI:
             data = intel_mod.fetch_intel_ip(es, cfg, value)
         except Exception as exc:                       # pragma: no cover
             log.exception("artifact_ip_api failed")
+            raise HTTPException(500, f"artifact lookup failed: {exc}")
+        return JSONResponse(data)
+
+    @app.get("/api/artifact/url")
+    def artifact_url_api(value: str = Query(..., description="URL artifact value")) -> JSONResponse:
+        # URL via `?value=<percent-encoded URL>` for the same reason
+        # the page route uses a query parameter.
+        try:
+            data = intel_mod.fetch_intel_url(es, cfg, value)
+        except Exception as exc:                       # pragma: no cover
+            log.exception("artifact_url_api failed")
             raise HTTPException(500, f"artifact lookup failed: {exc}")
         return JSONResponse(data)
 

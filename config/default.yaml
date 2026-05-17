@@ -109,6 +109,16 @@ cloud:
                                     # this — gates out the encoding-artifact tail
                                     # (raw ELF bytes etc. that score novelty=1.0
                                     # with confidence=1). See ROADMAP issue #3.
+    # M3.A: intel-aware escalation gate. When true, before dispatching
+    # a triaged command to the cloud, consult the intel verdicts on
+    # its source IPs. Skip cloud when:
+    #  - all source IPs are `override_applied=authoritative_clean`
+    #    (researchers like ShadowServer), OR
+    #  - all source IPs have malicious_provider_count >= 2 AND every
+    #    triage_reason is a gateable (LLM-uncertainty) reason — not
+    #    a command-shape reason like base64_blob/ip_literal/rare_tld.
+    # Disable to revert to non-intel-aware escalation.
+    intel_aware: true
   pricing:
     # USD per 1M tokens. Update to match the model you point at.
     input_per_mtok: 3.0
@@ -253,6 +263,46 @@ intel:
       sources_url: "https://isc.sans.edu/api/sources/attacks/2000?json"
       refresh_minutes: 360
       cache_file: "/var/lib/dshield_prism/intel_isc_top.json"
+    # GreyNoise Community — partitions internet-background-radiation
+    # from targeted activity. The highest-value single integration for
+    # research mode. Free tier is **50 lookups per week** (much tighter
+    # than the "10k/month" headline suggests); the priority queue
+    # spends the budget on highest-novelty artifacts first. The cache
+    # TTL matches the weekly cycle — 7 days — so resolved artifacts
+    # stay resolved and the budget always goes to fresh, high-novelty
+    # IPs. Requires GREYNOISE_API_KEY in .env. Set enabled: false to
+    # disable explicitly; otherwise the provider auto-skips when no
+    # key is set.
+    greynoise:
+      enabled: true
+      base_url: "https://api.greynoise.io"
+      request_timeout_seconds: 8.0
+      daily_budget: 6
+      min_inter_call_seconds: 1.0
+      ttl_days: 7
+    # AbuseIPDB — abuse-confidence score + report count + ISP. Free
+    # tier 1000 checks/day. Requires ABUSEIPDB_API_KEY in .env;
+    # auto-skipped when unset.
+    abuseipdb:
+      enabled: true
+      base_url: "https://api.abuseipdb.com"
+      request_timeout_seconds: 8.0
+      daily_budget: 900
+      min_inter_call_seconds: 0.0
+      max_age_days: 90
+      ttl_days: 3
+    # M4: URL providers (abuse.ch family — no key, unmetered).
+    urlhaus:
+      enabled: true
+      feed_url: "https://urlhaus.abuse.ch/downloads/csv_online/"
+      refresh_minutes: 60
+      cache_file: "/var/lib/dshield_prism/intel_urlhaus.csv"
+    threatfox:
+      enabled: true
+      base_url: "https://threatfox-api.abuse.ch/api/v1/"
+      request_timeout_seconds: 8.0
+      min_inter_call_seconds: 0.5
+      ttl_days: 3
 
   # Priority-queue weights. `priority = novelty_w * novelty +
   #                                     low_conf_w * (1 - confidence/10) +
@@ -275,6 +325,10 @@ intel:
   # sensors, and any user-controlled infrastructure here.
   never_query_cidrs: []
 
-  # Per-CLI-invocation safety cap. A misconfigured run can't exhaust
-  # daily budgets beyond this many artifact lookups.
+  # ES `size:` parameter for the discovery scans (IP rollup search,
+  # threat.indicator nested terms agg). NOT an artifact-dispatch cap
+  # — provider budgets are enforced at the provider level
+  # (RateLimit.daily_budget). Unmetered bulk providers (Tor / ISC /
+  # FireHOL / FeodoTracker / URLhaus) shouldn't be artificially
+  # limited.
   max_per_run: 5000

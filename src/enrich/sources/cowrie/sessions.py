@@ -433,6 +433,40 @@ def _record_credential(credentials_set: set[str], ev: dict) -> None:
         credentials_set.add(f"{user}:{password}")
 
 
+def _attach_source_ip_intel(doc: dict, summary) -> None:
+    """Mutate `doc` to add `dshield.cowrie.enrichment.session.source_ip_intel`.
+
+    `summary` is an `IntelSummary` (or None). When None, no field is
+    added — the absence carries meaning ("no intel data for this IP")
+    distinct from `consensus_malicious=False`. ROADMAP M3.C.
+
+    Pure function on the dict input — no ES, no other side effects.
+    Smoke-testable in `scripts/smoke_test_intel_session_block.py`.
+    """
+    if summary is None:
+        return
+    session = (
+        doc.setdefault("dshield", {})
+        .setdefault("cowrie", {})
+        .setdefault("enrichment", {})
+        .setdefault("session", {})
+    )
+    session["source_ip_intel"] = {
+        "consensus_malicious":      bool(summary.consensus_malicious),
+        "consensus_label":          summary.consensus_label,
+        "override_applied":         summary.override_applied,
+        "external_rarity_score":    summary.external_rarity_score,
+        "malicious_provider_count": summary.malicious_provider_count,
+        "clean_provider_count":     summary.clean_provider_count,
+        # ES rejects null integers in some strict configs; only emit
+        # the field when the intel actually carries a value.
+        **(
+            {"confidence_max": summary.confidence_max}
+            if summary.confidence_max is not None else {}
+        ),
+    }
+
+
 def _build_session_doc(
     session_id: str,
     events: list[dict],
@@ -641,6 +675,17 @@ def run_rollup(
     from ...es_client import init_index
     init_index(es, _SESSIONS_MAPPING, sessions_idx)
 
+    # M3.C: bulk source-IP intel lookups per batch. Each session's
+    # source IP is denormalised onto its rollup doc so downstream
+    # pivots ("show me playbooks whose member sessions are all
+    # intel-clean") become single-index queries instead of
+    # cross-index joins.
+    intel_lookup = None
+    if cfg.intel.enabled:
+        from ...intel.lookup import IntelLookup
+        intel_lookup = IntelLookup(es, cfg)
+        log.info("session rollup: source-IP-intel persistence enabled")
+
     session_ids_all = [sid for sid, _ in closed]
     page = cfg.session.page_size
 
@@ -662,7 +707,8 @@ def run_rollup(
         enrichment_by_hash = _mget_enrichment(es, commands_idx, list(all_hashes))
         stats["command_hashes_fetched"] += len(enrichment_by_hash)
 
-        actions: list[dict] = []
+        # Phase 1: build the session docs without intel.
+        built: list[tuple[str, dict]] = []
         for sid in batch_ids:
             events = events_by_session.get(sid, [])
             if not events:
@@ -674,8 +720,33 @@ def run_rollup(
             )
             if session_block.get("embedding"):
                 stats["sessions_with_embedding"] += 1
-            actions.append({"_op_type": "index", "_id": sid, "_source": doc})
+            built.append((sid, doc))
             stats["sessions_built"] += 1
+
+        # Phase 2: bulk intel lookup over the batch's source IPs,
+        # then mutate each doc to attach the source_ip_intel block.
+        # No-op when intel disabled or when the doc has no source.ip.
+        if intel_lookup is not None and built:
+            batch_ips = sorted({
+                (doc.get("source") or {}).get("ip")
+                for _, doc in built
+                if (doc.get("source") or {}).get("ip")
+            })
+            if batch_ips:
+                intel_lookup.get_many("ip", batch_ips)
+                for _, doc in built:
+                    ip = (doc.get("source") or {}).get("ip")
+                    if not ip:
+                        continue
+                    summary = intel_lookup.get_one("ip", ip)
+                    if summary is not None:
+                        _attach_source_ip_intel(doc, summary)
+                        stats["sessions_with_intel"] += 1
+
+        actions: list[dict] = [
+            {"_op_type": "index", "_id": sid, "_source": doc}
+            for sid, doc in built
+        ]
 
         if actions:
             ok, errs = bulk_write(es, sessions_idx, actions)

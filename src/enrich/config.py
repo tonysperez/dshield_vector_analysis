@@ -110,6 +110,20 @@ class CloudTriageConfig(BaseModel):
     # are typically encoding artifacts (raw ELF bytes, mojibake) where
     # novelty=1.0 is meaningless — see docs/ROADMAP.md issue #3.
     novel_confidence_min: int = 4
+    # M3.A: intel-aware escalation gate. When True (default), the triage
+    # consults each command's source-IP intel summaries before
+    # dispatching to the cloud LLM. Two skip rules fire:
+    #   - all source IPs have `override_applied=authoritative_clean`
+    #     (e.g. all are GreyNoise-RIOT or AbuseIPDB-whitelisted) →
+    #     "intel_skip_authoritative_clean"
+    #   - all source IPs have malicious_provider_count >= 2 AND all
+    #     existing triage_reasons are gateable (low_confidence /
+    #     novel_embedding / sample, NOT base64_blob / ip_literal /
+    #     rare_tld) → "intel_skip_commodity_consensus"
+    # Disable to revert to the M2-and-earlier behaviour where intel
+    # doesn't gate escalation. See src/enrich/triage.py
+    # `intel_skip_reason` for the canonical rule. ROADMAP M3.A.
+    intel_aware: bool = True
 
 
 class CloudPricingConfig(BaseModel):
@@ -240,6 +254,75 @@ class FireholProviderConfig(IntelProviderConfig):
     cache_file: str = "/var/lib/dshield_prism/intel_firehol_level1.netset"
 
 
+class GreyNoiseProviderConfig(IntelProviderConfig):
+    """GreyNoise Community provider — per-IP HTTP lookup.
+
+    Free-tier limits (verified 2026-05-17): **50 lookups per week**
+    on the Community plan — much tighter than the marketing
+    "10k/month" suggests. Daily ceiling of 6 here gives ~42/week,
+    leaving headroom for healthcheck probes plus any retries.
+
+    The 7-day cache TTL is the other half of the throughput model:
+    every artifact resolved by GreyNoise stays resolved for a week,
+    so we can keep growing the corpus and the budget covers it as
+    long as we resolve the 6 highest-novelty new artifacts each day.
+
+    A separate constraint: GreyNoise rate-limits short bursts. The
+    provider sleeps `min_inter_call_seconds` between calls to stay
+    below the per-second cap.
+    """
+    base_url: str = "https://api.greynoise.io"
+    # Community endpoint: GET /v3/community/<ip> → {classification, name, last_seen, ...}
+    request_timeout_seconds: float = 8.0
+    daily_budget: int = 6
+    min_inter_call_seconds: float = 1.0
+    # Cache TTL — Community endpoint data changes slowly; 7d matches
+    # the weekly budget cycle. Adjust if you have a paid plan with a
+    # different cadence.
+    ttl_days: int = 7
+
+
+class URLhausProviderConfig(IntelProviderConfig):
+    """abuse.ch URLhaus — known-malicious URL list. HTTP bulk-download CSV.
+
+    No API key; unmetered. Sibling family to FeodoTracker / ThreatFox /
+    MalwareBazaar. M4 first URL-kind provider.
+    """
+    # `csv_online` is the actively-malicious subset; the broader
+    # `csv` endpoint includes offline entries too.
+    feed_url: str = "https://urlhaus.abuse.ch/downloads/csv_online/"
+    refresh_minutes: int = 60
+    cache_file: str = "/var/lib/dshield_prism/intel_urlhaus.csv"
+
+
+class ThreatFoxProviderConfig(IntelProviderConfig):
+    """abuse.ch ThreatFox — per-IOC HTTP POST API.
+
+    Free, no API key required for low-volume usage. POSTs a search
+    body per artifact; returns rich IOC metadata (malware family,
+    threat type, confidence). M4 ships URL-kind handling; IP /
+    domain / hash extensions are a single-line change to
+    `ThreatFoxProvider.handles`.
+    """
+    base_url: str = "https://threatfox-api.abuse.ch/api/v1/"
+    request_timeout_seconds: float = 8.0
+    # Gentle throttle — abuse.ch politely accepts steady traffic.
+    min_inter_call_seconds: float = 0.5
+    ttl_days: int = 3
+
+
+class AbuseIPDBProviderConfig(IntelProviderConfig):
+    """AbuseIPDB provider — per-IP HTTP lookup. Free tier: 1000/day."""
+    base_url: str = "https://api.abuseipdb.com"
+    request_timeout_seconds: float = 8.0
+    daily_budget: int = 900
+    min_inter_call_seconds: float = 0.0
+    # AbuseIPDB lets you ask "how far back in reports to look" — 90
+    # days is their max for the free tier and matches the default UI.
+    max_age_days: int = 90
+    ttl_days: int = 3
+
+
 class ISCProviderConfig(IntelProviderConfig):
     """SANS Internet Storm Center / DShield top-attackers daily feed.
 
@@ -259,6 +342,11 @@ class IntelProvidersConfig(BaseModel):
     feodotracker: FeodoTrackerProviderConfig = Field(default_factory=FeodoTrackerProviderConfig)
     firehol: FireholProviderConfig = Field(default_factory=FireholProviderConfig)
     isc: ISCProviderConfig = Field(default_factory=ISCProviderConfig)
+    greynoise: GreyNoiseProviderConfig = Field(default_factory=GreyNoiseProviderConfig)
+    abuseipdb: AbuseIPDBProviderConfig = Field(default_factory=AbuseIPDBProviderConfig)
+    # M4: URL-kind providers.
+    urlhaus: URLhausProviderConfig = Field(default_factory=URLhausProviderConfig)
+    threatfox: ThreatFoxProviderConfig = Field(default_factory=ThreatFoxProviderConfig)
 
 
 class IntelPriorityConfig(BaseModel):
@@ -310,9 +398,16 @@ class IntelConfig(BaseModel):
     # is already filtered at canonicalisation time (artifact.py); list
     # the operator's egress + research peer CIDRs here.
     never_query_cidrs: list[str] = Field(default_factory=list)
-    # Max artifacts the refresh worker will process in one CLI
-    # invocation. A safety cap so a misconfigured run can't exhaust
-    # daily budgets in one go.
+    # ES `size:` parameter for the discovery scans (IP rollup search,
+    # threat.indicator nested terms agg). NOT an artifact-dispatch
+    # cap — the prior global-cap semantics starved URL artifacts and
+    # were removed. Provider rate enforcement belongs at the
+    # *integration* level: providers with API limits (GreyNoise,
+    # AbuseIPDB) set `RateLimit.daily_budget` and the worker gates on
+    # `intel_provider_calls_today` per call. Unmetered bulk providers
+    # (Tor / ISC / FireHOL / FeodoTracker / URLhaus) have effectively
+    # zero per-artifact cost after their once-per-window bulk
+    # download, so they shouldn't be capped.
     max_per_run: int = 5000
 
 
@@ -370,6 +465,22 @@ class Secrets(BaseSettings):
     es_password: Optional[str] = None
     es_api_key: Optional[str] = None
     anthropic_api_key: Optional[str] = None
+    # Intel-subsystem provider keys (M2). Both free-tier:
+    # GreyNoise Community (~10k req/month), AbuseIPDB (1000 checks/day).
+    # When unset, the corresponding provider is silently skipped at
+    # `intel.refresh._build_providers` construction time — no error,
+    # the rest of the providers run normally.
+    greynoise_api_key: Optional[str] = None
+    abuseipdb_api_key: Optional[str] = None
+    # M4: abuse.ch unified auth key. ONE key covers URLhaus,
+    # ThreatFox, FeodoTracker, and the future MalwareBazaar provider.
+    # Register at https://auth.abuse.ch/. Optional: the abuse.ch
+    # endpoints we use also serve unauthenticated callers at lower
+    # rate limits — when this is set, the providers send the key
+    # as the `Auth-Key` request header; when unset, they fall back
+    # to unauthenticated requests and just hope the rate limit
+    # holds.
+    abuse_ch_auth_key: Optional[str] = None
 
 
 def _deep_merge(base: dict, over: dict) -> dict:

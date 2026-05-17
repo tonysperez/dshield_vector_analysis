@@ -369,6 +369,8 @@ def iter_ip_docs(
     es: Elasticsearch,
     index: str,
     page_size: int = 1000,
+    *,
+    intel_lookup=None,
 ) -> Iterator[tuple[str, list[float], str, dict]]:
     """Yield (doc_id, embedding, source_ip, scalars).
 
@@ -376,6 +378,16 @@ def iter_ip_docs(
     `login_success_rate`, `mean_novelty_score`, `mean_session_duration_s`)
     *and* the attribution signals (`country_iso_code`, `as_number`,
     `credentials`) used by the attribution scalar block. ROADMAP issue #8.
+
+    When `intel_lookup` (an `enrich.intel.lookup.IntelLookup`) is
+    supplied, each page of IPs is bulk-mget'd against
+    `intel-dshield-ip-default` before yielding, and `scalars` gets two
+    extra keys consumed by the intel sub-block (`_build_intel_block`):
+
+      - `external_rarity_score`: float 0–1 (defaults 0 if no intel)
+      - `consensus_malicious`:   bool      (defaults False if no intel)
+
+    ROADMAP M3.B.
     """
     body: dict = {
         "size": page_size,
@@ -401,6 +413,15 @@ def iter_ip_docs(
         hits = resp["hits"]["hits"]
         if not hits:
             return
+        # M3.B: warm the intel cache for this page so the per-hit
+        # `get_one` calls below are O(1) lookups in memory rather than
+        # individual ES `get` requests.
+        if intel_lookup is not None:
+            page_ips = [
+                ((h.get("_source") or {}).get("source") or {}).get("ip") or h["_id"]
+                for h in hits
+            ]
+            intel_lookup.get_many("ip", page_ips)
         for h in hits:
             src = h["_source"]
             ip_en = (
@@ -425,7 +446,16 @@ def iter_ip_docs(
                 "country_iso_code": country,
                 "as_number": int(as_number) if as_number is not None else None,
                 "credentials": list(ip_en.get("credentials") or []),
+                # M3.B intel sub-block inputs. Defaults preserve cluster
+                # behaviour when intel is disabled / not yet populated.
+                "external_rarity_score": 0.0,
+                "consensus_malicious": False,
             }
+            if intel_lookup is not None:
+                summary = intel_lookup.get_one("ip", source_ip)
+                if summary is not None:
+                    scalars["external_rarity_score"] = summary.external_rarity_score
+                    scalars["consensus_malicious"] = bool(summary.consensus_malicious)
             yield h["_id"], emb, source_ip, scalars
         search_after = hits[-1]["sort"]
 
@@ -531,6 +561,46 @@ def _build_attribution_block(
     return block * weight
 
 
+def _build_intel_block(
+    scalars_list: list[dict], weight: float,
+) -> "np.ndarray":
+    """External-intel scalar sub-block: `external_rarity_score` + `consensus_malicious`.
+
+    Two-column block, each scaled by `weight`. Pulls from the per-IP
+    `scalars` dict that `iter_ip_docs` populates from the IntelLookup
+    cache. Defaults are 0 for both columns when an IP has no intel
+    data — same effect as "known-clean, no exotic rarity," which is
+    geometrically a no-op against IPs that DO carry intel data.
+
+    Two dimensions added to the matrix; L2 contribution per row is at
+    most `weight * sqrt(2)`. At `attribution_weight=0.10` that's
+    ~0.14 — same order of magnitude as the existing attribution
+    block. ROADMAP M3.B.
+
+    The point of this block: prevent ShadowServer-class IPs from
+    clustering with same-behavior-but-actually-malicious IPs. External
+    reputation is the discriminator the behavior+attribution-only
+    matrix can't see.
+    """
+    import numpy as np
+
+    n = len(scalars_list)
+    if n == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    rarity = np.array(
+        [float(s.get("external_rarity_score") or 0.0) for s in scalars_list],
+        dtype=np.float32,
+    )
+    consensus = np.array(
+        [1.0 if s.get("consensus_malicious") else 0.0 for s in scalars_list],
+        dtype=np.float32,
+    )
+    block = np.zeros((n, 2), dtype=np.float32)
+    block[:, 0] = np.clip(rarity, 0.0, 1.0) * weight
+    block[:, 1] = consensus * weight
+    return block
+
+
 def _build_behavior_block(
     scalars_list: list[dict], weight: float,
 ) -> "np.ndarray":
@@ -594,9 +664,15 @@ def make_full_scalar_builder(
             weight=attribution_weight,
             cred_hash_dim=cred_hash_dim,
         )
-        if attribution.shape[1] == 0:
-            return behavior
-        return np.hstack([behavior, attribution]).astype(np.float32)
+        # M3.B: external-intel block — same weight as attribution since
+        # external reputation is attribution-type signal (who is this
+        # IP) rather than behavior-type signal (what did this IP do).
+        intel = _build_intel_block(scalars_list, attribution_weight)
+        blocks = [behavior]
+        if attribution.shape[1] > 0:
+            blocks.append(attribution)
+        blocks.append(intel)
+        return np.hstack(blocks).astype(np.float32)
 
     return _builder
 
@@ -836,6 +912,16 @@ def run_cluster(
         cred_hash_dim=ipcfg.attribution_cred_hash_dim,
     )
 
+    # M3.B: external-intel sub-block. Always-on when intel data is
+    # present in the index; when intel is disabled / index missing,
+    # the IntelLookup defensively returns None for every IP and the
+    # block contributes 0s (no effect on clustering).
+    intel_lookup = None
+    if cfg.intel.enabled:
+        from ...intel.lookup import IntelLookup
+        intel_lookup = IntelLookup(es, cfg)
+        log.info("[cowrie.ips] intel sub-block enabled (cfg.intel.enabled=true)")
+
     # NOTE: the `dominant_playbook` annotation post-pass (ROADMAP #24) is
     # NOT called here. It depends on `session.playbook_id` being populated,
     # which only happens after `name playbooks` runs — and the backward
@@ -846,7 +932,9 @@ def run_cluster(
 
     return run_layer_clustering(
         es=es,
-        docs_iter=iter_ip_docs(es, ips_idx, ipcfg.page_size),
+        docs_iter=iter_ip_docs(
+            es, ips_idx, ipcfg.page_size, intel_lookup=intel_lookup,
+        ),
         docs_index=ips_idx,
         clusters_index=clusters_idx,
         mapping_path=_IP_CLUSTERS_MAPPING,
