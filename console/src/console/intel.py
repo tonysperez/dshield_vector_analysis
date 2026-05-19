@@ -248,7 +248,7 @@ def fetch_intel_url(es, cfg, value: str) -> dict[str, Any]:
     except Exception as exc:                           # pragma: no cover
         log.warning("console.intel: URL intel GET %s failed: %s", canon, exc)
 
-    # M4: cross-reference the host IP against intel-dshield-ip-default.
+    # M4: cross-reference the host IP against prism.intel.ip.
     host_ip = _extract_host_ip(canon)
     if host_ip:
         out["host_ip"] = host_ip

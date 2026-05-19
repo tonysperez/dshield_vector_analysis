@@ -520,7 +520,7 @@ def _campaign_anchor(
 
     Unlike a playbook (one session cluster), a campaign here is a derived
     multi-session grouping mined by `dshield_prism mine campaigns`. The
-    doc in `campaigns-dshield.cowrie-default` carries explicit lists of
+    doc in `prism.campaign.cowrie` carries explicit lists of
     member session ids and source ips, so the graph build is a direct
     `terms` fetch — no aggregation needed.
     """

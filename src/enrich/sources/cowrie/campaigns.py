@@ -14,7 +14,7 @@ infrastructural pattern, distinct from a session cluster (now called a
                 the commands themselves differ.
 
 Output schema is shared: one doc per campaign in `cfg.elasticsearch.indexes.
-cowrie.campaigns`. See es-mappings/cowrie/campaigns.json. The console reads
+cowrie.campaigns`. See setup/es-mappings/cowrie/campaigns.json. The console reads
 this index to render the `campaign` IOC type.
 
 Why the two flavours coexist
@@ -52,7 +52,7 @@ log = logging.getLogger(__name__)
 # deployment that runs `mine campaigns` before `init-indexes` would let ES
 # auto-create the index with dynamic mapping — silently mis-typing fields
 # like `member_playbook_ids` (would become `text` instead of `keyword`).
-_CAMPAIGNS_MAPPING = "es-mappings/cowrie/campaigns.json"
+_CAMPAIGNS_MAPPING = "setup/setup/es-mappings/cowrie/campaigns.json"
 
 
 _BEHAVIOUR_MIN_SUPPORT_IPS = 5     # itemset must hold for >=N IPs to be a campaign

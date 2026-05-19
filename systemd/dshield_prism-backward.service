@@ -86,7 +86,7 @@ Nice=10
 # Hardening
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=/var/lib/dshield_prism
+ReadWritePaths=/var/lib/dshield_prism /var/log/dshield_prism
 ProtectHome=true
 PrivateTmp=true
 

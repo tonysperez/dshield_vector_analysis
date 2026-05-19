@@ -16,7 +16,7 @@ an offline layer that:
 ## Install
 
 ```bash
-sudo bash scripts/setup-security-onion-node.sh
+sudo bash setup/setup.sh
 ```
 
 Idempotent. Requires `.env` + `config/local.yaml` filled in, and a reachable

@@ -1,6 +1,6 @@
-PUT _ingest/pipeline/dshield.cowrie.sessions
+PUT _ingest/pipeline/prism.cowrie.session
 {
-  "description": "Cowrie SSH/Telnet JSON events -> ECS",
+  "description": "Cowrie SSH/Telnet JSON events -> ECS. Reroutes to the project-owned prism.raw.cowrie.session index at the end of the chain.",
   "processors": [
     {
       "json": {
@@ -39,7 +39,6 @@ PUT _ingest/pipeline/dshield.cowrie.sessions
         "ignore_missing": true
       }
     },
-
     {
       "rename": {
         "field": "cowrie.src_ip",
@@ -88,7 +87,6 @@ PUT _ingest/pipeline/dshield.cowrie.sessions
         "if": "ctx.observer?.name == ''"
       }
     },
-
     {
       "rename": {
         "field": "cowrie.session",
@@ -103,7 +101,6 @@ PUT _ingest/pipeline/dshield.cowrie.sessions
         "ignore_missing": true
       }
     },
-
     {
       "rename": {
         "field": "cowrie.username",
@@ -111,16 +108,6 @@ PUT _ingest/pipeline/dshield.cowrie.sessions
         "ignore_missing": true
       }
     },
-
-    {
-      "rename": {
-        "description": "cowrie.password has no ECS equivalent; kept in the cowrie.* custom namespace intentionally",
-        "field": "cowrie.password",
-        "target_field": "cowrie.password",
-        "ignore_missing": true
-      }
-    },
-
     {
       "rename": {
         "field": "cowrie.shasum",
@@ -154,7 +141,6 @@ PUT _ingest/pipeline/dshield.cowrie.sessions
         "ignore_missing": true
       }
     },
-
     {
       "rename": {
         "field": "cowrie.url",
@@ -163,71 +149,15 @@ PUT _ingest/pipeline/dshield.cowrie.sessions
       }
     },
     {
-      "grok": {
-        "description": "Parse url.original into scheme, domain, path, query, fragment",
+      "uri_parts": {
+        "description": "Parse url.original into scheme/domain/port/path/query/fragment/extension. Replaces the multi-grok dance with the built-in processor — handles IPv6 hosts, userinfo, percent-encoding, etc. that the regex missed.",
         "field": "url.original",
-        "patterns": [
-          "^(?<_url_scheme>[a-zA-Z][a-zA-Z0-9+\\-.]*):(?://(?<_url_domain>[^/?#]*))?(?<_url_path>[^?#]*)(?:\\?(?<_url_query>[^#]*))?(?:#(?<_url_fragment>.*))?$",
-          "^(?<_url_path>[^?#]*)(?:\\?(?<_url_query>[^#]*))?(?:#(?<_url_fragment>.*))?$"
-        ],
+        "target_field": "url",
+        "keep_original": true,
         "if": "ctx.url?.original != null",
         "ignore_failure": true
       }
     },
-    {
-      "rename": {
-        "field": "_url_scheme",
-        "target_field": "url.scheme",
-        "ignore_missing": true
-      }
-    },
-    {
-      "rename": {
-        "field": "_url_domain",
-        "target_field": "url.domain",
-        "ignore_missing": true
-      }
-    },
-    {
-      "rename": {
-        "field": "_url_path",
-        "target_field": "url.path",
-        "ignore_missing": true
-      }
-    },
-    {
-      "rename": {
-        "field": "_url_query",
-        "target_field": "url.query",
-        "ignore_missing": true
-      }
-    },
-    {
-      "rename": {
-        "field": "_url_fragment",
-        "target_field": "url.fragment",
-        "ignore_missing": true
-      }
-    },
-    {
-      "grok": {
-        "description": "Extract file extension from url.path",
-        "field": "url.path",
-        "patterns": [
-          "\\.(?<_url_ext>[a-zA-Z0-9]{1,10})$"
-        ],
-        "if": "ctx.url?.path != null",
-        "ignore_failure": true
-      }
-    },
-    {
-      "rename": {
-        "field": "_url_ext",
-        "target_field": "url.extension",
-        "ignore_missing": true
-      }
-    },
-
     {
       "rename": {
         "field": "cowrie.input",
@@ -235,7 +165,6 @@ PUT _ingest/pipeline/dshield.cowrie.sessions
         "ignore_missing": true
       }
     },
-
     {
       "rename": {
         "field": "cowrie.version",
@@ -243,7 +172,6 @@ PUT _ingest/pipeline/dshield.cowrie.sessions
         "ignore_missing": true
       }
     },
-
     {
       "rename": {
         "field": "cowrie.duration",
@@ -259,7 +187,6 @@ PUT _ingest/pipeline/dshield.cowrie.sessions
         "ignore_failure": true
       }
     },
-
     {
       "rename": {
         "description": "Normalize cowrie.client.kex fields to snake_case",
@@ -310,7 +237,6 @@ PUT _ingest/pipeline/dshield.cowrie.sessions
         "ignore_missing": true
       }
     },
-
     {
       "convert": {
         "field": "source.port",
@@ -325,7 +251,6 @@ PUT _ingest/pipeline/dshield.cowrie.sessions
         "ignore_missing": true
       }
     },
-
     {
       "set": {
         "field": "event.kind",
@@ -375,7 +300,6 @@ PUT _ingest/pipeline/dshield.cowrie.sessions
         "if": "ctx.destination?.ip != null"
       }
     },
-
     {
       "script": {
         "description": "Set network.type from source.ip",
@@ -383,7 +307,6 @@ PUT _ingest/pipeline/dshield.cowrie.sessions
         "source": "if (ctx.source?.ip != null) { ctx.network = ctx.network ?: [:]; ctx.network.type = ctx.source.ip.contains(':') ? 'ipv6' : 'ipv4'; }"
       }
     },
-
     {
       "script": {
         "description": "ECS event.category / event.type / event.outcome per Cowrie eventid",
@@ -391,7 +314,6 @@ PUT _ingest/pipeline/dshield.cowrie.sessions
         "source": "String a = ctx.event?.action; if (a == null) return; if (a == 'cowrie.login.success') { ctx.event.category = ['authentication']; ctx.event.type = ['start']; ctx.event.outcome = 'success'; } else if (a == 'cowrie.login.failed') { ctx.event.category = ['authentication']; ctx.event.type = ['start']; ctx.event.outcome = 'failure'; } else if (a == 'cowrie.session.connect') { ctx.event.category = ['network']; ctx.event.type = ['connection']; ctx.event.outcome = 'success'; } else if (a == 'cowrie.session.closed') { ctx.event.category = ['network']; ctx.event.type = ['end']; ctx.event.outcome = 'success'; } else if (a == 'cowrie.client.version') { ctx.event.category = ['network']; ctx.event.type = ['info']; } else if (a == 'cowrie.client.kex') { ctx.event.category = ['network']; ctx.event.type = ['info']; } else if (['cowrie.command.input', 'cowrie.command.failed', 'cowrie.command.success'].contains(a)) { ctx.event.category = ['process']; ctx.event.type = ['info']; } else if (['cowrie.session.file_download', 'cowrie.session.file_upload', 'cowrie.session.file_download.failed'].contains(a)) { ctx.event.category = ['file']; ctx.event.type = ['creation']; } else if (a.startsWith('cowrie.direct-tcpip')) { ctx.event.category = ['intrusion_detection']; ctx.event.type = ['info']; }"
       }
     },
-
     {
       "geoip": {
         "description": "Enrich source.ip with geographic data",
@@ -429,7 +351,6 @@ PUT _ingest/pipeline/dshield.cowrie.sessions
         "ignore_missing": true
       }
     },
-
     {
       "append": {
         "field": "related.ip",
@@ -460,6 +381,12 @@ PUT _ingest/pipeline/dshield.cowrie.sessions
         "value": "{{{file.hash.sha256}}}",
         "allow_duplicates": false,
         "if": "ctx.file?.hash?.sha256 != null"
+      }
+    },
+    {
+      "reroute": {
+        "description": "Route the document into the project-owned prism.raw.cowrie.session index, outside Fleet's logs-*-* territory. Survives Fleet integration upgrades that recreate logs-* data streams.",
+        "destination": "prism.raw.cowrie.session"
       }
     }
   ],

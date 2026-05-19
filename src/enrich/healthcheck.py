@@ -155,7 +155,7 @@ def _check_llm(cfg: AppConfig, secrets: Secrets) -> int:
             v = llm.embed("hello")
             print(f"[ok] embedding works (dim={len(v)})")
             if len(v) != 768:
-                print(f"[FAIL] embedding dim {len(v)} != 768 — index mapping requires 768. Pick a 768-dim model or update es-mappings/.")
+                print(f"[FAIL] embedding dim {len(v)} != 768 — index mapping requires 768. Pick a 768-dim model or update setup/es-mappings/.")
                 failures += 1
             try:
                 reply = llm.generate_text("Reply with the single word: pong")

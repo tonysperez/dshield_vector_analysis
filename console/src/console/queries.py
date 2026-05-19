@@ -1,7 +1,7 @@
 """Elasticsearch queries used by the console API.
 
 Design notes:
-* Field paths follow the mappings in `es-mappings/cowrie/*.json`. Anything that
+* Field paths follow the mappings in `setup/es-mappings/cowrie/*.json`. Anything that
   changes there must be reflected here.
 * Every query strips `dshield.*.embedding` from `_source` so 768-dim vectors
   never leave the server.

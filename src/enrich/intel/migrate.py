@@ -206,8 +206,8 @@ def run_reapply_rules(
     Returns a stats dict suitable for `json.dumps`. Doesn't touch any
     upstream provider — purely re-derives from persisted data.
 
-    Today only `intel-dshield-ip-default` is in scope; URL / domain
-    / hash indices will be added with M3.
+    Today only `prism.intel.ip` is in scope; URL / domain / hash
+    indices will be added with M3.
     """
     if not cfg.intel.enabled:
         return {"enabled": False, "skipped": True}

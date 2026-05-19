@@ -32,8 +32,8 @@ from ... import triage as triage_mod
 
 log = logging.getLogger(__name__)
 
-_COMMANDS_MAPPING = "es-mappings/cowrie/commands.json"
-_COMMAND_CLUSTERS_MAPPING = "es-mappings/cowrie/command_clusters.json"
+_COMMANDS_MAPPING = "setup/es-mappings/cowrie/commands.json"
+_COMMAND_CLUSTERS_MAPPING = "setup/es-mappings/cowrie/command_clusters.json"
 
 # Fixed corpus-scale denominators for the log1p-normalized scalar block
 # (ROADMAP #14). See sessions.py for the rationale. occurrence_count P99.9

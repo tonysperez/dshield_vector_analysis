@@ -1,0 +1,158 @@
+PUT _index_template/prism.raw
+{
+  "index_patterns": ["prism.raw.*.*"],
+  "data_stream": {},
+  "priority": 250,
+  "_meta": {
+    "description": "Project-owned raw event store. Replaces Fleet-managed `logs-*-*` data streams so integration upgrades can't wipe history. Mappings are explicit for operational fields the pipeline aggregates on; everything else stays dynamic.",
+    "managed_by": "dshield_prism"
+  },
+  "template": {
+    "settings": {
+      "number_of_shards": 1,
+      "number_of_replicas": 0,
+      "lifecycle.name": "so-logs-logs"
+    },
+    "mappings": {
+      "dynamic": true,
+      "properties": {
+        "@timestamp":  { "type": "date" },
+        "message":     { "type": "text" },
+        "tags":        { "type": "keyword" },
+
+        "event": {
+          "properties": {
+            "action":   { "type": "keyword" },
+            "category": { "type": "keyword" },
+            "type":     { "type": "keyword" },
+            "outcome":  { "type": "keyword" },
+            "kind":     { "type": "keyword" },
+            "module":   { "type": "keyword" },
+            "dataset":  { "type": "keyword" },
+            "provider": { "type": "keyword" },
+            "start":    { "type": "date" },
+            "end":      { "type": "date" },
+            "duration": { "type": "long" },
+            "original": { "type": "text" }
+          }
+        },
+
+        "source": {
+          "properties": {
+            "ip":   { "type": "ip" },
+            "port": { "type": "integer" },
+            "as": {
+              "properties": {
+                "number": { "type": "long" },
+                "organization": {
+                  "properties": { "name": { "type": "keyword" } }
+                }
+              }
+            },
+            "geo": {
+              "properties": {
+                "city_name":         { "type": "keyword" },
+                "continent_name":    { "type": "keyword" },
+                "country_iso_code":  { "type": "keyword" },
+                "country_name":      { "type": "keyword" },
+                "region_iso_code":   { "type": "keyword" },
+                "region_name":       { "type": "keyword" },
+                "location":          { "type": "geo_point" }
+              }
+            }
+          }
+        },
+
+        "destination": {
+          "properties": {
+            "ip":   { "type": "ip" },
+            "port": { "type": "integer" }
+          }
+        },
+
+        "network": {
+          "properties": {
+            "protocol":  { "type": "keyword" },
+            "type":      { "type": "keyword" },
+            "direction": { "type": "keyword" }
+          }
+        },
+
+        "observer": {
+          "properties": {
+            "name":   { "type": "keyword" },
+            "type":   { "type": "keyword" },
+            "vendor": { "type": "keyword" },
+            "ip":     { "type": "ip" }
+          }
+        },
+
+        "user": {
+          "properties": {
+            "name": { "type": "keyword" }
+          }
+        },
+
+        "user_agent": {
+          "properties": {
+            "original": { "type": "keyword" }
+          }
+        },
+
+        "file": {
+          "properties": {
+            "name": { "type": "keyword" },
+            "path": { "type": "keyword" },
+            "hash": {
+              "properties": { "sha256": { "type": "keyword" } }
+            }
+          }
+        },
+
+        "url": {
+          "properties": {
+            "original":  { "type": "keyword" },
+            "scheme":    { "type": "keyword" },
+            "domain":    { "type": "keyword" },
+            "port":      { "type": "long" },
+            "path":      { "type": "keyword" },
+            "query":     { "type": "keyword" },
+            "fragment":  { "type": "keyword" },
+            "extension": { "type": "keyword" },
+            "username":  { "type": "keyword" },
+            "password":  { "type": "keyword" },
+            "full":      { "type": "keyword" }
+          }
+        },
+
+        "process": {
+          "properties": {
+            "command_line": { "type": "keyword", "ignore_above": 32766 }
+          }
+        },
+
+        "related": {
+          "properties": {
+            "ip":   { "type": "ip" },
+            "user": { "type": "keyword" },
+            "hash": { "type": "keyword" }
+          }
+        },
+
+        "cowrie": {
+          "properties": {
+            "session_id":         { "type": "keyword" },
+            "password":           { "type": "keyword" },
+            "hassh_algorithms":   { "type": "keyword" },
+            "kex_algorithms":     { "type": "keyword" },
+            "key_algorithms":     { "type": "keyword" },
+            "enc_cs":             { "type": "keyword" },
+            "mac_cs":             { "type": "keyword" },
+            "comp_cs":            { "type": "keyword" },
+            "lang_cs":            { "type": "keyword" }
+          }
+        }
+      }
+    }
+  }
+}
