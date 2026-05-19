@@ -114,7 +114,7 @@
     }
     .ioc-link:hover { text-decoration: underline; }
 
-    /* Pivot button */
+    /* Pivot + Findings buttons. Pair in a single `.actions` td. */
     .pivot-btn {
       background: #1a2540;
       border: 1px solid #2a3558;
@@ -126,6 +126,15 @@
       white-space: nowrap;
     }
     .pivot-btn:hover { background: #1f2d4e; }
+    /* "→ Findings" variant uses the findings page's purple accent so
+       the two buttons are visually distinct at a glance. */
+    .pivot-btn.findings-btn { color: #c084fc; border-color: #3a2a58; }
+    .pivot-btn.findings-btn:hover { background: #2d1f4e; }
+    .ins-table td.actions {
+      white-space: nowrap;
+      text-align: right;
+    }
+    .ins-table td.actions .pivot-btn + .pivot-btn { margin-left: 6px; }
 
     /* Intent badge */
     .badge-intent {
@@ -266,8 +275,9 @@
 </head>
 <body>
   <header class="topbar">
-    <a href="/" class="brand" style="text-decoration:none;color:inherit;">DShield Console</a>
-    <a href="/" class="nav-link">← Graph</a>
+    <a href="/findings" class="brand" style="text-decoration:none;color:inherit;">DShield Console</a>
+    <a href="/findings" class="nav-link">Findings</a>
+    <a href="/graph" class="nav-link">Graph</a>
     <a href="/compare" class="nav-link">Compare</a>
     <a href="/health" class="nav-link">Health</a>
     <div style="flex:1"></div>

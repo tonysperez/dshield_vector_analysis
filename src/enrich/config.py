@@ -19,7 +19,13 @@ _ENV_FILE_ENV = f"{ENV_PREFIX}ENV"
 
 
 class CowrieIndexes(BaseModel):
-    """All index names for the cowrie source. One layer per field."""
+    """All index names for the cowrie source. One layer per field.
+
+    Naming convention (post-2026-05-17 rename): `prism.<function>.<source>.<layer>`.
+    The `prism.*` prefix isn't claimed by any Fleet integration template,
+    so these indices are wholly project-owned and survive integration
+    upgrades. See docs/reference.md for the full layout.
+    """
     sessions_raw: str       # raw cowrie session-log events
     commands: str           # per-command enrichment docs
     command_clusters: str   # HDBSCAN centroids over commands
@@ -31,7 +37,7 @@ class CowrieIndexes(BaseModel):
     # — frequent-itemset (behaviour) and connected-component (infrastructure)
     # groupings of sessions that span multiple connections. Distinct from
     # session_clusters (those are playbooks). See docs/PLAYBOOKS_AND_CAMPAIGNS.md.
-    campaigns: str = "campaigns-dshield.cowrie-default"
+    campaigns: str = "prism.campaign.cowrie"
 
 
 class SourceIndexes(BaseModel):
@@ -377,10 +383,10 @@ class IntelIndexes(BaseModel):
     pre-allocated so adding a kind later doesn't require config
     migration on existing deploys.
     """
-    ip:     str = "intel-dshield-ip-default"
-    url:    str = "intel-dshield-url-default"
-    domain: str = "intel-dshield-domain-default"
-    hash:   str = "intel-dshield-hash-default"
+    ip:     str = "prism.intel.ip"
+    url:    str = "prism.intel.url"
+    domain: str = "prism.intel.domain"
+    hash:   str = "prism.intel.hash"
 
 
 class IntelConfig(BaseModel):
@@ -411,12 +417,57 @@ class IntelConfig(BaseModel):
     max_per_run: int = 5000
 
 
+class FindingsIndexes(BaseModel):
+    """Persisted findings index. M5."""
+    default: str = "prism.finding"
+
+
+class FindingsConfig(BaseModel):
+    """Findings-mining subsystem (M5).
+
+    The miner walks IP rollups (for `likely_discovery`) and joins
+    URL ↔ host-IP intel (for `axis_disagreement`), upserting one
+    finding doc per (kind, artifact_kind, artifact_value). Status
+    workflow lives on each doc; the miner is careful to overwrite
+    only the evidence/score/last_seen_at fields so the analyst's
+    triage state survives re-mines.
+    """
+    enabled: bool = True
+    indexes: FindingsIndexes = Field(default_factory=FindingsIndexes)
+    # Likely-discovery thresholds. Both halves must clear: high local
+    # novelty AND high external rarity. Defaults err on the side of a
+    # short ranked list — easier to lower than to wade through noise.
+    likely_discovery_novelty_min: float = 0.70
+    likely_discovery_rarity_min: float = 0.50
+    # Floor on local activity to avoid surfacing IPs we barely saw
+    # — single-session IPs aren't candidate discoveries even when
+    # both scores spike.
+    likely_discovery_min_sessions: int = 3
+    # Cap on how many findings of each kind the miner persists per
+    # run. The console paginates; a 5000-finding backlog is rarely
+    # useful and bloats the index.
+    max_findings_per_kind: int = 500
+    # Look-back window (days) for "recent activity" — IPs/URLs whose
+    # `last_seen` is older than this are ineligible for new findings.
+    # Existing finding docs keep their status; the miner just stops
+    # emitting fresh ones for stale artifacts.
+    window_days: int = 30
+
+
 class WorkerConfig(BaseModel):
     state_db: str
     page_size: int = 1000
     command_max_chars: int = 4000
     initial_lookback_days: Optional[int] = None
     log_level: str = "INFO"
+    # Directory for project-owned log files. The CLI installs a rotating
+    # file handler at `<log_dir>/cli.log` when this path is writable;
+    # setup.sh and destroy.sh write `<log_dir>/setup.log` and
+    # `<log_dir>/destroy.log`. Set to "" or an unwritable path to disable
+    # file logging entirely (the CLI keeps its stderr handler either
+    # way, so systemd's journal capture is unaffected). Override per
+    # run via the PRISM_LOG_DIR env var.
+    log_dir: str = "/var/log/dshield_prism"
     # When True (default), the cache key includes two SHA-256 hashes over
     # the inputs that affect enrichment output (see
     # `compute_llm_config_hash` and `compute_embed_config_hash`). Edits to
@@ -455,6 +506,7 @@ class AppConfig(BaseModel):
     ip: IPConfig = Field(default_factory=IPConfig)
     cooccurrence: CooccurrenceConfig = Field(default_factory=CooccurrenceConfig)
     intel: IntelConfig = Field(default_factory=IntelConfig)
+    findings: FindingsConfig = Field(default_factory=FindingsConfig)
 
 
 class Secrets(BaseSettings):

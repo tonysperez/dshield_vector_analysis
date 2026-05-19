@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query
@@ -20,7 +20,7 @@ from pydantic import BaseModel
 
 from ._config import load_config, load_secrets
 from ._es import make_client
-from . import graph, intel as intel_mod, ioc, queries
+from . import findings as findings_mod, graph, intel as intel_mod, ioc, queries
 # Imported as a renamed local to avoid shadowing the `health()` function
 # below that's registered as the `/api/health` system-check route.
 from . import health as health_mod
@@ -45,6 +45,12 @@ class DenylistAddRequest(BaseModel):
     rationale: str = ""
 
 
+class FindingStatusRequest(BaseModel):
+    """POST body for /api/finding/{id}/status (M5)."""
+    status: str
+    note: str = ""
+
+
 def build_app(config_path: str | None = None) -> FastAPI:
     cfg = load_config(config_path)
     secrets = load_secrets(config_path)
@@ -59,12 +65,28 @@ def build_app(config_path: str | None = None) -> FastAPI:
     if WEB_DIR.exists():
         app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")
 
+    # M5: `/` is the findings page; the graph (original index) moves to
+    # `/graph`. The redirect uses a 302 so older bookmarks still resolve
+    # to the new landing.
+    from fastapi.responses import RedirectResponse
+
     @app.get("/")
-    def root() -> FileResponse:
-        index = WEB_DIR / "index.html"
-        if not index.exists():
+    def root() -> RedirectResponse:
+        return RedirectResponse(url="/findings", status_code=302)
+
+    @app.get("/findings")
+    def findings_page() -> FileResponse:
+        page = WEB_DIR / "findings.html"
+        if not page.exists():
+            raise HTTPException(500, "web/findings.html missing")
+        return FileResponse(page)
+
+    @app.get("/graph")
+    def graph_page() -> FileResponse:
+        page = WEB_DIR / "index.html"
+        if not page.exists():
             raise HTTPException(500, "web/index.html missing")
-        return FileResponse(index)
+        return FileResponse(page)
 
     @app.get("/insights")
     def insights_page() -> FileResponse:
@@ -168,6 +190,35 @@ def build_app(config_path: str | None = None) -> FastAPI:
         _health_cmds_cache["data"] = None
         _health_cmds_cache["ts"] = 0.0
 
+    @app.post("/api/cache/purge")
+    def purge_caches() -> JSONResponse:
+        """Wipe every in-memory cache so the next request reads from ES.
+
+        The console layers a few caches on top of ES for query throughput:
+          - _insights_cache         (60 s TTL on the /api/insights payload)
+          - _health_cmds_cache      (60 s TTL on /api/health/commands)
+          - run_cache._cache        (5 min TTL on `latest run_id` per
+                                     centroid index — RunCache in queries.py)
+
+        After a fresh pipeline run, these caches can hold stale results
+        until their TTLs expire. The settings modal exposes a button
+        that POSTs here so operators don't have to restart the process.
+        """
+        cleared: list[str] = []
+        _insights_cache["data"] = None
+        _insights_cache["ts"] = 0.0
+        cleared.append("insights")
+        _invalidate_health_cache()
+        cleared.append("health_commands")
+        try:
+            # RunCache holds {index: (ts, run_id)}; clearing forces the
+            # next .latest() call to re-query ES.
+            run_cache._cache.clear()
+            cleared.append("run_cache")
+        except Exception:                                # pragma: no cover
+            pass
+        return JSONResponse({"ok": True, "cleared": cleared})
+
     @app.post("/api/health/commands/denylist")
     def denylist_add_api(body: DenylistAddRequest) -> JSONResponse:
         ok, msg = health_mod.add_token_to_denylist(body.token, body.rationale)
@@ -185,6 +236,65 @@ def build_app(config_path: str | None = None) -> FastAPI:
             raise HTTPException(404, msg)
         _invalidate_health_cache()
         return JSONResponse({"ok": True, "message": msg})
+
+    # ------------------------------------------------------------------
+    # Findings (M5) — list / filter / status mutation / calibration scatter
+    # ------------------------------------------------------------------
+    @app.get("/api/findings")
+    def findings_list_api(
+        status: str = Query("new", description="Comma-separated list of statuses, or 'all'"),
+        kind: Optional[str] = Query(None, description="likely_discovery | axis_disagreement"),
+        size: int = Query(50, ge=1, le=500),
+        frm: int = Query(0, ge=0),
+        sort: str = Query("score", description="score | last_seen | first_seen"),
+    ) -> JSONResponse:
+        status_list: Optional[list[str]]
+        if status == "all":
+            status_list = []
+        else:
+            status_list = [s.strip() for s in status.split(",") if s.strip()]
+        try:
+            data = findings_mod.list_findings(
+                es, cfg,
+                status=status_list, kind=kind, size=size, frm=frm, sort=sort,
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        # Pair with per-bucket aggregates so the page header shows counts
+        # without a second roundtrip.
+        data["status_counts"] = findings_mod.status_counts(es, cfg)
+        data["kind_counts"] = findings_mod.kind_counts(
+            es, cfg, status=status_list if status_list else None,
+        )
+        return JSONResponse(data)
+
+    @app.get("/api/finding/{finding_id}")
+    def finding_detail_api(finding_id: str) -> JSONResponse:
+        data = findings_mod.get_finding(es, cfg, finding_id)
+        if data is None:
+            raise HTTPException(404, f"finding not found: {finding_id}")
+        return JSONResponse(data)
+
+    @app.post("/api/finding/{finding_id}/status")
+    def finding_status_api(finding_id: str, body: FindingStatusRequest) -> JSONResponse:
+        # The mutation logic + history-append lives in the parent
+        # package's writer so the upsert contract has one canonical
+        # implementation. Cross-package import mirrors the pattern
+        # used by /api/compare.
+        from enrich.findings.writer import mutate_status
+        try:
+            updated = mutate_status(
+                es, cfg.findings.indexes.default, finding_id,
+                new_status=body.status, note=body.note,
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        except LookupError as exc:
+            raise HTTPException(404, str(exc))
+        except Exception as exc:                            # pragma: no cover
+            log.exception("finding_status_api failed")
+            raise HTTPException(500, f"status mutation failed: {exc}")
+        return JSONResponse(updated)
 
     # ------------------------------------------------------------------
     # Per-artifact pane — intel + local-observations join

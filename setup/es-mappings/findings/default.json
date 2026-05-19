@@ -1,0 +1,74 @@
+{
+  "_comment": "Persisted findings index — M5. One doc per (kind, artifact_kind, artifact_value) tuple, written by `dshield_prism mine findings`. Status workflow (new|ack|confirmed|rejected) is preserved across mining runs via doc-id upsert: the miner only touches `evidence`, `score`, `last_seen_at`; the analyst's `status` and `status_history` are never overwritten. `kind` distinguishes the discovery rule: `likely_discovery` (high local novelty AND high external rarity), `axis_disagreement` (URL intel disagrees with host-IP intel). The `evidence` block is kind-specific and uses dynamic=true so additional rule kinds can land without a mapping migration.",
+  "settings": {
+    "number_of_shards": 1,
+    "number_of_replicas": 0,
+    "refresh_interval": "5s"
+  },
+  "mappings": {
+    "properties": {
+      "finding_id":       { "type": "keyword" },
+      "kind":             { "type": "keyword" },
+      "run_id":           { "type": "keyword" },
+
+      "artifact": {
+        "properties": {
+          "kind":  { "type": "keyword" },
+          "value": { "type": "keyword" }
+        }
+      },
+
+      "score":            { "type": "float" },
+      "narrative":        { "type": "text" },
+
+      "status":           { "type": "keyword" },
+      "status_history": {
+        "type": "nested",
+        "properties": {
+          "ts":   { "type": "date" },
+          "from": { "type": "keyword" },
+          "to":   { "type": "keyword" },
+          "note": { "type": "text" }
+        }
+      },
+
+      "first_seen_at":    { "type": "date" },
+      "last_seen_at":     { "type": "date" },
+
+      "evidence": {
+        "type": "object",
+        "dynamic": true,
+        "properties": {
+          "novelty_score":             { "type": "float" },
+          "external_rarity_score":     { "type": "float" },
+          "consensus_malicious":       { "type": "boolean" },
+          "consensus_label":           { "type": "keyword" },
+          "override_applied":          { "type": "keyword" },
+          "malicious_provider_count":  { "type": "integer" },
+          "providers_total":           { "type": "integer" },
+          "providers_with_data":       { "type": "integer" },
+          "total_sessions":            { "type": "long" },
+          "total_commands":            { "type": "long" },
+          "dominant_intent":           { "type": "keyword" },
+          "host_ip": {
+            "properties": {
+              "value":                     { "type": "keyword" },
+              "consensus_malicious":       { "type": "boolean" },
+              "consensus_label":           { "type": "keyword" },
+              "malicious_provider_count":  { "type": "integer" },
+              "providers_with_data":       { "type": "integer" }
+            }
+          }
+        }
+      },
+
+      "linked_artifacts": {
+        "type": "nested",
+        "properties": {
+          "kind":  { "type": "keyword" },
+          "value": { "type": "keyword" }
+        }
+      }
+    }
+  }
+}

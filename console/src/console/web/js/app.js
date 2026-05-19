@@ -891,7 +891,10 @@
     if (!state.anchor) return;
     const p = new URLSearchParams();
     p.set("ioc", `${state.anchor.type}:${state.anchor.id}`);
-    const next = `/?${p.toString()}`;
+    // Graph page moved to `/graph` when the findings landing landed.
+    // Keep the URL in sync so back/forward + reload stay on /graph
+    // instead of redirecting to /findings.
+    const next = `/graph?${p.toString()}`;
     if (location.pathname + location.search === next) return;
     // Push a new history entry so browser back/forward works for
     // anchor changes. updateUrl is suppressed when we're already
@@ -1513,6 +1516,44 @@
     modal.querySelector(".modal-close").addEventListener("click", closeSettings);
     modal.querySelector(".modal-cancel").addEventListener("click", closeSettings);
     modal.querySelector(".modal-save").addEventListener("click", applySettings);
+
+    // Cache purge button. Resets the server-side in-memory caches so
+    // the next request reads ES afresh — useful after a manual pipeline
+    // run or an out-of-band data fix when waiting for the 60s/5min
+    // TTLs to expire is impatient. Updates the status span in-place;
+    // doesn't close the modal.
+    const purgeBtn = $("#cfg-purge-cache");
+    const purgeStatus = $("#cfg-purge-status");
+    if (purgeBtn && purgeStatus) {
+      purgeBtn.addEventListener("click", async () => {
+        purgeBtn.disabled = true;
+        purgeStatus.className = "setting-status";
+        purgeStatus.textContent = "purging…";
+        try {
+          const r = await fetch("/api/cache/purge", { method: "POST" });
+          if (r.ok) {
+            const data = await r.json();
+            const layers = (data.cleared || []).join(", ") || "ok";
+            purgeStatus.className = "setting-status success";
+            purgeStatus.textContent = `purged: ${layers}`;
+            setTimeout(() => {
+              if (purgeStatus.textContent.startsWith("purged")) {
+                purgeStatus.textContent = "";
+                purgeStatus.className = "setting-status";
+              }
+            }, 4000);
+          } else {
+            purgeStatus.className = "setting-status error";
+            purgeStatus.textContent = `failed: HTTP ${r.status}`;
+          }
+        } catch (exc) {
+          purgeStatus.className = "setting-status error";
+          purgeStatus.textContent = `error: ${exc}`;
+        } finally {
+          purgeBtn.disabled = false;
+        }
+      });
+    }
     modal.addEventListener("click", (e) => {
       // Clicking the backdrop (the modal itself, not the card) closes.
       if (e.target === modal) closeSettings();

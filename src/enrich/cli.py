@@ -18,11 +18,46 @@ from .config import load_config, load_secrets
 from . import healthcheck as hc_mod
 
 
-def _setup_log(level: str) -> None:
-    logging.basicConfig(
-        level=getattr(logging, level.upper(), logging.INFO),
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
+def _setup_log(level: str, log_dir: str | None = None) -> None:
+    """Configure root logging.
+
+    Always installs a stderr handler so systemd's journal capture and
+    interactive shell sessions both see live output. When `log_dir` is
+    non-empty AND writable, additionally installs a RotatingFileHandler
+    on `<log_dir>/cli.log` (10 MB × 5 backups) so historical CLI runs
+    are durable independent of journald rotation.
+
+    File-handler failures (missing directory, no write permission, etc.)
+    fall back to stderr-only with a single warning printed; never raise,
+    so the CLI works on dev workstations where /var/log/dshield_prism
+    doesn't exist.
+    """
+    import os
+    fmt = "%(asctime)s %(levelname)s %(name)s %(message)s"
+    lvl = getattr(logging, level.upper(), logging.INFO)
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    # PRISM_LOG_DIR env var wins over config so operators can redirect
+    # ad-hoc without editing config.
+    env_dir = os.environ.get("PRISM_LOG_DIR")
+    resolved = env_dir if env_dir is not None else (log_dir or "")
+    if resolved:
+        try:
+            os.makedirs(resolved, exist_ok=True)
+            from logging.handlers import RotatingFileHandler
+            log_path = os.path.join(resolved, "cli.log")
+            handlers.append(
+                RotatingFileHandler(
+                    log_path, maxBytes=10 * 1024 * 1024, backupCount=5,
+                    encoding="utf-8",
+                )
+            )
+        except Exception as exc:
+            # Single stderr line, no traceback — file logging is a nicety.
+            print(
+                f"[warn] file logging disabled: {resolved}/cli.log unwritable ({exc})",
+                file=__import__("sys").stderr, flush=True,
+            )
+    logging.basicConfig(level=lvl, format=fmt, handlers=handlers, force=True)
 
 
 # --- per-source dispatch ----------------------------------------------------
@@ -50,21 +85,26 @@ def _commands_layer(source: str):
 
 _LAYER_MAPPINGS = {
     "cowrie": {
-        "commands":         "es-mappings/cowrie/commands.json",
-        "command_clusters": "es-mappings/cowrie/command_clusters.json",
-        "sessions":         "es-mappings/cowrie/sessions.json",
-        "session_clusters": "es-mappings/cowrie/session_clusters.json",
-        "ips":              "es-mappings/cowrie/ips.json",
-        "ip_clusters":      "es-mappings/cowrie/ip_clusters.json",
-        "campaigns":        "es-mappings/cowrie/campaigns.json",
+        "commands":         "setup/es-mappings/cowrie/commands.json",
+        "command_clusters": "setup/es-mappings/cowrie/command_clusters.json",
+        "sessions":         "setup/es-mappings/cowrie/sessions.json",
+        "session_clusters": "setup/es-mappings/cowrie/session_clusters.json",
+        "ips":              "setup/es-mappings/cowrie/ips.json",
+        "ip_clusters":      "setup/es-mappings/cowrie/ip_clusters.json",
+        "campaigns":        "setup/es-mappings/cowrie/campaigns.json",
     },
     # External threat-intel — cross-source per-artifact indices.
     # `init-indexes --source intel` creates these. M1 shipped `ip`,
     # M4 added `url`; `domain` / `hash` land when corpus produces
     # extractable values.
     "intel": {
-        "ip":     "es-mappings/intel/ip.json",
-        "url":    "es-mappings/intel/url.json",
+        "ip":     "setup/es-mappings/intel/ip.json",
+        "url":    "setup/es-mappings/intel/url.json",
+    },
+    # Persisted findings index — M5. Cross-source: the miner reads
+    # IP rollups + intel-{ip,url}, writes one findings index.
+    "findings": {
+        "default": "setup/es-mappings/findings/default.json",
     },
 }
 
@@ -120,24 +160,79 @@ def _wipe_processed(cfg, secrets, source: str) -> dict:
     return out
 
 
+def _acquire_pipeline_lock(cfg, *, no_lock: bool, print_args):
+    """Acquire the same flock the systemd units use, so manual `pipeline`
+    invocations serialise with the forward / backward / mine-findings
+    timers. Returns the open file descriptor (caller keeps it alive for
+    the duration of the run; closing releases the lock).
+
+    Lock path mirrors the systemd units: `<state_db parent>/.lock`. With
+    the default config that's `/var/lib/dshield_prism/.lock`.
+
+    --no-lock skips acquisition entirely. Pre-emptive escape hatch for
+    test environments or ad-hoc runs where you've already stopped the
+    systemd timers and don't want the lock dance.
+    """
+    if no_lock:
+        print_args("[pipeline] --no-lock: skipping flock acquisition (caller responsible for serialisation)")
+        return None
+    import fcntl
+    from pathlib import Path
+    lock_path = Path(cfg.worker.state_db).parent / ".lock"
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    # Open for append (creates if missing). The file's content is
+    # irrelevant — the OS-level advisory lock is what serialises us.
+    lock_fd = open(lock_path, "a")
+    try:
+        fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        print_args(f"[pipeline] acquired lock {lock_path}")
+    except BlockingIOError:
+        print_args(f"[pipeline] waiting for lock {lock_path} (held by another process — likely forward/backward/mine-findings)")
+        fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX)
+        print_args(f"[pipeline] acquired lock {lock_path}")
+    return lock_fd
+
+
 def _run_pipeline(cfg, secrets, args) -> int:
     """End-to-end runner: each verb is invoked in dependency order via the
     same `run_*` entry points the individual CLI verbs call. Steps marked
     `optional=True` won't halt the chain on failure (mirrors the analytics
     systemd unit's leading `-` semantics). `--continue-on-error` extends
     that tolerance to every step.
+
+    The whole run is serialised with the systemd timers via an exclusive
+    flock on `<state_db_parent>/.lock`. Use `--no-lock` to skip if the
+    timers are already stopped and you want a fast manual iteration.
     """
     print_args = lambda *a, **kw: print(*a, **{**kw, "flush": True})
 
+    # Hold the flock for the entire run. `_pipeline_lock_fd` stays alive
+    # in this scope; closing on function exit releases the lock.
+    _pipeline_lock_fd = _acquire_pipeline_lock(
+        cfg, no_lock=getattr(args, "no_lock", False), print_args=print_args,
+    )
+
     # ---- Optional fresh-start wipe ---------------------------------------
+    # `--force` wipes every processed index across ALL sources (cowrie +
+    # intel + findings) plus the SQLite cache + watermark. The only thing
+    # preserved is the raw `sessions_raw` index — that's the source of
+    # truth ingested by Filebeat/Elastic-agent and is intentionally not
+    # touched. Re-running the pipeline rebuilds everything else from raw.
+    wipe_sources = ["cowrie", "intel", "findings"]
     if args.force:
         if not args.yes:
             try:
                 resp = input(
                     "[pipeline] --force will DELETE every processed ES index "
-                    f"for source {args.source!r} (commands, command_clusters, "
-                    "sessions_rollup, session_clusters, ips_rollup, ip_clusters, "
-                    "campaigns) and clear the SQLite cache + watermark. The raw "
+                    f"across all sources ({', '.join(wipe_sources)}):\n"
+                    "  cowrie:   commands, command_clusters, sessions_rollup, "
+                    "session_clusters, ips_rollup, ip_clusters, campaigns\n"
+                    "  intel:    prism.intel.ip, prism.intel.url\n"
+                    "  findings: prism.finding\n"
+                    "and clear the SQLite cache + watermark. The raw "
                     "sessions_raw index is NOT touched.\n"
                     "Proceed? [y/N] "
                 ).strip().lower()
@@ -147,11 +242,16 @@ def _run_pipeline(cfg, secrets, args) -> int:
                 print_args("Aborted.")
                 return 1
         if args.dry_run:
-            print_args("[pipeline] DRY-RUN: would wipe all processed data + SQLite state, then run every step.")
+            print_args(
+                "[pipeline] DRY-RUN: would wipe every processed index across "
+                f"{wipe_sources}, clear SQLite, then run every step."
+            )
         else:
-            wipe = _wipe_processed(cfg, secrets, args.source)
+            wipe_summary: dict = {}
+            for src in wipe_sources:
+                wipe_summary[src] = _wipe_processed(cfg, secrets, src)
             print_args("[pipeline] wipe:")
-            print_args(json.dumps(wipe, indent=2, default=str))
+            print_args(json.dumps(wipe_summary, indent=2, default=str))
 
     # ---- Step plan -------------------------------------------------------
     # Each step is (name, callable, optional). `optional=True` mirrors the
@@ -170,25 +270,84 @@ def _run_pipeline(cfg, secrets, args) -> int:
     if getattr(args, "ignore_config_hash", False):
         cfg.worker.cache_auto_invalidate = False
 
+    # Lazy imports so a missing optional dep (e.g. intel disabled in
+    # local.yaml) doesn't break the dispatcher import path.
+    def _run_intel_refresh():
+        from .intel.refresh import run_refresh
+        return run_refresh(cfg, secrets, dry_run=dry)
+
+    def _run_mine_findings():
+        from .findings.miner import run_mine as _rm
+        return _rm(cfg, secrets, dry_run=dry)
+
+    def _reset_rollup_watermarks():
+        """Clear the session + IP rollup watermarks so the next rollup
+        re-pools from every session/IP. Mirrors `reset --session-watermark
+        --ip-watermark --yes`. No-op when the watermarks were never set
+        (fresh deploys, --force runs that wiped SQLite). Returns a dict
+        for the step summary."""
+        from .cache import StateDB
+        db = StateDB(cfg.worker.state_db)
+        try:
+            sess = db.clear_watermark("session_rollup_last_processed_at")
+            ipw = db.clear_watermark("ip_rollup_last_processed_at")
+        finally:
+            db.close()
+        return {"session_watermark_rows_deleted": sess, "ip_watermark_rows_deleted": ipw}
+
     steps: list[tuple[str, callable, bool]] = [
-        # ingest half: raw events → enriched commands → session rollup
+        # ---- pre-enrich catch-up: re-LLM and re-embed any rows whose
+        # cache hashes drifted since the last run. Both are no-ops in
+        # steady state and on fresh deploys; they only do work when a
+        # prompt edit, embed_context change, or model swap has happened.
+        # Optional: shouldn't halt the chain if the LLM is down.
+        ("re-enrich-stale",            lambda: cmds_mod.run_reenrich_stale(cfg, secrets, dry_run=dry),                    True),
+        ("reembed",                    lambda: cmds_mod.run_reembed(cfg, secrets, dry_run=dry),                           True),
+
+        # ---- ingest: raw events → enriched commands
         ("enrich",                     lambda: cmds_mod.run_enrich(cfg, secrets, dry_run=dry, no_cloud=args.no_cloud), False),
+
+        # ---- force a full rollup re-pool. The rollup verbs are
+        # watermark-driven; after re-enrich-stale or reembed may have
+        # rewritten command-level data, we want the session/IP rollups
+        # to incorporate those changes rather than only processing rows
+        # whose source ts is newer than the watermark. SQLite-only;
+        # cheap and idempotent. Mirrors backward systemd step 3.
+        ("reset rollup watermarks",    _reset_rollup_watermarks,                                                          True),
+
+        # ---- session rollup + command clustering + cloud escalation
         ("rollup sessions",            lambda: sessions_mod.run_rollup(cfg, secrets, dry_run=dry),                       False),
-        # analytics half: command clustering → optional cloud escalation
         ("cluster commands",           lambda: cmds_mod.run_cluster(cfg, secrets, dry_run=dry),                           False),
         ("escalate",                   lambda: cmds_mod.run_escalate(cfg, secrets, dry_run=dry),                          True),
-        # session clustering + LLM naming (playbooks = named session clusters)
+
+        # ---- session clustering + LLM naming (playbooks = named session clusters)
         ("cluster sessions",           lambda: sessions_mod.run_cluster(cfg, secrets, dry_run=dry),                       False),
         ("name playbooks",             lambda: sessions_mod.run_name_playbooks(cfg, secrets, dry_run=dry, force=False),   True),
-        # IP rollup + clustering (IP clusters are unnamed actor profiles).
-        # `name ip-clusters` annotates each centroid with its dominant
-        # playbook — must run AFTER `name playbooks` above (depends on
-        # session.playbook_id being populated). ROADMAP #24.
+
+        # ---- IP rollup + clustering. `rollup ips` MUST come after
+        # `name playbooks` because session rollups carry playbook_id
+        # only after naming runs, and `name ip-clusters` reads those
+        # session rollups to derive dominant_playbook per IP cluster.
+        # ROADMAP #24.
         ("rollup ips",                 lambda: ips_mod.run_rollup(cfg, secrets, dry_run=dry),                             False),
         ("cluster ips",                lambda: ips_mod.run_cluster(cfg, secrets, dry_run=dry),                            False),
         ("name ip-clusters",           lambda: ips_mod.run_name_ip_clusters(cfg, secrets, dry_run=dry),                   True),
-        # multi-session campaign mining (separate concept; programmatic names)
+
+        # ---- multi-session campaign mining (frequent-itemset + shared-artifact)
         ("mine campaigns",             lambda: campaigns_mod.run_mine(cfg, secrets, kind="all", dry_run=dry),             True),
+
+        # ---- external threat-intel refresh — must run AFTER `rollup ips`
+        # (uses IP rollup for discovery) and AFTER `enrich` (uses
+        # LLM-extracted URL indicators in the commands index). No-op
+        # when intel is disabled in config; the run_refresh entry
+        # point gates on cfg.intel.enabled.
+        ("intel refresh",              _run_intel_refresh,                                                                True),
+
+        # ---- findings miner — populates prism.finding with one card
+        # per playbook + per campaign. Reads everything above;
+        # intentionally last in the chain so the inbox reflects this
+        # pipeline's output.
+        ("mine findings",              _run_mine_findings,                                                                True),
     ]
 
     if dry:
@@ -247,6 +406,8 @@ def _resolve_index_for_layer(cfg, source: str, layer: str) -> str:
             "domain": i.domain,
             "hash":   i.hash,
         }[layer]
+    if source == "findings":
+        return {"default": cfg.findings.indexes.default}[layer]
     raise ValueError(f"Unknown source: {source}")
 
 
@@ -330,6 +491,21 @@ def _build_parser() -> argparse.ArgumentParser:
         "--update-mapping",
         action="store_true",
         help="If an index exists, push additive mapping changes instead of noop",
+    )
+
+    # bootstrap-es — apply project-owned ES templates + ingest pipelines from
+    # the setup/ tree. Idempotent. Runs from the install dir; reuses the
+    # same ES client (TLS + auth) as everything else. Setup script calls
+    # this after healthcheck and before init-indexes so the data-stream
+    # template exists when the cowrie ingest pipeline first reroutes into
+    # `prism.raw.cowrie.session`.
+    p_boot = sub.add_parser(
+        "bootstrap-es",
+        help="Apply setup/*.yaml + setup/es-pipelines/*.yml to ES (templates + ingest pipelines)",
+    )
+    p_boot.add_argument(
+        "--dry-run", action="store_true",
+        help="Parse + list what would be applied without contacting ES",
     )
 
     # escalate
@@ -483,6 +659,14 @@ def _build_parser() -> argparse.ArgumentParser:
              "corpora). ROADMAP #21.",
     )
 
+    # mine findings — M5 persisted findings index. Cross-source: reads IP
+    # rollup + intel-{ip,url}, writes prism.finding. Status
+    # workflow on each doc is preserved across re-mines (writer merges
+    # analyst-owned fields back in). Hourly via systemd timer.
+    p_mf = mine_sub.add_parser("findings", help="Mine likely_discovery + axis_disagreement findings (M5)")
+    p_mf.add_argument("--dry-run", action="store_true",
+                      help="Score + rank without writing finding docs")
+
     # intel — external threat-intel subsystem. `refresh` runs one pass:
     # discovers artifacts, priority-queues them, dispatches to every
     # enabled provider, writes intel-*-default docs. `backfill` forces a
@@ -523,18 +707,26 @@ def _build_parser() -> argparse.ArgumentParser:
     # previous step's outputs.
     p_pipe = sub.add_parser(
         "pipeline",
-        help="Run the full enrichment pipeline end-to-end (enrich → rollup → cluster → name → mine)",
+        help=(
+            "Run every processing step end-to-end: re-enrich-stale → reembed → "
+            "enrich → reset rollup watermarks → rollup sessions → cluster commands → "
+            "escalate → cluster sessions → name playbooks → rollup ips → cluster ips → "
+            "name ip-clusters → mine campaigns → intel refresh → mine findings. "
+            "Serialised with the systemd timers via an exclusive flock; pass "
+            "--no-lock to skip when the timers are already stopped."
+        ),
     )
     p_pipe.add_argument("--source", default="cowrie", help="Source name (default: cowrie)")
     p_pipe.add_argument(
         "--force", action="store_true",
         help=(
-            "Wipe all processed data first: delete every processed ES index "
-            "(commands, command_clusters, sessions_rollup, session_clusters, "
-            "ips_rollup, ip_clusters, campaigns), recreate them from their "
-            "mappings, and clear the SQLite cache + watermark. The raw "
-            "sessions_raw index is NOT touched. Requires --yes to skip the "
-            "confirmation prompt."
+            "Wipe ALL processed data first, across every source, then "
+            "recreate each index from its mapping and clear the SQLite "
+            "cache + watermark. Targets: cowrie (commands, command_clusters, "
+            "sessions_rollup, session_clusters, ips_rollup, ip_clusters, "
+            "campaigns), intel (prism.intel.{ip,url}), findings "
+            "(prism.finding). The raw `sessions_raw` index is "
+            "NOT touched. Requires --yes to skip the confirmation prompt."
         ),
     )
     p_pipe.add_argument(
@@ -561,6 +753,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "--no-cloud", action="store_true",
         help="Pass --no-cloud through to `enrich` (skip cloud escalation paths)",
     )
+    p_pipe.add_argument(
+        "--no-lock", action="store_true",
+        help=(
+            "Skip the flock acquisition that serialises with the forward / "
+            "backward / mine-findings systemd timers. Default behaviour is "
+            "to wait for the lock; pass --no-lock when you've already "
+            "stopped the timers and want to iterate without the wait."
+        ),
+    )
 
     return p
 
@@ -571,7 +772,7 @@ def main(argv: list[str] | None = None) -> int:
 
     cfg = load_config(args.config)
     secrets = load_secrets(args.config)
-    _setup_log(cfg.worker.log_level)
+    _setup_log(cfg.worker.log_level, log_dir=cfg.worker.log_dir)
 
     if args.verb == "healthcheck":
         raw_scope = (args.scope or "all").strip().lower()
@@ -649,6 +850,12 @@ def main(argv: list[str] | None = None) -> int:
         db.close()
         print(json.dumps(result, indent=2))
         return 0
+
+    if args.verb == "bootstrap-es":
+        from .bootstrap import run_bootstrap
+        stats = run_bootstrap(cfg, secrets, dry_run=args.dry_run)
+        print(json.dumps(stats, indent=2, default=str))
+        return 0 if not stats.get("errors") else 1
 
     if args.verb == "init-indexes":
         from .es_client import init_index, make_client, update_mapping
@@ -822,7 +1029,12 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if args.verb == "mine":
-        # `mine campaigns` is the only subject so far.
+        if args.subject == "findings":
+            # Cross-source: reads IP rollup + intel-{ip,url}, writes findings-*.
+            from .findings.miner import run_mine as run_mine_findings
+            stats = run_mine_findings(cfg, secrets, dry_run=args.dry_run)
+            print(json.dumps(stats, indent=2, default=str))
+            return 0
         mod = _load_source_layer(args.source, "campaigns")
         if mod is None:
             print(f"[ERROR] Source {args.source!r} has no `campaigns` miner", flush=True)

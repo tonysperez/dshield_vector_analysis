@@ -619,6 +619,24 @@ main {
   cursor: pointer;
 }
 .setting-row input { accent-color: var(--accent); cursor: pointer; }
+.setting-action {
+  padding: 4px 12px;
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  color: var(--fg);
+  border-radius: 4px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+}
+.setting-action:hover { background: #2a3142; border-color: #3a4258; }
+.setting-action:disabled { opacity: 0.5; cursor: wait; }
+.setting-status {
+  font-size: 11px;
+  color: var(--muted);
+}
+.setting-status.success { color: var(--accent); }
+.setting-status.error { color: #f87171; }
 .modal-footer {
   display: flex;
   justify-content: flex-end;

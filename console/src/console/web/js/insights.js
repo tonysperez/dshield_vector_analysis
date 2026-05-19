@@ -33,14 +33,22 @@
 
   // ─── navigation ──────────────────────────────────────────────────────────
 
+  // M5: `/` redirects to `/findings`. Insights navigations target the
+  // graph explicitly so the IOC query parameter actually lands you on
+  // the graph view of the artifact.
+  function graphHref(type, id) {
+    return "/graph?ioc=" + encodeURIComponent(type + ":" + id);
+  }
+
   function pivot(type, id) {
-    window.location.href = "/?ioc=" + encodeURIComponent(type + ":" + id);
+    window.location.href = graphHref(type, id);
   }
 
   function pivotBtn(type, id, label) {
     const b = document.createElement("button");
     b.className = "pivot-btn";
-    b.textContent = label || "→ Explore";
+    b.textContent = label || "→ Graph";
+    b.title = "Open in the graph view";
     b.addEventListener("click", (e) => {
       e.stopPropagation();
       pivot(type, id);
@@ -48,12 +56,47 @@
     return b;
   }
 
+  // Some artifact types map onto a findings rule kind (playbook → playbook,
+  // session_cluster → playbook, campaign → campaign). Others (command_cluster,
+  // ip_cluster) don't, so the button just lands the analyst on the findings
+  // inbox with no kind filter applied.
+  const _FINDINGS_KIND_BY_TYPE = {
+    "playbook":        "playbook",
+    "session_cluster": "playbook",
+    "campaign":        "campaign",
+  };
+
+  function findingsHref(type) {
+    const kind = _FINDINGS_KIND_BY_TYPE[type];
+    return kind ? `/findings?kind=${encodeURIComponent(kind)}` : "/findings";
+  }
+
+  function findingsBtn(type, _id) {
+    const b = document.createElement("button");
+    b.className = "pivot-btn findings-btn";
+    b.textContent = "→ Findings";
+    b.title = "Open in the findings inbox";
+    b.addEventListener("click", (e) => {
+      e.stopPropagation();
+      window.location.href = findingsHref(type);
+    });
+    return b;
+  }
+
+  function actionCell(type, id) {
+    const cell = document.createElement("td");
+    cell.className = "actions";
+    cell.appendChild(pivotBtn(type, id));
+    cell.appendChild(findingsBtn(type, id));
+    return cell;
+  }
+
   function iocLink(type, id, label) {
     const a = document.createElement("a");
     a.className = "ioc-link";
     a.textContent = label != null ? label : id;
     a.title = type + ":" + id;
-    a.href = "/?ioc=" + encodeURIComponent(type + ":" + id);
+    a.href = graphHref(type, id);
     return a;
   }
 
@@ -136,7 +179,7 @@
       tr.appendChild(td("", fmt(row.session_count)));
       const mbrs = Array.isArray(row.member_playbook_ids) ? row.member_playbook_ids.length : 0;
       tr.appendChild(td("", row.kind === "behaviour" ? `${mbrs} playbooks` : `${row.support || 0} IPs`));
-      tr.appendChild(td("", pivotBtn("campaign", cid)));
+      tr.appendChild(actionCell("campaign", cid));
       tbody.appendChild(tr);
     }
     table.appendChild(tbody);
@@ -168,7 +211,7 @@
       const sparkSvg = renderSparkline(row.daily_14d || []);
       if (sparkSvg) sparkCell.appendChild(sparkSvg);
       tr.appendChild(sparkCell);
-      tr.appendChild(td("", pivotBtn("playbook", cid)));
+      tr.appendChild(actionCell("playbook", cid));
       tbody.appendChild(tr);
     }
     table.appendChild(tbody);
@@ -244,7 +287,7 @@
       }
       sampleCell.appendChild(sampleList);
       tr.appendChild(sampleCell);
-      tr.appendChild(td("", pivotBtn("command_cluster", row.cluster_id)));
+      tr.appendChild(actionCell("command_cluster", row.cluster_id));
       tbody.appendChild(tr);
     }
     table.appendChild(tbody);
@@ -281,7 +324,7 @@
       }
       sampleCell.appendChild(sampleList);
       tr.appendChild(sampleCell);
-      tr.appendChild(td("", pivotBtn("session_cluster", row.cluster_id)));
+      tr.appendChild(actionCell("session_cluster", row.cluster_id));
       tbody.appendChild(tr);
     }
     table.appendChild(tbody);
@@ -330,7 +373,7 @@
       }
       ccCell.appendChild(ccChips);
       tr.appendChild(ccCell);
-      tr.appendChild(td("", pivotBtn("ip_cluster", row.cluster_id)));
+      tr.appendChild(actionCell("ip_cluster", row.cluster_id));
       tbody.appendChild(tr);
     }
     table.appendChild(tbody);
@@ -383,7 +426,7 @@
         mitreCell.appendChild(document.createTextNode(" "));
       }
       tr.appendChild(mitreCell);
-      tr.appendChild(td("", row.sha256 ? pivotBtn("command", row.sha256) : null));
+      tr.appendChild(row.sha256 ? actionCell("command", row.sha256) : td(""));
       tbody.appendChild(tr);
     }
     table.appendChild(tbody);

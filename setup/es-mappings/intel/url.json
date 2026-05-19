@@ -1,0 +1,88 @@
+{
+  "_comment": "External threat-intel for URL artifacts. One doc per URL, keyed by canonical URL (scheme+host+path, query stripped — see src/enrich/intel/artifact.py canonical_url). Written by `dshield_prism intel refresh`. Mirrors the prism.intel.ip layout; same `derived` rollup contract for cross-kind consumers. Strict-dynamic on the providers object: adding a new URL provider must update this mapping first.",
+  "settings": {
+    "number_of_shards": 1,
+    "number_of_replicas": 0,
+    "refresh_interval": "30s"
+  },
+  "mappings": {
+    "dynamic": "strict",
+    "properties": {
+      "artifact": {
+        "properties": {
+          "kind":                    { "type": "keyword" },
+          "value":                   { "type": "keyword" },
+          "first_observed_locally":  { "type": "date" }
+        }
+      },
+      "last_refreshed":              { "type": "date" },
+      "providers": {
+        "type": "object",
+        "dynamic": "strict",
+        "properties": {
+          "urlhaus": {
+            "properties": {
+              "fetched_at":          { "type": "date" },
+              "ttl_expires_at":      { "type": "date" },
+              "malicious":           { "type": "boolean" },
+              "confidence":          { "type": "integer" },
+              "label":               { "type": "keyword" },
+              "tags":                { "type": "keyword" },
+              "authoritative_clean": { "type": "boolean" },
+              "evidence_direct":     { "type": "boolean" },
+              "structured": {
+                "properties": {
+                  "in_urlhaus":      { "type": "boolean" },
+                  "threat":          { "type": "keyword" },
+                  "tags":            { "type": "keyword" },
+                  "url_status":      { "type": "keyword" },
+                  "first_seen":      { "type": "keyword" },
+                  "list_size":       { "type": "long" }
+                }
+              },
+              "raw": { "type": "object", "enabled": false }
+            }
+          },
+          "threatfox": {
+            "properties": {
+              "fetched_at":          { "type": "date" },
+              "ttl_expires_at":      { "type": "date" },
+              "malicious":           { "type": "boolean" },
+              "confidence":          { "type": "integer" },
+              "label":               { "type": "keyword" },
+              "tags":                { "type": "keyword" },
+              "authoritative_clean": { "type": "boolean" },
+              "evidence_direct":     { "type": "boolean" },
+              "structured": {
+                "properties": {
+                  "in_threatfox":     { "type": "boolean" },
+                  "threat_type":      { "type": "keyword" },
+                  "malware":          { "type": "keyword" },
+                  "malware_alias":    { "type": "keyword" },
+                  "confidence_level": { "type": "integer" },
+                  "first_seen":       { "type": "keyword" },
+                  "last_seen":        { "type": "keyword" }
+                }
+              },
+              "raw": { "type": "object", "enabled": false }
+            }
+          }
+        }
+      },
+      "derived": {
+        "properties": {
+          "consensus_malicious":      { "type": "boolean" },
+          "consensus_label":          { "type": "keyword" },
+          "tags":                     { "type": "keyword" },
+          "providers_with_data":      { "type": "integer" },
+          "providers_total":          { "type": "integer" },
+          "external_rarity_score":    { "type": "float" },
+          "override_applied":         { "type": "keyword" },
+          "malicious_provider_count": { "type": "integer" },
+          "clean_provider_count":     { "type": "integer" },
+          "confidence_max":           { "type": "integer" }
+        }
+      }
+    }
+  }
+}

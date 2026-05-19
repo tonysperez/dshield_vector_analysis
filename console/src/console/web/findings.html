@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>DShield Findings</title>
+  <link rel="stylesheet" href="/static/css/app.css" />
+  <style>
+    /* Findings-specific layout — not shared with the graph page */
+
+    #findings-main {
+      max-width: 1280px;
+      margin: 0 auto;
+      padding: 16px 20px 60px;
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+    }
+
+    .fnd-section-title {
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      color: #6b7494;
+      margin: 0 0 12px;
+      display: flex;
+      align-items: baseline;
+      gap: 10px;
+    }
+    .fnd-hint {
+      font-size: 11px;
+      font-weight: 400;
+      text-transform: none;
+      letter-spacing: 0;
+      color: #4a5470;
+    }
+
+    /* Status / kind filter chips */
+    .fnd-filters {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-bottom: 8px;
+    }
+    .fnd-chip {
+      font-size: 11px;
+      font-weight: 600;
+      color: #b9c2db;
+      background: #0e1e35;
+      border: 1px solid #25324c;
+      border-radius: 999px;
+      padding: 3px 11px;
+      cursor: pointer;
+      user-select: none;
+      white-space: nowrap;
+    }
+    .fnd-chip:hover { background: #1a2d4e; }
+    .fnd-chip.active {
+      color: #4cc1ff;
+      border-color: #4cc1ff80;
+      background: #0a1929;
+    }
+    .fnd-chip .count {
+      opacity: 0.6;
+      margin-left: 5px;
+      font-weight: 400;
+    }
+    .fnd-filter-label {
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+      color: #6b7494;
+      margin-right: 4px;
+    }
+
+    /* Sort control */
+    .fnd-sort {
+      margin-left: auto;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .fnd-sort select {
+      background: #0a121f;
+      color: #b9c2db;
+      border: 1px solid #25324c;
+      border-radius: 4px;
+      font-size: 11px;
+      padding: 2px 6px;
+    }
+
+    /* Findings table */
+    #findings-table-wrap {
+      overflow-x: auto;
+    }
+    table.fnd-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+    }
+    table.fnd-table th, table.fnd-table td {
+      text-align: left;
+      padding: 6px 10px;
+      border-bottom: 1px solid #1d2840;
+      vertical-align: top;
+    }
+    table.fnd-table th {
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+      color: #6b7494;
+      font-weight: 600;
+      background: #0a121f;
+      position: sticky;
+      top: 0;
+    }
+    table.fnd-table td.score { font-variant-numeric: tabular-nums; }
+    table.fnd-table td.artifact a {
+      color: #4cc1ff;
+      text-decoration: none;
+    }
+    table.fnd-table td.artifact a:hover { text-decoration: underline; }
+    table.fnd-table tr:hover td { background: #0e1e35; }
+    table.fnd-table td.size {
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+    .fnd-kind-badge {
+      font-size: 10px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+      padding: 1px 6px;
+      border-radius: 3px;
+      border: 1px solid #25324c;
+    }
+    .fnd-kind-playbook { background: #0a1929; color: #4cc1ff; border-color: #4cc1ff60; }
+    .fnd-kind-campaign { background: #1a0e29; color: #c084fc; border-color: #c084fc60; }
+
+    /* Status select */
+    .fnd-status-select {
+      background: #0a121f;
+      color: #b9c2db;
+      border: 1px solid #25324c;
+      border-radius: 4px;
+      font-size: 11px;
+      padding: 2px 6px;
+    }
+    .fnd-status-select:focus { outline: 1px solid #4cc1ff; outline-offset: 0; }
+
+    /* Narrative cell — wrap-friendly */
+    table.fnd-table td.narrative {
+      max-width: 480px;
+      color: #c8d0e2;
+      white-space: normal;
+    }
+
+    .fnd-empty {
+      padding: 20px;
+      text-align: center;
+      color: #4a5470;
+      font-size: 12px;
+    }
+
+    /* Topbar nav reuse */
+    .topbar .nav-link {
+      font-size: 11px;
+      color: #4cc1ff;
+      font-weight: 600;
+      background: #0e1e35;
+      border: 1px solid #4cc1ff28;
+      border-radius: 4px;
+      padding: 3px 10px;
+      text-decoration: none;
+      white-space: nowrap;
+    }
+    .topbar .nav-link:hover { background: #1a2d4e; }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <a href="/findings" class="brand" style="text-decoration:none;color:inherit;">DShield Console</a>
+    <a href="/graph" class="nav-link">Graph</a>
+    <a href="/insights" class="nav-link">Insights</a>
+    <a href="/compare" class="nav-link">Compare</a>
+    <a href="/health" class="nav-link">Health</a>
+    <div style="flex:1"></div>
+    <div id="loading" class="loading hidden" aria-live="polite"></div>
+  </header>
+
+  <main id="findings-main">
+
+    <section>
+      <p class="fnd-section-title">Findings — playbooks &amp; campaigns
+        <span class="fnd-hint">one card per playbook and per campaign. Triage with the status dropdown; verdicts persist across re-mines.</span>
+      </p>
+
+      <div class="fnd-filters">
+        <span class="fnd-filter-label">Status:</span>
+        <span id="status-chips" style="display:contents;"></span>
+      </div>
+      <div class="fnd-filters">
+        <span class="fnd-filter-label">Kind:</span>
+        <span id="kind-chips" style="display:contents;"></span>
+        <span class="fnd-sort">
+          <span class="fnd-filter-label">Sort:</span>
+          <select id="sort-select">
+            <option value="score">score</option>
+            <option value="last_seen">last seen</option>
+            <option value="first_seen">first seen</option>
+          </select>
+        </span>
+      </div>
+
+      <div id="findings-table-wrap">
+        <em class="fnd-empty">loading…</em>
+      </div>
+    </section>
+
+  </main>
+
+  <script src="/static/js/findings.js"></script>
+</body>
+</html>

@@ -7,7 +7,8 @@
 </head>
 <body>
   <header class="topbar">
-    <div class="brand">DShield Console</div>
+    <a href="/findings" class="brand" style="text-decoration:none;color:inherit;">DShield Console</a>
+    <a href="/findings" class="nav-link" title="Findings inbox">Findings</a>
     <a href="/insights" class="nav-link" title="Insights dashboard">Insights</a>
     <a href="/compare" class="nav-link" title="Compare two session clusters">Compare</a>
     <a href="/health" class="nav-link" title="Console + pipeline health">Health</a>
@@ -135,6 +136,19 @@
             <input type="checkbox" id="cfg-require-commands" checked />
             <span>Require at least one command run</span>
           </label>
+        </fieldset>
+
+        <fieldset class="setting-group">
+          <legend>Cache</legend>
+          <p class="setting-hint">
+            The console caches insights (60&nbsp;s) and the latest cluster
+            run id (5&nbsp;min) to keep page loads snappy. After a fresh
+            pipeline run, purge the cache to force a re-read of ES.
+          </p>
+          <div class="setting-row">
+            <button type="button" id="cfg-purge-cache" class="setting-action">Purge cache</button>
+            <span id="cfg-purge-status" class="setting-status"></span>
+          </div>
         </fieldset>
       </section>
       <footer class="modal-footer">

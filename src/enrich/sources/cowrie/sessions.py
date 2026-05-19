@@ -30,8 +30,8 @@ from .commands import hash_command, normalize
 log = logging.getLogger(__name__)
 
 _SESSION_WATERMARK_KEY = "session_last_processed_at"
-_SESSIONS_MAPPING = "es-mappings/cowrie/sessions.json"
-_SESSION_CLUSTERS_MAPPING = "es-mappings/cowrie/session_clusters.json"
+_SESSIONS_MAPPING = "setup/es-mappings/cowrie/sessions.json"
+_SESSION_CLUSTERS_MAPPING = "setup/es-mappings/cowrie/session_clusters.json"
 
 # Fixed corpus-scale denominators for the log1p-normalized scalar block,
 # replacing the previous per-batch `np.max(...)` (ROADMAP #14). Per-batch

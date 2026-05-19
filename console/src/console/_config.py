@@ -45,7 +45,7 @@ class CowrieIndexes(BaseModel):
     # Multi-session campaigns mined by `dshield_prism mine campaigns`.
     # Default value here means the console will fall back to a sensible
     # name if the user's local.yaml hasn't been re-merged from default.yaml.
-    campaigns: str = "campaigns-dshield.cowrie-default"
+    campaigns: str = "prism.campaign.cowrie"
 
 
 class SourceIndexes(BaseModel):
@@ -74,10 +74,10 @@ class IntelIndexes(BaseModel):
     config still load. The console treats missing indices as "intel
     not deployed yet" and degrades gracefully on the artifact pane.
     """
-    ip:     str = "intel-dshield-ip-default"
-    url:    str = "intel-dshield-url-default"
-    domain: str = "intel-dshield-domain-default"
-    hash:   str = "intel-dshield-hash-default"
+    ip:     str = "prism.intel.ip"
+    url:    str = "prism.intel.url"
+    domain: str = "prism.intel.domain"
+    hash:   str = "prism.intel.hash"
 
 
 class IntelConfig(BaseModel):
@@ -85,11 +85,24 @@ class IntelConfig(BaseModel):
     indexes: IntelIndexes = IntelIndexes()
 
 
+class FindingsIndexes(BaseModel):
+    """Mirror of the parent FindingsIndexes (M5)."""
+    default: str = "prism.finding"
+
+
+class FindingsConfig(BaseModel):
+    """Minimal mirror — the console only needs to know the index name
+    and whether the feature is enabled. Thresholds live on the miner."""
+    enabled: bool = True
+    indexes: FindingsIndexes = FindingsIndexes()
+
+
 class AppConfig(BaseModel):
     """Slimmed-down config — only what the console needs."""
     elasticsearch: ESConfig
     llm: Optional[LLMConfig] = None
     intel: IntelConfig = IntelConfig()
+    findings: FindingsConfig = FindingsConfig()
 
 
 class Secrets(BaseSettings):
@@ -145,10 +158,12 @@ def load_config(path: Optional[str] = None) -> AppConfig:
 
     raw_llm = data.get("llm")
     raw_intel = data.get("intel") or {}
+    raw_findings = data.get("findings") or {}
     return AppConfig(
         elasticsearch=data["elasticsearch"],
         llm=LLMConfig(**raw_llm) if raw_llm else None,
         intel=IntelConfig(**raw_intel),
+        findings=FindingsConfig(**raw_findings),
     )
 
 

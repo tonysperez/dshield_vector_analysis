@@ -7,23 +7,29 @@ elasticsearch:
   ca_certs: null
   request_timeout: 60
 
-  # All index names are nested per source so adding a new sensor (webhoneypot,
-  # dshield, etc.) is a sibling block, not a flat rename. Layout:
-  #   <aspect>-dshield.<source>.<stream>-<namespace>
-  # aspects: logs (raw) / enriched / rollup / clusters
+  # All index names are nested per source so adding a new sensor
+  # (webhoneypot, dionaea, etc.) is a sibling block, not a flat rename.
+  # Naming layout (post-2026-05-17): prism.<function>.<source>.<layer>
+  # - prism.*    distinguishes project-owned indices from Fleet's logs-*
+  # - <function> ∈ raw | enriched | rollup | clusters | campaigns
+  #                | intel | findings  (intel/findings are cross-source)
+  # - <source>   ∈ cowrie | <future-source>
+  # - <layer>    ∈ session | command | ip | url | <future-layer>
+  # The `prism.*` prefix isn't claimed by any Fleet integration, so these
+  # indices survive integration upgrades that wipe `logs-*-*` streams.
   indexes:
     cowrie:
-      sessions_raw:      "logs-dshield.cowrie.session-default"
-      commands:          "enriched-dshield.cowrie.command-default"
-      command_clusters:  "clusters-dshield.cowrie.command-default"
-      sessions_rollup:   "rollup-dshield.cowrie.session-default"
-      session_clusters:  "clusters-dshield.cowrie.session-default"
-      ips_rollup:        "rollup-dshield.cowrie.source_ip-default"
-      ip_clusters:       "clusters-dshield.cowrie.source_ip-default"
+      sessions_raw:      "prism.raw.cowrie.session"
+      commands:          "prism.enriched.cowrie.command"
+      command_clusters:  "prism.cluster.cowrie.command"
+      sessions_rollup:   "prism.rollup.cowrie.session"
+      session_clusters:  "prism.cluster.cowrie.session"
+      ips_rollup:        "prism.rollup.cowrie.ip"
+      ip_clusters:       "prism.cluster.cowrie.ip"
       # Multi-session campaigns mined by `mine campaigns`. Distinct from
       # session_clusters (each centroid there is a "playbook"). See
       # docs/PLAYBOOKS_AND_CAMPAIGNS.md.
-      campaigns:         "campaigns-dshield.cowrie-default"
+      campaigns:         "prism.campaign.cowrie"
 
 llm:
   # provider: "ollama" (Ollama API) or "openai_compat" (LM Studio, vLLM, llama.cpp server)
@@ -51,6 +57,12 @@ worker:
   command_max_chars: 4000
   initial_lookback_days: null
   log_level: "INFO"
+  # Project log directory. CLI rotates `cli.log` here; setup.sh / destroy.sh
+  # tee their stdout to setup.log / destroy.log. Empty string or an
+  # unwritable path disables file logging (the stderr handler stays so
+  # journalctl keeps working under systemd). Override per-run via the
+  # PRISM_LOG_DIR env var.
+  log_dir: "/var/log/dshield_prism"
   # When true, the cache key carries two auto-derived hashes:
   #   - llm_config_hash:   prompt-file content + LLM-side cooccurrence params
   #   - embed_config_hash: llm.embed_context + llm.embedding_model +
@@ -219,7 +231,7 @@ ip:
 
 # External threat-intel subsystem (ROADMAP "Research-mode strategic gaps" A).
 # Runs alongside the enrichment pipeline; writes per-artifact intel docs to
-# project-owned `intel-*-default` indices. Disabled by default — flip
+# project-owned `prism.intel.*` indices. Disabled by default — flip
 # `enabled: true` in local.yaml after configuring providers + never-query
 # CIDRs. Milestone 1 ships three free-tier IP providers (Tor exit list,
 # Spamhaus DNS, ISC daily feed); other artifact kinds + providers land in
@@ -230,10 +242,10 @@ intel:
   # Project-owned intel indices, one per artifact kind. Pre-allocated so
   # adding a kind later doesn't require a config migration.
   indexes:
-    ip:     "intel-dshield-ip-default"
-    url:    "intel-dshield-url-default"
-    domain: "intel-dshield-domain-default"
-    hash:   "intel-dshield-hash-default"
+    ip:     "prism.intel.ip"
+    url:    "prism.intel.url"
+    domain: "prism.intel.domain"
+    hash:   "prism.intel.hash"
 
   providers:
     tor:

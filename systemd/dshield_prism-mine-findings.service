@@ -1,0 +1,39 @@
+[Unit]
+Description=DShield Prism — mine findings (likely_discovery + axis_disagreement)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=dshield_prism
+Group=dshield_prism
+WorkingDirectory=/opt/dshield_prism
+EnvironmentFile=/opt/dshield_prism/.env
+
+# Shares the same flock as the rest of the pipeline. The findings miner
+# is read-mostly (one cheap scroll + a few mgets, then a few hundred
+# index ops at most), but it touches ES at the same time as the forward
+# and backward passes — the flock prevents the small chance of an mget
+# racing with an in-flight rollup.
+ExecStartPre=/usr/bin/flock /var/lib/dshield_prism/.lock /bin/true
+
+ExecStart=/usr/bin/flock /var/lib/dshield_prism/.lock /opt/dshield_prism/.venv/bin/python -m enrich.cli --config /opt/dshield_prism/config/default.yaml mine findings
+
+StandardOutput=journal
+StandardError=journal
+
+# Findings mining is bounded by intel-index size + IP rollup size. On
+# this corpus it completes in seconds; the 30-min ceiling is purely a
+# stuck-process circuit-breaker.
+TimeoutStartSec=30min
+Nice=10
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/dshield_prism /var/log/dshield_prism
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

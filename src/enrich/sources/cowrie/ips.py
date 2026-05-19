@@ -27,8 +27,8 @@ from .sessions import _mean_pool, _summarize_intents
 log = logging.getLogger(__name__)
 
 _IP_WATERMARK_KEY = "ip_rollup_last_processed_at"
-_IPS_MAPPING = "es-mappings/cowrie/ips.json"
-_IP_CLUSTERS_MAPPING = "es-mappings/cowrie/ip_clusters.json"
+_IPS_MAPPING = "setup/es-mappings/cowrie/ips.json"
+_IP_CLUSTERS_MAPPING = "setup/es-mappings/cowrie/ip_clusters.json"
 
 _IP_CLUSTER_UPDATE_SCRIPT = (
     "if (ctx._source.dshield == null) { ctx._source.dshield = [:]; }"
@@ -381,7 +381,7 @@ def iter_ip_docs(
 
     When `intel_lookup` (an `enrich.intel.lookup.IntelLookup`) is
     supplied, each page of IPs is bulk-mget'd against
-    `intel-dshield-ip-default` before yielding, and `scalars` gets two
+    `prism.intel.ip` before yielding, and `scalars` gets two
     extra keys consumed by the intel sub-block (`_build_intel_block`):
 
       - `external_rarity_score`: float 0–1 (defaults 0 if no intel)

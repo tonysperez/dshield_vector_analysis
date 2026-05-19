@@ -1,0 +1,16 @@
+[Unit]
+Description=Run the DShield Prism findings miner hourly
+Requires=dshield_prism-mine-findings.service
+
+[Timer]
+# Top of every hour. Findings depend on the latest IP rollup + intel
+# refresh; both run more often, so hourly is the conservative cadence
+# that keeps the page fresh without redundant work.
+OnCalendar=*-*-* *:05:00
+RandomizedDelaySec=60
+# Catch up once if the system was down at the scheduled firing.
+Persistent=true
+Unit=dshield_prism-mine-findings.service
+
+[Install]
+WantedBy=timers.target
